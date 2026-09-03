@@ -1,0 +1,29 @@
+# node
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+next-env.d.ts
+
+# python
+__pycache__/
+*.pyc
+.venv/
+.uv/
+
+# local data & artifacts
+*.db
+*.db-journal
+api/artifacts/*
+!api/artifacts/.gitkeep
+
+# env / ports
+.env.local
+.worktree-env
+
+# misc
+.DS_Store
+.remember/tmp/
+
+# worktrees live inside the repo but are never committed
+.worktrees/
