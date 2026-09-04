@@ -52,6 +52,8 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 
+from urllib.parse import urlsplit, urlunsplit
+
 from playwright.sync_api import Page
 
 from .critic import Gap, prioritise
@@ -523,7 +525,33 @@ def report(pipe: Pipeline) -> str:
     return "\n".join(lines)
 
 
-def main(entry_url: str) -> int:
+def fixture_variants(entry_url: str) -> tuple[str, ...]:
+    """The extra targets to re-verify against, when the target is *our* SUT.
+
+    `?v=1|2|3` and `?bug=1` are knobs on `web/app/sut/` and on nothing else.
+    They were passed unconditionally, which is correct for the demo and wrong
+    for every other URL: appended to a third-party app they are query parameters
+    it ignores, so the suite is re-run against a byte-identical target and the
+    report presents the passes as a drift check and a defect check.
+
+    Measured against saucedemo on 2026-09-04, before this existed: 12 runs
+    reported, 4 of which re-tested an unchanged app. Nothing failed, so nothing
+    looked wrong -- which is what makes it worth a check rather than a comment.
+
+    A real second target is a real deploy, so `main()` takes those on the
+    command line. What this function decides is only the default.
+    """
+    parsed = urlsplit(entry_url)
+    ours = parsed.hostname in {"localhost", "127.0.0.1"} and parsed.path.rstrip(
+        "/"
+    ).endswith("/sut")
+    if not ours:
+        return ()
+    base = urlunsplit(parsed._replace(query="", fragment=""))
+    return (f"{base}?v=2", f"{base}?bug=1")
+
+
+def main(entry_url: str, verify_against: tuple[str, ...] = ()) -> int:
     """One command, no human between the stages. Needs `make dev`."""
     from playwright.sync_api import sync_playwright
 
@@ -540,6 +568,13 @@ def main(entry_url: str) -> int:
         print(f"no model configured ({type(error).__name__}) -- "
               "deterministic exploration and ranking\n")
 
+    # Say it up front. A run with no second target cannot heal and cannot find a
+    # defect, and a report that is silent about that reads like it looked.
+    print(
+        "re-verify against: " + (", ".join(verify_against) or
+        "nothing -- pass further deploy URLs as extra arguments") + "\n"
+    )
+
     with sync_playwright() as pw:
         browser = pw.chromium.launch()
         page = browser.new_page()
@@ -547,7 +582,7 @@ def main(entry_url: str) -> int:
             page, entry_url,
             provider=provider,
             synthesizer=synthesizer,
-            verify_against=(f"{entry_url}?v=2", f"{entry_url}?bug=1"),
+            verify_against=verify_against,
             on_event=lambda level, message, surface=None: print(
                 f"  [{level}] {message}"
             ),
@@ -562,4 +597,11 @@ def main(entry_url: str) -> int:
 if __name__ == "__main__":
     import sys
 
-    raise SystemExit(main(sys.argv[1] if len(sys.argv) > 1 else "http://localhost:3000/sut"))
+    #   python -m agents.pipeline <url> [verify-url ...]
+    #
+    # The extra URLs are further deploys of the same app to re-run the suite
+    # against. Given none, `fixture_variants` supplies the SUT's own knobs when
+    # the target *is* the SUT, and nothing at all otherwise.
+    url = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:3000/sut"
+    targets = tuple(sys.argv[2:]) or fixture_variants(url)
+    raise SystemExit(main(url, targets))

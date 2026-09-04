@@ -43,10 +43,11 @@ import json
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 from .explorer.forms import Credentials, fields_of, value_for
 from .explorer.statekey import explain, normalize
-from .explorer.worldmap import WorldMap
+from .explorer.worldmap import Transition, WorldMap, is_flow
 
 # A normalised node line: `  - heading "Order confirmed"` or `  - alert: text`.
 # Normalisation has already stripped refs, boxes and the trailing colon, so this
@@ -107,7 +108,7 @@ class Scenario:
         return self.steps[-1]
 
 
-def intent_of(action: str, title: str = "") -> str:
+def intent_of(action: str, title: str = "", destination: str = "") -> str:
     """A human sentence for one action. Deterministic, and a model seam later.
 
     The brief wants a *human-readable* plan, and this is where that word is
@@ -128,7 +129,11 @@ def intent_of(action: str, title: str = "") -> str:
 
     role, _, name = action.partition(":")
     if not name:
-        return f"activate the {role}"
+        # An icon control with no accessible name. "activate the link" names
+        # nothing a user would recognise, and saucedemo's cart is exactly this
+        # -- so say where it goes instead. Where it goes is recorded; inventing
+        # a name for it would not be.
+        return f"open {destination}" if destination else f"activate the {role}"
     return {
         "link": f"follow the {name} link",
         "button": f"click {name}",
@@ -195,6 +200,75 @@ def _terminal_rank(action: str) -> int:
     return _RANK.get(form.group("mode"), 3) if form else 4
 
 
+def _where(world: WorldMap, key: str) -> str:
+    """A short human name for a destination state: its path, or its title."""
+    node = world.states.get(key)
+    if node is None:
+        return ""
+    path = urlparse(node.url).path.rstrip("/")
+    return path or node.title
+
+
+def worth_testing(world: WorldMap, transition: Transition) -> bool:
+    """`is_flow`, plus the one rule that needs to know what an action means.
+
+    A submission is an accomplishment however the app answers it. Refusing
+    invalid input is a *correct* behaviour worth locking down, and structurally
+    it is indistinguishable from an inert edge: it stays put and fires nothing,
+    exactly like `textbox:Email stays`. `is_flow` cannot tell them apart without
+    learning the action vocabulary, which `worldmap.py` deliberately refuses to
+    do -- so the exception lives here, in the module that already parses
+    `submit[...]`, and the brief's "not just happy paths" survives the filter.
+    """
+    if _FORM_ACTION.match(transition.action):
+        return True
+    return is_flow(world, transition)
+
+
+def _shape(lines: tuple[str, ...]) -> tuple[str, ...]:
+    """The roles a delta touched, without the names in them.
+
+    Two product pages add a heading, an image, a price and a button each; only
+    the words differ. Comparing roles is what makes them one behaviour and a
+    login page a different one.
+    """
+    roles = []
+    for line in lines:
+        match = _LINE.match(line)
+        if match:
+            roles.append(match.group("role"))
+    return tuple(sorted(roles))
+
+
+def _equivalence(from_key: str, action: str, expect: Expectation) -> tuple:
+    """Which edges are the same behaviour, and so want one test between them.
+
+    Standard equivalence partitioning: six `link:Sauce Labs <product>` edges out
+    of the inventory page are one class, and testing a representative is the
+    textbook move. Measured on saucedemo, they consumed a quarter of an
+    eight-scenario suite while the cart went untested.
+
+    **`from_key` is deliberately NOT in the class, and that was measured.** It
+    was, in the first version of this function, to stop the SUT's three drift
+    variants collapsing into one. It worked and it was wrong: a login page is
+    several states (pristine, filled, showing a validation error), so keying on
+    the state gave the *same form* a class per state -- saucedemo went from two
+    near-duplicate scenarios to seven, and the form classes then crowded every
+    link out of the eight-scenario limit. Collapsing the SUT's variants is the
+    correct answer anyway: they are one form rendered three ways, which is what
+    an equivalence class is.
+    """
+    form = _FORM_ACTION.match(action)
+    kind = f"submit[{form.group('mode')}]" if form else action.partition(":")[0]
+    return (
+        kind,
+        expect.moved,
+        expect.mutating,
+        _shape(expect.added),
+        _shape(expect.removed),
+    )
+
+
 def scenarios(world: WorldMap, limit: int = 8) -> tuple[Scenario, ...]:
     """Every recorded edge, as a runnable scenario. Best first, capped.
 
@@ -204,7 +278,7 @@ def scenarios(world: WorldMap, limit: int = 8) -> tuple[Scenario, ...]:
     validation error renders in a state something else also reaches.
     """
     routes = world.paths()
-    best: dict[str, tuple[tuple[int, int, int], Scenario]] = {}
+    best: dict[tuple, tuple[tuple[int, int, int], Scenario]] = {}
 
     for (from_key, action), taken in world.transitions.items():
         route = routes.get(from_key)
@@ -213,6 +287,8 @@ def scenarios(world: WorldMap, limit: int = 8) -> tuple[Scenario, ...]:
 
         expect = expectation(world, from_key, action)
         if expect is None:
+            continue
+        if not worth_testing(world, taken[0]):
             continue
 
         steps: list[Step] = []
@@ -224,7 +300,9 @@ def scenarios(world: WorldMap, limit: int = 8) -> tuple[Scenario, ...]:
             observation = world.evidence[world.states[cursor].evidence[0]]
             steps.append(
                 Step(
-                    intent=intent_of(edge, observation.title),
+                    intent=intent_of(
+                        edge, observation.title, _where(world, step_expect.to_key)
+                    ),
                     action=edge,
                     from_key=cursor,
                     fields=fields_of(observation),
@@ -236,13 +314,16 @@ def scenarios(world: WorldMap, limit: int = 8) -> tuple[Scenario, ...]:
             # Rank: informative terminal action, then a moving edge over a
             # self-loop, then the shortest route that gets there.
             rank = (_terminal_rank(action), 0 if expect.moved else 1, len(route))
-            existing = best.get(action)
+            klass = _equivalence(from_key, action, expect)
+            existing = best.get(klass)
             if existing is None or rank < existing[0]:
-                title = world.states[from_key].title
-                best[action] = (
+                best[klass] = (
                     rank,
                     Scenario(
-                        name=intent_of(action, title),
+                        # The name IS the terminal step's intent -- one sentence,
+                        # written once, so the plan and the step can never
+                        # disagree about what the scenario does.
+                        name=steps[-1].intent,
                         target_url=world.states[world.entry_key].url,
                         steps=tuple(steps),
                     ),

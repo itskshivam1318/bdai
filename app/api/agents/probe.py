@@ -313,6 +313,67 @@ def main() -> int:
                 not compare(world, stripped).identical,
             )
 
+        # 3d. What is worth a test. `is_flow` is structural and lives in
+        #     worldmap.py, which never learns what an action *means*; the
+        #     vocabulary rule (a submission is always a flow) lives in the
+        #     generator, which does. Both halves are checked here because the
+        #     split is the point -- putting `submit[` in worldmap.py would be
+        #     the easy fix and would break the module's stated invariant.
+        print()
+        from .explorer.worldmap import Transition as _T
+        from .explorer.worldmap import WorldMap as _WM
+        from .explorer.worldmap import is_flow
+
+        flows = _WM()
+        flows.entry_key = "a"
+        # a --click--> a  (nothing happened)          not a flow
+        # a --type---> a  but a POST fired            a flow: accepted, no re-render
+        # a --nav----> b  b reachable only this way   a flow
+        # a --alt----> b  b already reachable         not a flow, b is recorded
+        edges = {
+            ("a", "button:Nothing"): _T("a", "button:Nothing", "a", False, 0),
+            ("a", "textbox:Email"): _T("a", "textbox:Email", "a", True, 0),
+            ("a", "link:Only way"): _T("a", "link:Only way", "b", False, 0),
+            ("a", "link:Also"): _T("a", "link:Also", "b", False, 0),
+        }
+        flows.transitions = {k: [v] for k, v in edges.items()}
+        ok &= check(
+            "an edge where nothing happened is not worth a test",
+            not is_flow(flows, edges[("a", "button:Nothing")]),
+        )
+        ok &= check(
+            "staying put with a request fired IS worth a test",
+            is_flow(flows, edges[("a", "textbox:Email")]),
+            "the app accepted input and did not re-render -- the bug this catches",
+        )
+        ok &= check(
+            "the only recorded way into a state is worth a test",
+            is_flow(flows, edges[("a", "link:Only way")]),
+        )
+        ok &= check(
+            "a second way into an already-recorded state is not",
+            not is_flow(flows, edges[("a", "link:Also")]),
+        )
+
+        # 3e. The vocabulary half of the same policy. A submission the app
+        #     correctly refuses is a self-loop that fires nothing -- structurally
+        #     indistinguishable from `textbox:Email stays` -- and the brief wants
+        #     unhappy paths, so the Generator overrides `is_flow` for it.
+        from .generator import worth_testing
+
+        refused = _T("a", "submit[empty]:button:Sign in", "a", False, 0)
+        idle = _T("a", "textbox:Email", "a", False, 0)
+        flows.transitions[("a", refused.action)] = [refused]
+        ok &= check(
+            "a submission the app refuses is still a flow",
+            worth_testing(flows, refused),
+            "an unhappy path was dropped for looking structurally inert",
+        )
+        ok &= check(
+            "a non-submission that does nothing is still dropped",
+            not worth_testing(flows, idle),
+        )
+
         # 4. The executable layer: a path through the map becomes a test, and
         #    the test's failure classifies itself. These six checks are the
         #    acceptance experiment for the whole product claim, so they drive
@@ -515,6 +576,20 @@ def main() -> int:
                 for scenario in verifiable(pipe.plan)
             ),
             "a link-following scenario would be re-run against a different base",
+        )
+
+        # `?v=2` and `?bug=1` are knobs on *our* SUT and nothing else. Appended
+        # to a third-party URL they are query parameters the app ignores, so the
+        # suite gets re-run against a byte-identical target and the report calls
+        # the result a verification. Measured against saucedemo before this
+        # check existed: 4 of 12 reported runs meant nothing.
+        from .pipeline import fixture_variants
+
+        ok &= check(
+            "the SUT's fixture knobs are not appended to a third-party URL",
+            fixture_variants("https://www.saucedemo.com") == ()
+            and fixture_variants(SUT) == (f"{SUT}?v=2", f"{SUT}?bug=1"),
+            "a real target would be re-verified against itself",
         )
 
         written = report(pipe)
