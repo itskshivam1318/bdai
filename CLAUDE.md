@@ -14,6 +14,7 @@ Agent** — a URL in, a meaningful test suite out, no human between the stages.
 | `docs/product/decisions.md` | What has already been settled? Append-only. |
 | `docs/execution/packets/P*.md` | Who owns what, and what "done" means. |
 | `docs/research/README.md` | Prior art. **Read the index; open a full report only when the index says it answers your question** — the reports total ~1,300 lines. |
+| `docs/discussions/README.md` | Captured external conversations, verbatim. Arguments, not decisions. **Same rule: read the index** — the transcripts total ~5,500 lines. |
 
 The repo — not the chat — holds project state. Read these before asking a human
 anything; if the answer isn't there, that's a bug in the files.
