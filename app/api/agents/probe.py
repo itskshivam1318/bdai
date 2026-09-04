@@ -326,6 +326,30 @@ def main() -> int:
                 reloaded.states[shot_key].screenshot == "run-1/abc.png",
             )
 
+        # 3d. store.save is incremental and upserts states. A thumbnail that
+        #     arrives after a state's first save must reach the database on the
+        #     next checkpoint, or the UI shows a picture-less node forever.
+        from sqlmodel import Session as _Session
+        from sqlmodel import SQLModel as _SQLModel
+        from sqlmodel import create_engine as _create_engine
+
+        from .explorer import store as _store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = _create_engine(f"sqlite:///{tmp}/probe.db")
+            _SQLModel.metadata.create_all(engine)
+            with _Session(engine) as db:
+                bare = _WorldMap()
+                bare_key = bare.record(world.evidence[0])
+                _store.save(bare, run_id=7, session=db)
+                bare.attach_screenshot(bare_key, "run-7/pic.png")
+                _store.save(bare, run_id=7, session=db)
+                back = _store.load(7, db)
+                ok &= check(
+                    "a thumbnail attached after the first save still persists",
+                    back.states[bare_key].screenshot == "run-7/pic.png",
+                )
+
         # 4. The executable layer: a path through the map becomes a test, and
         #    the test's failure classifies itself. These six checks are the
         #    acceptance experiment for the whole product claim, so they drive

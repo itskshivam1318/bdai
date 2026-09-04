@@ -100,14 +100,22 @@ def save(world: WorldMap, run_id: int, session: Session) -> int:
                     title=node.title,
                     actions=actions,
                     label=node.label,
+                    screenshot=node.screenshot,
                     is_entry=(key == world.entry_key),
                 )
             )
             written += 1
-        elif row.actions != actions or row.label != node.label:
+        elif (
+            row.actions != actions
+            or row.label != node.label
+            or row.screenshot != node.screenshot
+        ):
             # A state's action set can grow as later visits reveal controls,
-            # and `label` arrives from a model seam long after the crawl.
+            # `label` arrives from a model seam long after the crawl, and the
+            # screenshot is taken on first sighting -- which may be after this
+            # row was first written by an earlier checkpoint.
             row.actions, row.label = actions, node.label
+            row.screenshot = node.screenshot
             session.add(row)
             written += 1
 
@@ -197,6 +205,7 @@ def load(run_id: int, session: Session) -> WorldMap:
             title=row.title,
             actions=tuple(json.loads(row.actions or "[]")),
             label=row.label,
+            screenshot=row.screenshot,
             evidence=tuple(evidence_of.get(row.key, ())),
         )
         if row.is_entry:

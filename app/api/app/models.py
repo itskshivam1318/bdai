@@ -134,6 +134,9 @@ class AppState(SQLModel, table=True):
     actions: str = "[]"  # JSON list of action descriptors
     # Human-readable name. A model seam -- null until something names it.
     label: Optional[str] = None
+    # Path to one screenshot, relative to the artifacts dir, served at
+    # /artifacts/<path>. Null when capture was off or the shot failed.
+    screenshot: Optional[str] = None
     is_entry: bool = False
     first_seen: datetime = Field(default_factory=utcnow)
 
