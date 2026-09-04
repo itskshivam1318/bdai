@@ -3,8 +3,15 @@ import { Handle, Position, useStore, type NodeProps } from "@xyflow/react";
 import { artifactUrl, type MapState, type Verdict } from "@/lib/api";
 import { NODE_H, NODE_W } from "@/lib/map";
 
-/** Below this zoom a thumbnail is unreadable, so the card becomes a chip. */
-const COMPACT_BELOW = 0.6;
+/**
+ * Below this zoom a thumbnail is unreadable, so the card becomes a chip.
+ *
+ * Calibrated against what `fitView` actually produces, not against a guess: a
+ * 9-state map opens at ~0.5 and a 25-state one far lower. At 0.6 even a small
+ * map opened as chips and the screenshots -- the most useful thing on the card
+ * -- never appeared unless someone zoomed in by hand.
+ */
+const COMPACT_BELOW = 0.4;
 
 const VERDICT: Record<Verdict | "untested", { tone: string; dashed: boolean; glyph: string }> = {
   passed: { tone: "text-live", dashed: false, glyph: "✓" },
