@@ -35,7 +35,16 @@ export default function MapPane({ runId }: { runId: number | null }) {
       api
         .getMap(runId)
         .then((next) => {
-          if (!cancelled) setPayload(next);
+          if (cancelled) return;
+          // Keep the previous object when the map has not actually changed.
+          // `res.json()` allocates a new object every tick, so assigning it
+          // unconditionally reruns the layout and throws away any node the user
+          // has dragged -- every two seconds, invisibly. Comparing the
+          // serialised form is cheap at this size and is exactly the "did
+          // anything change" question being asked.
+          setPayload((prev) =>
+            prev && JSON.stringify(prev) === JSON.stringify(next) ? prev : next,
+          );
         })
         .catch(() => {
           // The run may not have written a map yet. Try again next tick.
@@ -49,7 +58,13 @@ export default function MapPane({ runId }: { runId: number | null }) {
   }, [runId]);
 
   const { nodes, edges } = useMemo(() => {
-    if (!payload) return { nodes: [] as Node[], edges: [] as Edge[] };
+    // A payload belongs to the run it was fetched for. Rendering run A's
+    // states under run B's identity is worse than rendering nothing: the nodes
+    // look authoritative, carry real screenshots, and are simply the wrong
+    // application state. `.catch()` swallows a failed fetch and a brand-new run
+    // has not written its first checkpoint yet, so "until the next poll" is not
+    // a bound worth relying on.
+    if (!payload || payload.run_id !== runId) return { nodes: [], edges: [] };
     const positions = layout(payload.states, payload.transitions);
     return {
       nodes: payload.states.map<Node>((state) => ({
@@ -71,7 +86,7 @@ export default function MapPane({ runId }: { runId: number | null }) {
         labelStyle: { fontSize: 10 },
       })),
     };
-  }, [payload]);
+  }, [payload, runId]);
 
   const nodeTypes = useMemo(() => ({ state: StateCard }), []);
 
