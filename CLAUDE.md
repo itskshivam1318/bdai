@@ -46,7 +46,7 @@ A stale status file misleads three agents at once — worse than none.
 Deliberately out of scope unless the demo needs it:
 
 - Authentication, authorization, multi-tenancy
-- Migrations — `rm api/app.db` is the migration tool
+- Migrations — `make reset` is the migration tool
 - Error handling off the demo path
 - Tests other than the demo path and `api/smoke_run.py`
 - Abstractions with exactly one implementation
@@ -71,12 +71,41 @@ Nothing else changes — not the canvas, not the backend.
 
 ## Running
 
+`make` with no arguments lists every target.
+
 ```bash
-./scripts/dev.sh                 # this worktree's stack
-./scripts/worktree.sh new alice  # a new worktree on its own ports
-./scripts/worktree.sh list       # who is running where
+make setup              # first run only: npm install, uv sync, playwright
+make dev                # this worktree's full stack (web + api)
+make smoke              # walking skeleton: drive a browser, break a locator, heal it
+make check              # typecheck + lint — run before handing work off
+make reset              # wipe this worktree's database and artifacts
+make stop               # kill this worktree's servers
 ```
 
-Each worktree gets its own port pair and its own SQLite file, so all three
-stacks run at once. The header in the UI shows which worktree you are looking
-at — check it before reporting a bug.
+Parallel work:
+
+```bash
+make worktree name=alice   # own branch, own ports, own database (~4s)
+make list                  # who is running where
+make rm name=alice         # remove it (branch is kept)
+```
+
+Every target behaves the same in the main checkout and inside a worktree —
+`scripts/dev.sh` reads `.worktree-env` for this stack's ports. The header in the
+UI shows which worktree you are looking at; check it before reporting a bug.
+
+## Gotchas worth not rediscovering
+
+**Do not symlink `node_modules` into a worktree.** Turbopack rejects it with
+*"Symlink [project]/node_modules is invalid, it points out of the filesystem
+root"*, and the failure is nasty: the API starts fine and only the web server
+dies. `scripts/worktree.sh` uses an APFS copy-on-write clone instead — 3s for
+475MB, near-zero real disk. If you are tempted to "simplify" that back to a
+symlink, don't.
+
+**Python needs no sharing.** `uv sync` hardlinks from uv's global cache, so a
+fresh per-worktree venv costs about 0.1s warm.
+
+**Widget config lives in local state**, not on the xyflow node's `data`.
+Mutating `data` is a lint error and causes stale renders; `WidgetNode` holds
+state and persists it 400ms after you stop typing.

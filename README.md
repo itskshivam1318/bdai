@@ -5,26 +5,22 @@ Autonomous QA Agent with Design Intelligence & Self-Healing Test Automation.
 ## Quickstart
 
 ```bash
-./scripts/dev.sh
+make setup   # first run only
+make dev
 ```
 
 - canvas → http://localhost:3000
 - system under test → http://localhost:3000/sut?v=1 (try `v=2`, `v=3`)
 - API docs → http://localhost:8000/docs
 
-First run only:
-
-```bash
-cd web && npm install
-cd api && uv sync --python 3.12 && uv run playwright install chromium
-```
+Run `make` on its own to list every target.
 
 ## Walking skeleton
 
 With the stack running:
 
 ```bash
-cd api && uv run python smoke_run.py http://localhost:3000
+make smoke
 ```
 
 Drives the browser against the system under test at v1, then v2 where the
@@ -35,9 +31,9 @@ Viewer** widget on the canvas with path `run-1/v2.png` to see the evidence.
 ## Parallel work
 
 ```bash
-./scripts/worktree.sh new alice   # own branch, own ports, own database
-./scripts/worktree.sh list        # who is running where
-./scripts/worktree.sh rm alice
+make worktree name=alice   # own branch, own ports, own database (~4s)
+make list                  # who is running where
+make rm name=alice
 ```
 
 Each worktree runs a full independent stack, so all three of us can have the
@@ -46,4 +42,5 @@ looking at.
 
 ## Where things are
 
-See `CLAUDE.md` — it maps the workspace and states the operating rules.
+See `CLAUDE.md` — it maps the workspace, states the operating rules, and lists
+the gotchas worth not rediscovering.

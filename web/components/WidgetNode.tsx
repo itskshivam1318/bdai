@@ -1,6 +1,6 @@
 "use client";
 import { NodeResizer, type NodeProps, type Node } from "@xyflow/react";
-import { useCallback, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { WIDGETS_BY_TYPE } from "@/lib/widgets/registry";
 import type { WidgetConfig } from "@/lib/widgets/types";
 
@@ -16,26 +16,33 @@ export type WidgetNodeType = Node<WidgetNodeData, "widget">;
 /**
  * Chrome shared by every widget: title bar, resize handles, and debounced
  * config persistence. Widgets themselves stay ignorant of the canvas.
+ *
+ * Config lives in local state rather than on the node's `data`, so typing feels
+ * instant while the network write lags behind it.
  */
 export default function WidgetNode({ data, selected }: NodeProps<WidgetNodeType>) {
-  const def = WIDGETS_BY_TYPE.get(data.widgetType);
-  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const { rowId, widgetType, onConfigChange } = data;
+  const def = WIDGETS_BY_TYPE.get(widgetType);
 
-  const setConfig = useCallback(
-    (patch: WidgetConfig) => {
-      const next = { ...data.config, ...patch };
-      // Typing in a widget shouldn't fire a PATCH per keystroke.
-      if (timer.current) clearTimeout(timer.current);
-      timer.current = setTimeout(() => data.onConfigChange(data.rowId, next), 400);
-      data.config = next;
-    },
-    [data],
-  );
+  const [config, setLocalConfig] = useState<WidgetConfig>(data.config);
+  const initialConfig = useRef(data.config);
+
+  const setConfig = useCallback((patch: WidgetConfig) => {
+    setLocalConfig((current) => ({ ...current, ...patch }));
+  }, []);
+
+  // One PATCH per pause in typing, not one per keystroke. Skipped on mount so
+  // loading the canvas doesn't immediately write back what it just read.
+  useEffect(() => {
+    if (config === initialConfig.current) return;
+    const timer = setTimeout(() => onConfigChange(rowId, config), 400);
+    return () => clearTimeout(timer);
+  }, [config, onConfigChange, rowId]);
 
   if (!def) {
     return (
       <div className="rounded-lg border border-red-300 bg-red-50 p-2 text-xs text-red-700">
-        Unknown widget type “{data.widgetType}”
+        Unknown widget type “{widgetType}”
       </div>
     );
   }
@@ -47,11 +54,7 @@ export default function WidgetNode({ data, selected }: NodeProps<WidgetNodeType>
         {def.label}
       </div>
       <div className="flex-1 overflow-hidden p-2">
-        <def.Component
-          nodeId={data.rowId}
-          config={data.config}
-          setConfig={setConfig}
-        />
+        <def.Component nodeId={rowId} config={config} setConfig={setConfig} />
       </div>
     </div>
   );
