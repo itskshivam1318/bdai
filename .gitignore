@@ -28,3 +28,8 @@ app/api/artifacts/*
 
 # worktrees live inside the repo but are never committed
 .worktrees/
+
+# generated test suites -- computed from a crawl, never hand-maintained
+app/web/generated/
+app/web/test-results/
+app/web/playwright-report/

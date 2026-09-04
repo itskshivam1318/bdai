@@ -13,7 +13,9 @@ app/
 ├── api/                backend — FastAPI + SQLModel + SQLite, driven by uv
 │   ├── app/                routers/, models.py, db.py, config.py, main.py
 │   ├── agents/explorer/    observe → identify → map → crawl → store. See below
-│   └── smoke_run.py        walking skeleton: browser → drift → heal → evidence
+│   ├── agents/generator.py map path → scenario → runnable .spec.ts
+│   ├── agents/runner.py    execute a scenario; heal, or report a defect, or escalate
+│   └── smoke_run.py        walking skeleton, superseded by `make loop`. See below
 ├── web/                frontend — Next.js 16 + React 19 + Tailwind v4
 │   ├── app/                layout, page, globals.css
 │   │   └── sut/            the system under test (see below)
@@ -22,9 +24,17 @@ app/
 └── scripts/            dev.sh (runs both servers), worktree.sh (unused)
 ```
 
-`web/app/sut/` is our own system under test: `?v=1|2|3` serve the same page with
-drifted markup, so self-healing has something real to heal. It is a fixture, not
-a product surface.
+`web/app/sut/` is our own system under test, and it carries **two orthogonal
+knobs** because the product claim is that we can tell two failures apart:
+
+| Knob | Moves | Must not move | The agent should |
+|---|---|---|---|
+| `?v=1\|2\|3` | markup — ids, button copy, field order, nesting | behaviour | heal and carry on |
+| `?bug=1` | behaviour — a completed form returns the form | markup | report a defect, and **not** heal |
+
+Keep them orthogonal. If drift ever changes behaviour, or the bug ever changes
+markup, a classifier that is only guessing will start scoring well. It is a
+fixture, not a product surface.
 
 ## The agent pipeline
 
@@ -133,8 +143,12 @@ ANTHROPIC_API_KEY                 # synth.py. Without it, invalid payloads come
 Fixtures and mocks are fine and expected — but they must be visible, or the next
 agent builds on sand:
 
-- `smoke_run.py` drives our own SUT at a fixed URL and a fixed pair of variants.
-  It is a skeleton proving the loop, not a general runner.
+- `smoke_run.py` drives our own SUT at a fixed URL and a fixed pair of variants,
+  and its `heal_locator` answers `get_by_role("button").first` — *any* button.
+  It is the walking skeleton that proved the wiring, kept for that history. The
+  real thing is `agents/runner.py`; `agents.probe` has a check named "healing
+  refuses a control it cannot justify" whose whole job is to stop that toy
+  behaviour coming back. Run `make loop`, not `make smoke`.
 - No migrations. `make reset` is the migration tool. `db.init_db()` imports
   `app.models` for a load-bearing reason — `create_all` only builds what has
   registered itself on the metadata, so without that import it silently creates

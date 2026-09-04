@@ -155,3 +155,75 @@ pool needs — several processes writing one run's rows — which then costs a
 claim column rather than a rewrite.
 
 **Who:** shivam + Claude.
+
+---
+
+## 2026-09-04 18:20 — A generated test asserts the transition, not the destination
+
+`generator.Expectation` records what an action **changed** — `moved`,
+`mutating`, and the added/removed lines of `explain(before, after)` — and never
+`actual_key == expected_key`.
+
+**Why:** `normalize()` deliberately keeps accessible names, so a button whose
+copy goes from "Sign in" to "Log in" changes the `state_key` of every state it
+appears in. An absolute-key assertion therefore reports **cosmetic markup drift
+as an application defect** — the exact confusion the Runner exists to resolve,
+reintroduced one level down. A transition delta is drift-immune because both
+sides of the diff drift together: the renamed button cancels out, a missing
+confirmation heading does not.
+
+Same reasoning one level further: `_behavioural()` drops `/url:` property lines
+from the delta. A link's href is markup, and the SUT's own variants differ by
+`/sut?v=1` versus `/sut?v=2` and nothing else.
+
+**Consequence:** `to_key` is still carried, as evidence for the report and never
+as the pass condition. Field signatures are compared as **sets**, not sequences,
+for the same reason — SUT v2 renders Password before Email, and an ordered
+comparison refused to heal a form no user could perceive as changed.
+
+**Who:** shivam + Claude.
+
+---
+
+## 2026-09-04 18:20 — Classification crosses two independent signals; it is not a judgement
+
+`runner.py` never asks "is this a bug?". It asks two orthogonal, separately
+observable questions and reads the answer off the cross product:
+
+|                | expectation met | expectation missed |
+|---|---|---|
+| resolved as-is | `passed`        | **`defect`**       |
+| resolved healed| `healed`        | **`escalate`**     |
+| did not resolve| —               | `escalate`         |
+
+**Why:** Google measured 84% of Pass→Fail transitions as flaky and only 1.23% of
+tests ever catching a real breakage (`research/healing-and-triage.md`). Against
+that base rate a model asked "script or defect?" scores well by always saying
+"script" and knows nothing. Resolution is a fact about markup; expectation is a
+fact about behaviour; neither is an opinion.
+
+`escalate` is the cell nobody ships — ~25 products surveyed, zero with
+policy-level escalation. When we healed the locator *and* the outcome changed,
+two variables moved at once and one run cannot attribute it. Saying so beats
+picking the answer that makes the dashboard greener.
+
+**Healing is a ladder of observable rungs**, not a model call: `exact` →
+`structural` (same kind, same role, same form field set — the only candidate) →
+`similarity` (difflib, gated by a floor *and* a margin over the runner-up) →
+refuse. The rung that fired is reported, because "healed structurally" and
+"healed by name similarity" are different amounts of trust.
+
+**Alternatives rejected:** an LLM healer proposing a replacement selector. It
+can only speak once the deterministic rungs have failed — precisely when its
+answer is least checkable — so it belongs above `escalate`, not above
+`structural`. The seam is there when a real app needs it.
+
+**Evidence:** `make probe` — ten checks driving the real crawler, generator and
+browser. Baseline `passed`, `?v=2` `healed` via `structural`, `?bug=1` `defect`,
+`?v=2&bug=1` `escalate`, and a check that healing refuses a control it cannot
+justify (the `smoke_run.heal_locator` regression: any button will do).
+`make specs` writes eight `.spec.ts` and stock `npx playwright test` passes 8/8.
+
+**Who:** shivam + Claude. Sequenced from a ChatGPT critique that correctly read
+the gap as "no executable layer" and incorrectly prescribed a linear
+Planner→Generator→Runner→Healer rebuild.

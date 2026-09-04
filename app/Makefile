@@ -2,7 +2,7 @@
 # scripts/dev.sh reads .worktree-env for ports, falling back to 3000/8000.
 
 .DEFAULT_GOAL := help
-.PHONY: help setup dev api web smoke probe explore crawl trace diff runs worktree list rm check reset stop
+.PHONY: help setup dev api web smoke probe loop generate specs explore crawl trace diff runs worktree list rm check reset stop
 
 PY_VERSION := 3.12
 
@@ -31,6 +31,16 @@ smoke: ## Walking skeleton: drive a browser, break a locator, heal it
 probe: ## Observable checks for the explorer and the agents. No API key needed.
 	cd api && uv run python -m agents.explorer.probe
 	cd api && uv run python -m agents.probe
+
+loop: ## The whole claim, in one command: crawl, generate, run, drift, defect. URL=...
+	cd api && uv run python -m agents.runner "$${URL:-http://localhost:$${WEB_PORT:-3000}/sut}"
+
+generate: ## Crawl an app and print the test plan it compiles to. URL=...
+	cd api && uv run python -m agents.generator "$${URL:-http://localhost:$${WEB_PORT:-3000}/sut}"
+
+specs: ## Write generated .spec.ts to web/generated, then run them with Playwright
+	cd api && uv run python -c "$$WRITE_SPECS"
+	cd web && npx playwright test generated --reporter=line
 
 explore: ## Map an app with the agent colony. URL=... [INTENT=...]
 	cd api && uv run python -m agents.orchestrator "$${URL:-http://localhost:$${WEB_PORT:-3000}/sut}" "$${INTENT}"
@@ -66,9 +76,27 @@ check: ## Typecheck and lint the frontend
 reset: ## Wipe this worktree's database and artifacts (no migrations here)
 	rm -f api/app.db
 	rm -rf api/artifacts/run-*
+	rm -rf web/generated
 	@echo "database and artifacts cleared"
 
 stop: ## Kill this worktree's servers
 	@-pkill -f "port $${WEB_PORT:-3000}" 2>/dev/null || true
 	@-pkill -f "port $${API_PORT:-8000}" 2>/dev/null || true
 	@echo "stopped"
+
+# Used by `make specs`. Exported so the recipe can pass it to python -c without
+# fighting make's own quoting rules.
+define WRITE_SPECS
+from playwright.sync_api import sync_playwright
+from agents.explorer.crawler import Budget, crawl
+from agents.generator import scenarios, write
+import os
+url = os.environ.get("URL") or f"http://localhost:{os.environ.get('WEB_PORT', '3000')}/sut"
+with sync_playwright() as pw:
+    browser = pw.chromium.launch()
+    world = crawl(browser.new_page(), url, Budget(max_actions=40, max_seconds=180))
+    browser.close()
+for path in write(scenarios(world), "../web/generated"):
+    print(path)
+endef
+export WRITE_SPECS

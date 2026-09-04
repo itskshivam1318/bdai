@@ -181,6 +181,16 @@ def _page_and_map(pw):
     return browser, page, world, world.record(observer.observe())
 
 
+def render_verdicts(result) -> str:
+    """A failed classification check, in one line per step. The `detail` of a
+    `check` is only read when something broke, so it carries the verdict and the
+    rung that produced it -- which together are the whole diagnosis."""
+    return " | ".join(
+        f"{step.verdict}({step.resolution.rung}): {step.detail[:90]}"
+        for step in result.steps
+    ) or "no steps ran"
+
+
 def check(label: str, condition: bool, detail: str = "") -> bool:
     print(f"  {'PASS' if condition else 'FAIL'}  {label}")
     if not condition and detail:
@@ -275,7 +285,116 @@ def main() -> int:
                 not compare(world, stripped).identical,
             )
 
-    # 4. The prompts are the tunable part; loading them must not silently break.
+        # 4. The executable layer: a path through the map becomes a test, and
+        #    the test's failure classifies itself. These six checks are the
+        #    acceptance experiment for the whole product claim, so they drive
+        #    the real crawler, the real generator and the real browser.
+        #
+        #    The SUT carries two orthogonal knobs precisely so this section can
+        #    exist: `?v=` moves the markup without touching behaviour, `?bug=1`
+        #    moves the behaviour without touching the markup. An agent that
+        #    always answers "heal" passes the drift check and fails the defect
+        #    check; one that always answers "defect" does the reverse. Only a
+        #    classifier reading both signals passes both.
+        print()
+        from .explorer.crawler import Budget as CrawlBudget
+        from .explorer.crawler import crawl
+        from .generator import Expectation, Step, from_json, scenarios, spec, to_json
+        from .runner import DEFECT, ESCALATE, HEALED, PASSED, resolve
+        from .runner import run as replay
+
+        browser = pw.chromium.launch()
+        page = browser.new_page()
+        mapped = crawl(page, SUT, CrawlBudget(max_actions=10, max_seconds=90))
+        plan = scenarios(mapped)
+        happy = next(
+            (s for s in plan if s.terminal.action.startswith("submit[valid]")), None
+        )
+
+        ok &= check("a crawl compiles into scenarios", bool(plan))
+        ok &= check(
+            "a completed form becomes a scenario",
+            happy is not None,
+            "no submit[valid] edge in the map -- the crawl never filled the form",
+        )
+
+        if happy is not None:
+            ok &= check(
+                "expectations are recorded effects, not invented ones",
+                bool(happy.terminal.expect.added) and happy.terminal.expect.moved,
+                "the happy path recorded no observable effect to assert on",
+            )
+            ok &= check(
+                "a scenario survives the round trip to JSON",
+                from_json(to_json(happy)) == happy,
+            )
+            exported = spec(happy)
+            ok &= check(
+                "the exported spec is a real Playwright file that asserts",
+                "@playwright/test" in exported
+                and "toBeVisible" in exported
+                and exported.count("test.step") == len(happy.steps),
+            )
+
+            baseline = replay(page, happy, target_url=SUT)
+            ok &= check(
+                "baseline: the recorded path still passes",
+                baseline.verdict == PASSED,
+                render_verdicts(baseline),
+            )
+
+            drifted = replay(page, happy, target_url=f"{SUT}?v=2")
+            ok &= check(
+                "markup drift is healed, not reported as a bug",
+                drifted.verdict == HEALED
+                and drifted.steps[-1].resolution.rung == "structural",
+                render_verdicts(drifted),
+            )
+
+            broken = replay(page, happy, target_url=f"{SUT}?bug=1")
+            ok &= check(
+                "a behavioural defect is reported, not healed away",
+                broken.verdict == DEFECT,
+                render_verdicts(broken),
+            )
+
+            both = replay(page, happy, target_url=f"{SUT}?v=2&bug=1")
+            ok &= check(
+                "drift and defect at once escalates instead of guessing",
+                both.verdict == ESCALATE,
+                render_verdicts(both),
+            )
+
+            # The regression that matters most. `smoke_run.heal_locator` used to
+            # answer `page.get_by_role("button").first` -- any button at all --
+            # which turns every failure into a green run. A step whose form no
+            # longer matches must refuse to resolve rather than grab a neighbour.
+            observer = Observer(page)
+            observer.start_window()
+            page.goto(SUT)
+            here = observer.observe()
+            #
+            # The name must be one the page does not carry, or the exact rung
+            # fires first and fires correctly: a descriptor that still resolves
+            # verbatim has not drifted, whatever else changed around it.
+            impostor = Step(
+                intent="submit a payment form this page does not have",
+                action="submit[valid]:button:Place order",
+                from_key="",
+                fields=(("textbox", "Card number"), ("textbox", "CVC")),
+                expect=Expectation(True, False, (), (), ""),
+            )
+            refusal = resolve(page, impostor, here)
+            ok &= check(
+                "healing refuses a control it cannot justify",
+                refusal.action is None,
+                f"the healer grabbed {refusal.action!r} via {refusal.rung} -- "
+                "the old toy behaviour, any button will do",
+            )
+
+        browser.close()
+
+    # 5. The prompts are the tunable part; loading them must not silently break.
     print()
     for role, marker in (("ant", "explorer ant"), ("orchestrator", "orchestrator")):
         text = instructions(role)
