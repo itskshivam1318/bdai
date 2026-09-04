@@ -18,11 +18,14 @@ end.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from sqlmodel import Session
 
 from agents.explorer import store
 from agents.explorer.crawler import Budget, crawl as crawl_world
 from agents.explorer.forms import Credentials
+from agents.explorer.synth import Synthesizer
 from app.db import engine
 
 from .client import Console
@@ -37,6 +40,13 @@ def crawl(
     max_seconds: float = 180.0,
 ) -> dict:
     from playwright.sync_api import sync_playwright
+
+    # Without a synthesizer `forms.perform` refuses every `submit[invalid]`
+    # rather than submitting valid input under an invalid label -- correct, but
+    # it silently costs the map its error states, which are a deliverable. This
+    # was missing here while `crawler.main` had it, so `make crawl` and the MCP
+    # tool disagreed about what the same app offers.
+    synthesizer = Synthesizer(cache_path=Path("artifacts/invalid-payloads.json"))
 
     session = console.session_for(url, name)
     run = console.create_run(session["id"], url)
@@ -69,6 +79,7 @@ def crawl(
                 url,
                 budget=Budget(max_states=max_states, max_seconds=max_seconds),
                 credentials=Credentials.from_env(),
+                synthesizer=synthesizer,
                 checkpoint=checkpoint,
             )
             browser.close()

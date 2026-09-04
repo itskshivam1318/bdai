@@ -174,11 +174,62 @@ comparison would flag wholesale. And on `testingchallenges` it returned a
 exactly, so the classifier refused to heal it and called it a defect. That is
 the product claim working on an unrehearsed third-party app.
 
-**Still open:** the bet asked for a target rich enough to write journeys
-against. The answer so far is that **richness was never the binding constraint —
-frontier ordering is.** Re-run against `saucedemo.com` or Conduit before
-accepting that, since both have a login wall that gates a genuinely multi-step
-area, and a wall is what forces depth.
+**RESOLVED 2026-09-04 19:50 against `saucedemo.com`. BET-005 passes, and the
+frontier-ordering diagnosis above was wrong.**
+
+| | States | Transitions | Flows ≥3 steps | Nondeterministic |
+|---|---|---|---|---|
+| Bar | ≥8 | — | ≥3 | ≥1 |
+| saucedemo | **19** | **24** | **3** | 0 |
+
+It crossed the login wall on the first try (`submit[valid]:button:Login` →
+`/inventory.html`) and went on to item pages, the burger menu and add-to-cart.
+The longest journey is four steps: *log in → open an item → open the menu →
+follow All Items*. Only the nondeterministic-edge criterion is unmet, and that
+one was always a bonus.
+
+**Frontier ordering was never the problem.** `crawler.py:_priority` already
+ranks `submit[valid]` ahead of every link at equal depth, with a comment saying
+exactly why ("a login wall is the highest-value edge in any app"). The rule is
+right and it fired correctly on saucedemo. On the earlier two targets it never
+got the chance, because the edge was **disqualified before ordering applied**:
+
+    forms.perform -> fill_form typed nothing -> returns False
+                  -> crawler adds (state, action) to `skipped`, forever
+
+Measured, per target, with `forms.form_of` and `forms.fill_form` directly:
+
+| Target | `form_of` | Fields the observer named | `fill_form` |
+|---|---|---|---|
+| `saucedemo.com` | found | `textbox:Username`, `textbox:Password` | **2 typed** |
+| `testingchallenges` | found | four `textbox:` with **empty names** | **0 typed** |
+| `practicetestautomation` | **None** — page has no `<form>` | `textbox:Username`, `textbox:Password` | n/a |
+
+So there are two distinct failure modes, and neither is about budget or
+ordering:
+
+1. **No `<form>` element** — `form_of` returns None, no form action is ever
+   synthesised. (practicetestautomation)
+2. **Fields with no accessible name** — the form is found, but `fill_form`
+   cannot decide what to type into an anonymous textbox, types nothing, and the
+   action is disqualified. (testingchallenges)
+
+Both end the same way: the single highest-value edge is dropped, the budget then
+drains into nav links, and the run *looks* like a shallow-target problem. It is
+not. **A crawl that cannot type is a crawl that cannot leave the front page.**
+
+**The missing end statement is not a stopping rule — it is a reason.** The loop
+ends at `if not pending: break`, which is reached both when the app is genuinely
+exhausted and when everything left is in `skipped`. Those are opposite
+outcomes reported identically, and `skipped` is an opaque `set` that records no
+reason. Nothing downstream — `summary()`, the console, the MCP `map` tool — can
+tell "this app has no more to offer" from "we gave up on its login form".
+
+Cheapest fix, and the one to do first: make `skipped` a
+`dict[(state, action), reason]`, and report it. It turns the failure that cost
+two of three targets from invisible into a line of output. A retry policy for
+the transient reasons (replay failed) versus the permanent ones (off-origin) is
+a second, separable step — and unnecessary until the reasons are visible.
 
 **Timebox:** 30 minutes. Unblocked — needs no API key and no target from the
 organiser.

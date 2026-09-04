@@ -70,6 +70,16 @@ def latest_run(console: Console, target_url: str | None = None) -> dict | None:
     return None
 
 
+# `generator.scenarios` defaults to 8, which is a *demo* size: it is the
+# number of .spec.ts files `make specs` should write, not the number of
+# journeys an app has. Measured on saucedemo (19 states), the default
+# returned 8 scenarios with **zero** of 3+ steps, while limit=40 returned 11
+# with three -- including a four-step login -> item -> menu -> All Items
+# journey. The map had the depth all along; the cap hid it. An agent asking
+# what an app does wants the app's answer, not the demo's.
+SCENARIO_LIMIT = 60
+
+
 def map_of(run_id: int, include_snapshots: bool = False) -> dict:
     """The world map as an agent wants it: states, edges, and runnable flows.
 
@@ -79,7 +89,7 @@ def map_of(run_id: int, include_snapshots: bool = False) -> dict:
     added answer.
     """
     world = world_of(run_id)
-    scenarios = generator.scenarios(world)
+    scenarios = generator.scenarios(world, limit=SCENARIO_LIMIT)
 
     return {
         "run_id": run_id,
@@ -110,12 +120,15 @@ def map_of(run_id: int, include_snapshots: bool = False) -> dict:
             for (key, action), edges in world.transitions.items()
             for edge in edges
         ],
+        # Longest first: a multi-step journey says more about the app than a
+        # one-click edge, and a caller that reads only the head of the list
+        # should get the journeys.
         "flows": [
             {
                 "name": scenario.name,
                 "steps": [step.intent for step in scenario.steps],
             }
-            for scenario in scenarios
+            for scenario in sorted(scenarios, key=lambda s: -len(s.steps))
         ],
         # Two edges with the same (state, action) landing apart means
         # `normalize()` collapsed behaviours that differ. Surfaced, not hidden:
@@ -172,7 +185,7 @@ def impact_of(run_id: int, names: list[str]) -> dict:
     affected when you delete that heading, even though it never acts on it.
     """
     world = world_of(run_id)
-    scenarios = generator.scenarios(world)
+    scenarios = generator.scenarios(world, limit=SCENARIO_LIMIT)
 
     affected, observing = [], []
     for scenario in scenarios:
