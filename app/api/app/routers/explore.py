@@ -28,19 +28,20 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 # Absolute, not relative: `agents/` is a sibling of `app/` under `api/`, so a
 # relative import would climb above this package and fail at import time.
-from agents import orchestrator
+from agents import orchestrator, runner
 from agents.explorer import crawler, store
 from agents.explorer.forms import Credentials
 from agents.explorer.synth import Synthesizer
+from agents.generator import scenarios
 from agents.llm import load
 from agents.tracing import start as start_tracing
 from ..config import settings
 from ..db import engine, get_session
-from ..models import Event, Run
+from ..models import Event, Run, TestCase
 
 router = APIRouter(prefix="/api/runs", tags=["explore"])
 
@@ -82,6 +83,45 @@ def _crawl_only(page, target_url: str, emit, checkpoint) -> orchestrator.Explora
         if actions
     )
     return orchestrator.Exploration(world=world, stopped="no model", gaps=gaps[:3])
+
+
+def _save_results(results, run_id: int, db: Session) -> int:
+    """Replay outcomes as `TestCase` rows. Idempotent per run.
+
+    Stands in for `suite.save_results` (Task 4), which lives on `work/map`
+    along with `agents/suite.py`. Writing it here rather than creating that
+    file keeps this change off the map branch's territory -- swap the call when
+    the branch lands, and delete this.
+
+    Rows are cleared before writing: a re-run of the same `run_id` is a second
+    opinion about the same app, not eight more tests. `store.save` takes the
+    same view of states.
+    """
+    for stale in db.exec(select(TestCase).where(TestCase.run_id == run_id)).all():
+        db.delete(stale)
+
+    for outcome in results:
+        healed = outcome.healed_steps
+        # The terminal step is what the scenario is *about* -- generator.py
+        # builds one scenario per distinct terminal action -- so its locator is
+        # the one worth recording against the row.
+        terminal = outcome.scenario.terminal
+        db.add(
+            TestCase(
+                run_id=run_id,
+                name=outcome.scenario.name,
+                selector=terminal.action,
+                healed_selector=healed[-1].resolution.action if healed else None,
+                status=outcome.verdict,
+                detail=" | ".join(
+                    f"[{s.verdict}] {s.step.intent}" for s in outcome.steps
+                )[:2000]
+                or None,
+            )
+        )
+
+    db.commit()
+    return len(results)
 
 
 def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
@@ -143,6 +183,10 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
                 seen = len(world.states)
                 emit("info", f"  crawled {seen} state(s)")
 
+        # Assigned inside the `with` block below but read after it, and the
+        # `except` path must still find a list rather than a NameError.
+        results: list = []
+
         try:
             with sync_playwright() as pw:
                 browser = pw.chromium.launch()
@@ -164,33 +208,110 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
                         on_event=emit,
                         run_id=run_id,
                     )
+                # --- map ---------------------------------------------
+                # The browser stays open past this point: generation reads the
+                # map, but replay drives a live page, and reopening one would
+                # throw away the session the crawl just established.
+                rows = store.save(result.world, run_id, db)
+                emit(
+                    "decision",
+                    f"map saved: {len(result.world.states)} states, "
+                    f"{sum(len(t) for t in result.world.transitions.values())} "
+                    # "new": the crawl checkpoints as it goes, so a healthy run
+                    # ends at 0 here. Bare "(0 rows)" reads like a failed write.
+                    f"transitions ({rows} new rows)",
+                )
+
+                # --- plan --------------------------------------------
+                for flow in result.flows:
+                    emit("decision", f"flow: {flow.get('name')} -- {flow.get('why', '')}")
+                emit(
+                    "decision",
+                    f"plan: {len(result.flows)} flows across "
+                    f"{len(result.world.states)} states",
+                    surface="plan",
+                )
+
+                # --- coverage, before generation, as the brief requires
+                for gap in result.gaps:
+                    emit("warn", f"gap: {gap}")
+                emit(
+                    "warn" if result.gaps else "info",
+                    f"coverage: {len(result.gaps)} gap(s) before generation",
+                    surface="coverage",
+                )
+
+                # --- suite -------------------------------------------
+                plan = scenarios(result.world)
+                emit(
+                    "decision",
+                    f"suite: {len(plan)} scenarios compiled from recorded paths",
+                    surface="suite",
+                )
+
+                # --- run and heal ------------------------------------
+                credentials = Credentials.from_env()
+                for scenario in plan:
+                    try:
+                        results.append(
+                            runner.run(
+                                page,
+                                scenario,
+                                credentials=credentials,
+                                on_event=emit,
+                            )
+                        )
+                    except Exception as exc:
+                        # One scenario that cannot even be replayed must not
+                        # cost the others their verdicts.
+                        emit("error", f"{scenario.name}: {type(exc).__name__}: {exc}")
+
                 browser.close()
 
-            rows = store.save(result.world, run_id, db)
+            written = _save_results(results, run_id, db)
+
+            for outcome in results:
+                for step in outcome.healed_steps:
+                    emit(
+                        "decision",
+                        f"healed: {step.step.action} -> {step.resolution.action} "
+                        f"({step.resolution.rung})",
+                        surface="heal",
+                    )
+                if outcome.verdict in {runner.DEFECT, runner.ESCALATE}:
+                    emit(
+                        "error",
+                        f"{outcome.verdict}: {outcome.scenario.name}",
+                        surface="defect",
+                    )
+
+            tally = {
+                v: sum(1 for r in results if r.verdict == v)
+                for v in (runner.PASSED, runner.HEALED, runner.DEFECT, runner.ESCALATE)
+            }
             emit(
                 "decision",
-                f"map saved: {len(result.world.states)} states, "
-                f"{sum(len(t) for t in result.world.transitions.values())} "
-                # "new": the crawl checkpoints as it goes, so a healthy run
-                # ends at 0 here. Bare "(0 rows)" reads like a failed write.
-                f"transitions ({rows} new rows)",
+                f"report: {tally[runner.PASSED]} passed, {tally[runner.HEALED]} healed, "
+                f"{tally[runner.DEFECT]} defect, {tally[runner.ESCALATE]} escalate, "
+                f"{len(result.gaps)} gap(s) remaining ({written} rows)",
+                surface="report",
             )
-            for flow in result.flows:
-                emit("decision", f"flow: {flow.get('name')} -- {flow.get('why', '')}")
-            for gap in result.gaps:
-                emit("warn", f"gap: {gap}")
 
             if run:
-                # Not "passed": a map exists, but no flows were named and no
-                # intent was honoured. Green would claim more than happened,
-                # and red would hide a map that is genuinely there. `degraded`
-                # is unknown to STATUS_TONE and renders grey, which is the
-                # point -- see SessionView.tsx.
-                run.status = "passed" if provider else "degraded"
+                # A defect is a defect whoever found it, so it outranks the
+                # model question. Absent one, `degraded` survives a model-free
+                # run: a map and a suite exist, but no flow was named and no
+                # intent was honoured, so green would claim more than happened.
+                # `degraded` is unknown to STATUS_TONE and renders grey, which
+                # is the point -- see SessionView.tsx.
+                if tally[runner.DEFECT] or tally[runner.ESCALATE]:
+                    run.status = "failed"
+                else:
+                    run.status = "passed" if provider else "degraded"
                 run.summary = result.summary or (
-                    f"{len(result.world.states)} states, "
-                    f"{sum(len(t) for t in result.world.transitions.values())} "
-                    f"transitions -- crawled without a model. Set "
+                    f"{len(result.world.states)} states, {len(plan)} scenarios, "
+                    f"{tally[runner.DEFECT] + tally[runner.ESCALATE]} needing "
+                    f"attention -- crawled without a model. Set "
                     f"ANTHROPIC_API_KEY for flows and a summary."
                     if provider is None
                     else f"stopped: {result.stopped}"
