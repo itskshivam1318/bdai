@@ -2,7 +2,7 @@
 # scripts/dev.sh reads .worktree-env for ports, falling back to 3000/8000.
 
 .DEFAULT_GOAL := help
-.PHONY: help setup dev api web smoke probe loop generate specs explore crawl trace diff runs worktree list rm check reset stop
+.PHONY: help setup dev api web smoke probe loop generate specs gaps explore crawl trace diff runs worktree list rm check reset stop
 
 PY_VERSION := 3.12
 
@@ -34,6 +34,9 @@ probe: ## Observable checks for the explorer and the agents. No API key needed.
 
 loop: ## The whole claim, in one command: crawl, generate, run, drift, defect. URL=...
 	cd api && uv run python -m agents.runner "$${URL:-http://localhost:$${WEB_PORT:-3000}/sut}"
+
+gaps: ## Crawl an app and rank what the crawl did not cover. URL=...
+	cd api && uv run python -m agents.critic "$${URL:-http://localhost:$${WEB_PORT:-3000}/sut}"
 
 generate: ## Crawl an app and print the test plan it compiles to. URL=...
 	cd api && uv run python -m agents.generator "$${URL:-http://localhost:$${WEB_PORT:-3000}/sut}"
