@@ -366,7 +366,11 @@ def main(entry_url: str, intent: str | None = None) -> int:
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch()
-        page = browser.new_page()
+        # Test and staging targets routinely serve self-signed or expired certs;
+        # refusing them would make the agent useless on its own target market. The
+        # run still reports that transport security was not verified -- see
+        # `_tls_warning`.
+        page = browser.new_page(ignore_https_errors=True)
         result = run(
             page, entry_url, provider, intent=intent, credentials=credentials
         )

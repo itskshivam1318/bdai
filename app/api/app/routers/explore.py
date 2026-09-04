@@ -89,6 +89,40 @@ def _crawl_only(page, target_url: str, emit, checkpoint, shot) -> orchestrator.E
     return orchestrator.Exploration(world=world, stopped="no model", gaps=gaps[:3])
 
 
+def _tls_warning(target_url: str) -> str | None:
+    """Why the browser would have refused this target, or None if it is fine.
+
+    The browser is launched with `ignore_https_errors=True` -- a QA agent whose
+    market is staging environments cannot refuse self-signed certs -- but
+    silently ignoring them would let a report imply a security posture the run
+    never checked. Playwright does not say whether it had to overlook anything,
+    so the handshake is re-attempted here with verification on: the only thing
+    this needs to know is whether a *verifying* client would have failed.
+
+    Never raises. A target that is unreachable is the crawl's problem to report,
+    not this function's -- it returns None and lets navigation produce the real
+    error.
+    """
+    import socket
+    import ssl
+    from urllib.parse import urlparse
+
+    parsed = urlparse(target_url)
+    if parsed.scheme != "https":
+        return None
+
+    port = parsed.port or 443
+    context = ssl.create_default_context()
+    try:
+        with socket.create_connection((parsed.hostname, port), timeout=5) as raw:
+            with context.wrap_socket(raw, server_hostname=parsed.hostname):
+                return None
+    except ssl.SSLCertVerificationError as exc:
+        return exc.verify_message or str(exc)
+    except (OSError, ValueError):
+        return None
+
+
 def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
     """The background job. Owns its own DB session and its own browser."""
     from playwright.sync_api import sync_playwright
@@ -111,6 +145,18 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
         traces = start_tracing()
         if traces:
             emit("info", f"traces: {traces}")
+
+        # Said once, up front, and recorded on the run: everything below this
+        # line talked to a host whose identity was never established.
+        untrusted = _tls_warning(target_url)
+        if untrusted:
+            emit(
+                "warn",
+                f"TLS not verified for {target_url} ({untrusted}) -- "
+                "exploring anyway; treat any security claim in this report as "
+                "unproven",
+                surface="explore",
+            )
 
         # A missing key degrades the run; it does not end it. The error message
         # has always named `explorer.crawler` as the way to get a map anyway,
@@ -155,7 +201,11 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
         try:
             with sync_playwright() as pw:
                 browser = pw.chromium.launch()
-                page = browser.new_page()
+                # Test and staging targets routinely serve self-signed or expired certs;
+                # refusing them would make the agent useless on its own target market. The
+                # run still reports that transport security was not verified -- see
+                # `_tls_warning`.
+                page = browser.new_page(ignore_https_errors=True)
                 if provider is None:
                     result = _crawl_only(
                         page,
