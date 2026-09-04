@@ -1,13 +1,25 @@
 /**
  * System Under Test.
  *
- * Self-healing test automation is impossible to demo without something that
- * breaks in a realistic way. `?v=2` and `?v=3` serve the same *functional* page
- * with drifted markup — renamed test ids, changed button copy, extra wrapper
- * elements, reordered fields. A locator written against v1 fails on v2/v3, and
- * the agent's job is to recover it.
+ * Two independent knobs, because the demo has to tell two failures apart and a
+ * fixture that conflates them proves nothing:
  *
- * Keep the semantics identical across variants: only the selectors move.
+ *   ?v=1|2|3   MARKUP DRIFT. Same behaviour, moved selectors — renamed test
+ *              ids, changed button copy, reordered fields, an extra wrapper.
+ *              A locator written against v1 misses on v2/v3. The agent should
+ *              heal and carry on.
+ *
+ *   ?bug=1     BEHAVIOURAL DEFECT. Markup untouched, so every locator still
+ *              resolves and the click still lands. The app simply fails to
+ *              transition: a completed form returns the completed form instead
+ *              of the confirmation. The agent must NOT heal this — there is
+ *              nothing broken to repair — it must report it.
+ *
+ * Keep those orthogonal. Drift must never change behaviour and the bug must
+ * never change markup, or an agent that scores well is only guessing.
+ *
+ * Rendered on the server and driven by a plain GET form, so a state is a URL
+ * and every state the agent reaches is one a human can reach by hand.
  */
 
 type Variant = "1" | "2" | "3";
@@ -27,11 +39,48 @@ const SUBMIT_COPY: Record<Variant, string> = {
 export default async function SystemUnderTest({
   searchParams,
 }: {
-  searchParams: Promise<{ v?: string }>;
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
 }) {
-  const raw = (await searchParams).v ?? "1";
+  const params = await searchParams;
+  const one = (key: string) => {
+    const value = params[key];
+    return (Array.isArray(value) ? value[0] : value) ?? "";
+  };
+
+  const raw = one("v") || "1";
   const variant: Variant = raw === "2" || raw === "3" ? raw : "1";
   const ids = FIELD[variant];
+  const buggy = one("bug") === "1";
+
+  const submitted = one("submitted") === "1";
+  const email = one("email").trim();
+  const password = one("password").trim();
+  const complete = Boolean(email && password);
+
+  // The three outcomes. `buggy` collapses the success arm back onto the form —
+  // no error, no confirmation, no clue in the markup. Exactly the failure a
+  // selector-healing agent will happily "repair" forever if it is only
+  // watching locators.
+  const outcome =
+    !submitted ? "form"
+    : !complete ? "rejected"
+    : buggy ? "form"
+    : "confirmed";
+
+  if (outcome === "confirmed") {
+    return (
+      <main className="mx-auto flex min-h-dvh max-w-sm flex-col justify-center gap-6 p-6">
+        <header>
+          <h1 className="text-xl font-semibold">Order confirmed</h1>
+          <p className="text-sm text-neutral-500">DOM variant v{variant}</p>
+        </header>
+        <p className="text-sm">Signed in as {email}. Your order is on its way.</p>
+        <a className="text-sm underline" href={`/sut?v=${variant}`}>
+          Start over
+        </a>
+      </main>
+    );
+  }
 
   // v3 also nests the form one level deeper, so structural locators break too.
   const Wrapper = variant === "3" ? "section" : "div";
@@ -43,8 +92,19 @@ export default async function SystemUnderTest({
         <p className="text-sm text-neutral-500">DOM variant v{variant}</p>
       </header>
 
+      {outcome === "rejected" && (
+        <p role="alert" className="text-sm text-red-600">
+          Email and password are required
+        </p>
+      )}
+
       <Wrapper className={variant === "3" ? "rounded-lg border p-4" : undefined}>
-        <form className="flex flex-col gap-3" data-testid={`form-v${variant}`}>
+        <form method="get" action="/sut" className="flex flex-col gap-3">
+          {/* The knobs ride along so a submit stays in the world it started in. */}
+          <input type="hidden" name="v" value={variant} />
+          {buggy && <input type="hidden" name="bug" value="1" />}
+          <input type="hidden" name="submitted" value="1" />
+
           {/* v2 puts password first — order-based locators break here. */}
           {variant === "2" && (
             <PasswordField id={ids.password} className="order-first" />
@@ -54,7 +114,7 @@ export default async function SystemUnderTest({
             <input
               type="email"
               id={ids.email}
-              name={ids.email}
+              name="email"
               data-testid={ids.email}
               className="rounded border border-neutral-300 px-2 py-1"
               placeholder="you@example.com"
@@ -91,7 +151,7 @@ function PasswordField({ id, className }: { id: string; className?: string }) {
       <input
         type="password"
         id={id}
-        name={id}
+        name="password"
         data-testid={id}
         className="rounded border border-neutral-300 px-2 py-1"
       />
