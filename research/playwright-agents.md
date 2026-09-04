@@ -150,3 +150,62 @@ locator to prefer test ids and ARIA roles over CSS — and
   Check `npx playwright init-agents --help` locally.
 - Web search quota ran out mid-research, so the human-intervention analysis
   rests on primary sources rather than practitioner reports.
+
+---
+
+## Verified locally on this machine, 2026-09-04
+
+Ran `npx playwright init-agents --loop=claude --prompts` in a scratch project.
+Everything above is confirmed on disk, plus three corrections/confirmations:
+
+**Installed version: 1.62.1.** `--loop` choices are exactly `claude`, `codex`,
+`copilot`, `opencode`, `vscode`, `vscode-legacy` — **no `cursor`**, resolving
+that open caveat.
+
+**Files written:**
+```
+specs/README.md
+tests/seed.spec.ts
+.claude/prompts/playwright-test-{coverage,generate,heal,plan}.md
+.claude/agents/playwright-test-{planner,generator,healer}.md
+.mcp.json
+```
+
+**The seed test is exactly as described — an empty stub:**
+```ts
+import { test, expect } from '@playwright/test';
+test.describe('Test group', () => {
+  test('seed', async ({ page }) => {
+    // generate code here.
+  });
+});
+```
+No URL, no auth, no fixtures. A human writes the real one, and **every stage
+runs it first**. This is seam (a), confirmed.
+
+**`.claude/commands/` does NOT exist** — prompts land in `.claude/prompts/`
+only. Claude Code registers project slash commands from `.claude/commands/`, so
+**the shipped coverage prompt is not exposed as `/playwright-test-coverage`**.
+Caveat confirmed true.
+
+**The planner's tool list confirms the exploration gap.** It has 19
+`browser_*` tools plus `planner_setup_page` / `planner_save_plan` — and
+`model: sonnet` hardcoded in frontmatter. Its instructions say "Thoroughly
+explore the interface", but there is no crawl budget, no state-abstraction, no
+loop detection, no stopping rule. Exploration quality is entirely whatever the
+LLM improvises.
+
+**`playwright-test-coverage.md` verbatim — this single file is the brief:**
+
+> 1. Call #playwright-test-planner subagent with prompt: `<plan>…</plan>`
+> 2. **For each test case from the test plan file (1.1, 1.2, ...), one after
+>    another, not in parallel**, call #playwright-test-generator subagent…
+> 3. Call #playwright-test-healer subagent with: `<heal>Run all tests and fix
+>    the failing ones one after another.</heal>`
+
+Read what is absent: no coverage evaluation between steps 1 and 2 (despite the
+filename), no re-plan condition, no retry, no resume, no escalation, no
+parallelism, no writing results back to the plan, no report. It is a
+three-sentence instruction to a human's chat client.
+
+**Every must-have in the brief maps to something missing from this file.**
