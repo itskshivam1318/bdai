@@ -346,7 +346,7 @@ From here or from the repo root; `make` with no arguments lists every target.
 make setup     # first run only: npm install, uv sync, playwright install
 make dev       # both servers — web :3000, api :8000
 make pipeline  # the whole claim: URL in, test quality report out
-make probe     # 41 observable checks. No API key, no quota
+make probe     # 115 observable checks. No API key, no quota
 make gaps      # crawl an app and rank what the crawl did not cover
 make specs     # write generated .spec.ts, then run them with Playwright
 make check     # typecheck + lint — run before handing work off

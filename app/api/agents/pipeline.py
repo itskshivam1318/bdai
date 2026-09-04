@@ -540,6 +540,15 @@ def fixture_variants(entry_url: str) -> tuple[str, ...]:
 
     A real second target is a real deploy, so `main()` takes those on the
     command line. What this function decides is only the default.
+
+    **Three targets, not two.** The knobs are orthogonal by construction, which
+    means they compose, and the composition is the one verdict the taxonomy has
+    that nothing else demonstrates. `?v=2` alone is HEALED, `?bug=1` alone is
+    DEFECT, and both at once is ESCALATE -- the locator was repaired *and* the
+    behaviour changed, so neither observation explains the other and the run is
+    genuinely unattributable. `runner.py` has always classified it and
+    `agents/probe.py` has always checked it; until this line nothing ever
+    *showed* it, so the demo said three of the four words it can say.
     """
     parsed = urlsplit(entry_url)
     ours = parsed.hostname in {"localhost", "127.0.0.1"} and parsed.path.rstrip(
@@ -548,7 +557,7 @@ def fixture_variants(entry_url: str) -> tuple[str, ...]:
     if not ours:
         return ()
     base = urlunsplit(parsed._replace(query="", fragment=""))
-    return (f"{base}?v=2", f"{base}?bug=1")
+    return (f"{base}?v=2", f"{base}?bug=1", f"{base}?v=2&bug=1")
 
 
 def main(entry_url: str, verify_against: tuple[str, ...] = ()) -> int:

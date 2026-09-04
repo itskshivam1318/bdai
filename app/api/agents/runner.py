@@ -372,14 +372,28 @@ def render(result: Result) -> str:
 
 
 def main(entry_url: str) -> int:
-    """The acceptance experiment: one crawl, one scenario, three runs.
+    """The acceptance experiment: one crawl, one scenario, every verdict it has.
 
     Needs `make dev`. Spends no quota -- nothing in this path calls a model.
+
+    The targets come from `pipeline.fixture_variants` rather than from string
+    concatenation here, and that is a fix, not a tidy-up. This function used to
+    append `?v=2` and `?bug=1` to whatever URL it was given; pointed at a real
+    app those are query parameters it ignores, so two of the three runs
+    re-tested a byte-identical page and the output labelled them "markup drift"
+    and "injected defect". Nothing failed, so nothing looked wrong. Against a
+    third-party URL there are now no extra runs and the baseline stands alone,
+    which is the honest answer.
     """
     from playwright.sync_api import sync_playwright
 
     from .explorer.crawler import Budget, crawl
     from .generator import scenarios
+
+    # Local: `pipeline` imports this module at module level, so importing it
+    # back at the top would be a cycle. This is a CLI entry point and the file
+    # already imports its other collaborators here for the same reason.
+    from .pipeline import fixture_variants
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch()
@@ -400,13 +414,27 @@ def main(entry_url: str) -> int:
             return 1
 
         print(f"scenario: {happy.name}\n")
-        for label, url in (
-            ("1. baseline           ", entry_url),
-            ("2. markup drift  (v=2)", f"{entry_url}?v=2"),
-            ("3. injected defect    ", f"{entry_url}?bug=1"),
-        ):
+
+        # Labels are positional against `fixture_variants`, which returns the
+        # SUT's knobs in a fixed order and an empty tuple for anything else.
+        # `zip` is what makes a third-party target degrade to the baseline
+        # alone rather than to three mislabelled runs.
+        expected = (
+            "expect HEALED   -- markup moved, behaviour did not",
+            "expect DEFECT   -- markup untouched, behaviour changed",
+            "expect ESCALATE -- both moved; neither observation explains the other",
+        )
+        targets = [("1. baseline", entry_url, "expect PASSED")]
+        targets += [
+            (f"{i}. {url.split('?', 1)[1]}", url, note)
+            for i, (url, note) in enumerate(
+                zip(fixture_variants(entry_url), expected), start=2
+            )
+        ]
+
+        for label, url, note in targets:
+            print(f"--- {label:<22} {note} ---")
             result = run(page, happy, target_url=url)
-            print(f"--- {label} ---")
             print(render(result))
             print()
 

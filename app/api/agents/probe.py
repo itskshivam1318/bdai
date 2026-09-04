@@ -873,17 +873,19 @@ def main() -> int:
             "a link-following scenario would be re-run against a different base",
         )
 
-        # `?v=2` and `?bug=1` are knobs on *our* SUT and nothing else. Appended
-        # to a third-party URL they are query parameters the app ignores, so the
-        # suite gets re-run against a byte-identical target and the report calls
-        # the result a verification. Measured against saucedemo before this
-        # check existed: 4 of 12 reported runs meant nothing.
+        # `?v=2`, `?bug=1` and their composition are knobs on *our* SUT and
+        # nothing else. Appended to a third-party URL they are query parameters
+        # the app ignores, so the suite gets re-run against a byte-identical
+        # target and the report calls the result a verification. Measured
+        # against saucedemo before this check existed: 4 of 12 reported runs
+        # meant nothing.
         from .pipeline import fixture_variants
 
         ok &= check(
             "the SUT's fixture knobs are not appended to a third-party URL",
             fixture_variants("https://www.saucedemo.com") == ()
-            and fixture_variants(SUT) == (f"{SUT}?v=2", f"{SUT}?bug=1"),
+            and fixture_variants(SUT)
+            == (f"{SUT}?v=2", f"{SUT}?bug=1", f"{SUT}?v=2&bug=1"),
             "a real target would be re-verified against itself",
         )
 
