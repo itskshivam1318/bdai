@@ -42,6 +42,7 @@ def seed(session: Session) -> int:
             url="http://localhost:3000/sut",
             title="Home",
             actions=json.dumps(["button:Sign in"]),
+            fields=json.dumps([["textbox", "Email"], ["textbox", "Password"]]),
             screenshot=f"run-{run.id}/aaaa000000000000.png",
             is_entry=True,
         )
@@ -119,6 +120,15 @@ def main() -> int:
         ok &= check(
             "actions arrive parsed, not as a JSON string",
             states["aaaa000000000000"]["actions"] == ["button:Sign in"],
+        )
+        ok &= check(
+            "a state reports its input fields",
+            states["aaaa000000000000"]["fields"]
+            == [["textbox", "Email"], ["textbox", "Password"]],
+        )
+        ok &= check(
+            "a state with no fields returns an empty list, not null",
+            states["bbbb000000000000"]["fields"] == [],
         )
         ok &= check(
             "a thumbnail path is the URL suffix the browser needs",

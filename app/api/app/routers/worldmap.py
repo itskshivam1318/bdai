@@ -33,6 +33,7 @@ class StateOut(BaseModel):
     label: str | None
     is_entry: bool
     actions: list[str]
+    fields: list[list[str]]
     screenshot: str | None
     verdict: str | None
 
@@ -70,6 +71,10 @@ def get_map(run_id: int, session: Session = Depends(get_session)) -> MapOut:
         except json.JSONDecodeError:
             # A corrupt blob is one grey node, not a broken console.
             actions = []
+        try:
+            fields = json.loads(row.fields or "[]")
+        except json.JSONDecodeError:
+            fields = []
         states.append(
             StateOut(
                 key=row.key,
@@ -78,6 +83,7 @@ def get_map(run_id: int, session: Session = Depends(get_session)) -> MapOut:
                 label=row.label,
                 is_entry=row.is_entry,
                 actions=actions,
+                fields=fields,
                 screenshot=row.screenshot,
                 verdict=verdicts.get(row.key),
             )

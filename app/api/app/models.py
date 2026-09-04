@@ -136,6 +136,11 @@ class AppState(SQLModel, table=True):
     url: str  # first seen; descriptive only, never identity
     title: str
     actions: str = "[]"  # JSON list of action descriptors
+    # JSON list of [role, name] pairs -- the fillable fields this screen
+    # offers. Derived from the state's first observation at save time, not
+    # stored on StateNode: `worldmap.py` takes `actions_of` injected precisely
+    # so that it never learns what a control means.
+    fields: str = "[]"
     # Human-readable name. A model seam -- null until something names it.
     label: Optional[str] = None
     # Path to one screenshot, relative to the artifacts dir, served at

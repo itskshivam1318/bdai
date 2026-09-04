@@ -99,6 +99,7 @@ def save(world: WorldMap, run_id: int, session: Session) -> int:
                     url=node.url,
                     title=node.title,
                     actions=actions,
+                    fields=_fields_of(world, node),
                     label=node.label,
                     screenshot=node.screenshot,
                     is_entry=(key == world.entry_key),
@@ -225,6 +226,23 @@ def load(run_id: int, session: Session) -> WorldMap:
         )
 
     return world
+
+
+def _fields_of(world: WorldMap, node: StateNode) -> str:
+    """The fillable fields of a state, from the first time we saw it.
+
+    First sighting rather than latest: `record()` already takes `url`, `title`
+    and `actions` from the first observation, and a card whose fields came from
+    a different visit than its screenshot would be describing two screens.
+    """
+    from .forms import fields_of
+
+    if not node.evidence:
+        return "[]"
+    index = node.evidence[0]
+    if index >= len(world.evidence):
+        return "[]"
+    return json.dumps([list(pair) for pair in fields_of(world.evidence[index])])
 
 
 def _key_of(world: WorldMap, observation: Observation) -> str:
