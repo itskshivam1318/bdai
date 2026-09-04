@@ -11,7 +11,20 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     cache: "no-store",
     ...init,
   });
-  if (!res.ok) throw new Error(`${init?.method ?? "GET"} ${path} → ${res.status}`);
+  if (!res.ok) {
+    // FastAPI puts the reason in `detail`, and for the chat endpoint that
+    // reason *is* the message worth showing ("the model could not answer:
+    // ANTHROPIC_API_KEY is not set"). Collapsing every failure to a status code
+    // is how a spent API key became four grey characters last time.
+    const detail = await res
+      .clone()
+      .json()
+      .then((body) => (typeof body?.detail === "string" ? body.detail : null))
+      .catch(() => null);
+    throw new Error(
+      detail ?? `${init?.method ?? "GET"} ${path} → ${res.status}`,
+    );
+  }
   return res.status === 204 ? (undefined as T) : ((await res.json()) as T);
 }
 
@@ -38,6 +51,25 @@ export type CanvasNodeRow = {
   height: number | null;
   config: string;
 };
+
+/**
+ * One turn of the conversation held beside a session's map.
+ *
+ * `node_keys` is the JSON array of `MapState.key` values that were attached
+ * when the message was sent — what was asked about, not what is selected now.
+ */
+export type ChatMessage = {
+  id: number;
+  session_id: number | null;
+  role: "user" | "assistant";
+  content: string;
+  node_keys: string;
+  run_id: number | null;
+  created_at: string;
+};
+
+/** A question and the reply it produced. The API writes both or neither. */
+export type ChatTurn = { user: ChatMessage; assistant: ChatMessage };
 
 export type Run = {
   id: number;
@@ -139,6 +171,25 @@ export const api = {
   /** Tail of the session's event stream. `after` is the highest id already seen. */
   listSessionEvents: (id: number, after = 0) =>
     request<AgentEvent[]>(`/api/sessions/${id}/events?after=${after}`),
+
+  listChat: (sessionId: number) =>
+    request<ChatMessage[]>(`/api/sessions/${sessionId}/chat`),
+  /**
+   * Ask about the map. Blocks for as long as the model takes — there is no
+   * event stream behind this, the reply *is* the response.
+   */
+  sendChat: (
+    sessionId: number,
+    text: string,
+    node_keys: string[],
+    run_id: number | null,
+  ) =>
+    request<ChatTurn>(`/api/sessions/${sessionId}/chat`, {
+      method: "POST",
+      body: JSON.stringify({ text, node_keys, run_id }),
+    }),
+  clearChat: (sessionId: number) =>
+    request<void>(`/api/sessions/${sessionId}/chat`, { method: "DELETE" }),
 
   listNodes: (sessionId: number) =>
     request<CanvasNodeRow[]>(`/api/canvas/nodes?session_id=${sessionId}`),

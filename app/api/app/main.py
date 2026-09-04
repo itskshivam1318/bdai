@@ -6,7 +6,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import settings
 from .db import init_db
-from .routers import canvas, explore, runs, sessions, worldmap
+from .routers import canvas, chat, explore, runs, sessions, worldmap
 
 
 @asynccontextmanager
@@ -28,6 +28,7 @@ app.add_middleware(
 )
 
 app.include_router(canvas.router)
+app.include_router(chat.router)
 app.include_router(runs.router)
 app.include_router(sessions.router)
 app.include_router(explore.router)

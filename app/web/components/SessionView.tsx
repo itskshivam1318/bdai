@@ -1,11 +1,12 @@
 "use client";
 import Link from "next/link";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import ChatPanel from "@/components/ChatPanel";
 import MapPane from "@/components/MapPane";
 import StageRail from "@/components/StageRail";
 import SettingsDialog from "@/components/SettingsDialog";
 import { sessionLabel } from "@/components/Sidebar";
-import { api, type Run, type TestSession } from "@/lib/api";
+import { api, type MapState, type Run, type TestSession } from "@/lib/api";
 
 const STATUS_TONE: Record<string, string> = {
   passed: "text-live",
@@ -25,6 +26,17 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
   const [name, setName] = useState("");
   const [intent, setIntent] = useState("");
   const [selectedRunId, setSelectedRunId] = useState<number | null>(null);
+  /*
+   * The states attached to the next question. Whole states rather than keys:
+   * the chips need a name, and the map is the only place one exists -- keeping
+   * keys here would mean re-fetching the map to render a label.
+   *
+   * A key identifies a state only *within* a run, so this is cleared whenever
+   * the map being shown changes. Carrying a selection across a re-crawl would
+   * attach keys the new map has never heard of, and the answer would be about
+   * a graph the person is not looking at.
+   */
+  const [attached, setAttached] = useState<MapState[]>([]);
 
   const refreshRuns = useCallback(() => {
     api.listSessionRuns(sessionId).then(setRuns).catch(() => {});
@@ -96,6 +108,21 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
   // So the picker is not a convenience — it is how you compare two builds.
   const shownRunId = selectedRunId ?? latest?.id ?? null;
 
+  // A state key identifies a state only *within* a run, so a selection made
+  // against one map means nothing against another. Cleared during render for
+  // the same reason the rail adjusts during render: an effect would let one
+  // frame paint chips that belong to the map no longer on screen.
+  const [seenMapRunId, setSeenMapRunId] = useState(shownRunId);
+  if (shownRunId !== seenMapRunId) {
+    setSeenMapRunId(shownRunId);
+    if (attached.length) setAttached([]);
+  }
+
+  // Memoised because `MapPane` builds a Set from this and `StateCard` reads it
+  // through context -- a fresh array every render would re-render every card on
+  // every three-second poll.
+  const attachedKeys = useMemo(() => attached.map((s) => s.key), [attached]);
+
   function commitName() {
     const next = name.trim();
     if (!session || !next || next === sessionLabel(session)) return;
@@ -117,20 +144,18 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
     void api.explore(run.id, intent.trim() || undefined).catch(() => {});
   }
 
-  /**
-   * Optional steering, not the driver: the pipeline starts from the URL alone.
-   * Anything typed here lands on the run's timeline as intent the agent can
-   * read — the brief's "focus on checkout and authentication flows".
-   */
-  async function sendIntent(e: React.FormEvent) {
-    e.preventDefault();
-    const message = intent.trim();
-    if (!message || !session) return;
-    setIntent("");
-    const run = latest ?? (await api.createRun(session.target_url, sessionId));
-    await api.addEvent(run.id, { level: "info", message: `Intent: ${message}` });
-    refreshRuns();
-  }
+  const toggleAttached = useCallback((state: MapState) => {
+    setAttached((current) =>
+      current.some((s) => s.key === state.key)
+        ? current.filter((s) => s.key !== state.key)
+        : [...current, state],
+    );
+  }, []);
+
+  const detach = useCallback(
+    (key: string) => setAttached((current) => current.filter((s) => s.key !== key)),
+    [],
+  );
 
   return (
     <>
@@ -258,37 +283,32 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
         }`}
       >
         <div className="min-w-0">
-          <MapPane runId={shownRunId} />
+          <MapPane
+            runId={shownRunId}
+            selectedKeys={attachedKeys}
+            onToggleSelect={toggleAttached}
+          />
         </div>
         {railOpen && (
           <div id="stage-rail" className="min-w-0 overflow-hidden">
-            <StageRail sessionId={sessionId} runId={shownRunId} />
+            <StageRail
+              sessionId={sessionId}
+              runId={shownRunId}
+              running={running && shownRunId === latestId}
+            />
           </div>
         )}
       </div>
 
-      <form
-        onSubmit={sendIntent}
-        className="flex items-center gap-2 border-t border-rule px-4 py-3"
-      >
-        <label htmlFor="intent" className="sr-only">
-          Steer the agent
-        </label>
-        <input
-          id="intent"
-          value={intent}
-          onChange={(e) => setIntent(e.target.value)}
-          placeholder="Optional — steer it, e.g. focus on checkout and sign-in"
-          className="min-w-0 flex-1 rounded-md border border-rule bg-paper px-3 py-2 text-sm outline-none focus:border-ink"
-        />
-        <button
-          type="submit"
-          disabled={!intent.trim()}
-          className="rounded-md border border-rule px-3 py-2 text-sm disabled:opacity-30"
-        >
-          Send
-        </button>
-      </form>
+      <ChatPanel
+        sessionId={sessionId}
+        runId={shownRunId}
+        attached={attached}
+        onDetach={detach}
+        onClearAttached={() => setAttached([])}
+        text={intent}
+        onTextChange={setIntent}
+      />
 
       {settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} />}
     </>

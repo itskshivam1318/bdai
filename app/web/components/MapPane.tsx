@@ -7,21 +7,46 @@ import {
   type Node,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import StateCard from "@/components/StateCard";
 import StateDetail from "@/components/StateDetail";
-import { api, type WorldMapPayload } from "@/lib/api";
+import { api, type MapState, type WorldMapPayload } from "@/lib/api";
+import { AttachedStates } from "@/lib/attached";
 import { antColour, antsIn, layout } from "@/lib/map";
 
 /**
  * The graph one run discovered.
+ *
+ * Clicking a state attaches it to the chat; double-clicking opens what it
+ * actually contains. Click was already spoken for, and the card has no room
+ * for a second hit target -- at the zoom a ten-state map opens at, a button
+ * inside it would be a few pixels across.
+ *
+ * Edges are tinted by the ant that walked them, so the graph shows the routes
+ * each one took. Nodes are left alone: their border already carries the
+ * verdict, and two meanings on the same pixels would make the map lie about a
+ * test result. See --ant-N in globals.css.
+ *
+ * The
+ * selection is owned by `SessionView` and passed in, because the thing that
+ * consumes it -- the chat bar -- is a sibling of this pane, not a child: the
+ * map has to be able to say "this one" to a control it does not contain.
  *
  * Polls rather than streams: `store.save` is incremental and writes after every
  * edge, so re-reading the map every two seconds is how the graph draws itself
  * while the colony is still walking. Positions are recomputed from scratch each
  * time the node set changes and never persisted — see lib/map.ts.
  */
-export default function MapPane({ runId }: { runId: number | null }) {
+export default function MapPane({
+  runId,
+  selectedKeys,
+  onToggleSelect,
+}: {
+  runId: number | null;
+  /** `AppState.key` values currently attached to the chat. */
+  selectedKeys: string[];
+  onToggleSelect: (state: MapState) => void;
+}) {
   const [payload, setPayload] = useState<WorldMapPayload | null>(null);
   // The state whose panel is open, by key rather than by object: a poll
   // replaces every state object every two seconds, and holding one would pin
@@ -104,6 +129,25 @@ export default function MapPane({ runId }: { runId: number | null }) {
 
   const nodeTypes = useMemo(() => ({ state: StateCard }), []);
 
+  // Attachment reaches the cards through context rather than through node
+  // `data` -- see lib/attached.tsx. Touching `data` would change the `nodes`
+  // array on every click, and xyflow re-syncs from that array, so every state
+  // anyone had dragged would jump back to its computed position.
+  const attached = useMemo(() => new Set(selectedKeys), [selectedKeys]);
+
+  // Attaching on click and not on a button inside the card: at the zoom a
+  // ten-state map opens at, the card is small enough that a hit target inside
+  // it would be a few pixels. Dragging still works -- xyflow fires this only
+  // when the pointer did not move.
+  const handleNodeClick = useCallback(
+    // The whole state, not the key: the chip above the message box has to show
+    // a name, and this is the only place that already holds one. Passing the
+    // key would make `SessionView` re-fetch the map to render a label.
+    (_: React.MouseEvent, node: Node) =>
+      onToggleSelect((node.data as { state: MapState }).state),
+    [onToggleSelect],
+  );
+
   // Derived, never stored: when the run changes, the key stops matching any
   // state and the panel closes on its own. An effect chasing `runId` to clear
   // it would be the same thing with a frame of the wrong panel first.
@@ -112,9 +156,9 @@ export default function MapPane({ runId }: { runId: number | null }) {
       ? (payload.states.find((s) => s.key === detailKey) ?? null)
       : null;
 
-  // Double-click rather than click: opening what a state contains is a second
-  // gesture on the same card, and at the zoom a ten-state map opens at, a hit
-  // target inside the card would be a few pixels across.
+  // xyflow fires two clicks before this, so attachment toggles on and off and
+  // lands where it started. That is the reason this can coexist with
+  // `handleNodeClick` without either of them knowing about the other.
   const handleNodeDoubleClick = (_: React.MouseEvent, node: Node) =>
     setDetailKey((current) => (current === node.id ? null : node.id));
 
@@ -126,35 +170,38 @@ export default function MapPane({ runId }: { runId: number | null }) {
     );
   }
 
+  // Switching runs replaces the node set but keeps the old viewport otherwise,
+  // which leaves the new map clipped -- keying on runId forces a fresh mount so
+  // fitView re-fits for the run now showing.
   return (
-    <div className="flex h-full min-w-0">
-      <div className="min-w-0 flex-1">
-        {/* Switching runs replaces the node set but keeps the old viewport
-            otherwise, which leaves the new map clipped -- keying on runId
-            forces a fresh mount so fitView re-fits for the run now showing. */}
-        <ReactFlow
-          key={runId}
-          nodes={nodes}
-          edges={edges}
-          nodeTypes={nodeTypes}
-          onNodeDoubleClick={handleNodeDoubleClick}
-          proOptions={{ hideAttribution: true }}
-          fitView
-          fitViewOptions={{ maxZoom: 1, padding: 0.2 }}
-        >
-          <Background />
-          <Controls />
-        </ReactFlow>
+    <AttachedStates.Provider value={attached}>
+      <div className="flex h-full min-w-0">
+        <div className="min-w-0 flex-1">
+          <ReactFlow
+            key={runId}
+            nodes={nodes}
+            edges={edges}
+            nodeTypes={nodeTypes}
+            onNodeClick={handleNodeClick}
+            onNodeDoubleClick={handleNodeDoubleClick}
+            proOptions={{ hideAttribution: true }}
+            fitView
+            fitViewOptions={{ maxZoom: 1, padding: 0.2 }}
+          >
+            <Background />
+            <Controls />
+          </ReactFlow>
+        </div>
+        {detail && (
+          <StateDetail
+            state={detail}
+            transitions={payload?.transitions ?? []}
+            states={payload?.states ?? []}
+            ants={ants}
+            onClose={() => setDetailKey(null)}
+          />
+        )}
       </div>
-      {detail && (
-        <StateDetail
-          state={detail}
-          transitions={payload?.transitions ?? []}
-          states={payload?.states ?? []}
-          ants={ants}
-          onClose={() => setDetailKey(null)}
-        />
-      )}
-    </div>
+    </AttachedStates.Provider>
   );
 }

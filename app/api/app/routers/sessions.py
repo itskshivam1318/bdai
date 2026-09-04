@@ -12,7 +12,15 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
 
 from ..db import get_session
-from ..models import Artifact, CanvasNode, Event, Run, TestCase, TestSession
+from ..models import (
+    Artifact,
+    CanvasNode,
+    ChatMessage,
+    Event,
+    Run,
+    TestCase,
+    TestSession,
+)
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 
@@ -101,6 +109,10 @@ def delete_session(session_id: int, session: Session = Depends(get_session)):
         select(CanvasNode).where(CanvasNode.session_id == session_id)
     ):
         session.delete(node)
+    for message in session.exec(
+        select(ChatMessage).where(ChatMessage.session_id == session_id)
+    ):
+        session.delete(message)
 
     session.delete(row)
     session.commit()

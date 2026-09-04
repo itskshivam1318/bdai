@@ -197,3 +197,31 @@ class Event(SQLModel, table=True):
     # Opaque pointer the widget resolves, e.g. "testcase:12".
     ref: Optional[str] = None
     created_at: datetime = Field(default_factory=utcnow)
+
+
+class ChatMessage(SQLModel, table=True):
+    """One turn of the conversation held beside a session's map.
+
+    Scoped to the **session**, not a run: the question "why did sign-in split
+    into two states" outlives the run that provoked it, and re-crawling should
+    not wipe the thread that explains the last crawl.
+
+    `node_keys` is the JSON list of `AppState.key` values the user attached when
+    they sent the message -- the map nodes they had selected. Stored on the row
+    rather than resolved at send time because it is *what was asked about*: the
+    same question with two different states attached is two different questions,
+    and re-reading the thread later has to show which.
+    """
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    session_id: Optional[int] = Field(
+        default=None, foreign_key="testsession.id", index=True
+    )
+    role: str  # user | assistant
+    content: str
+    node_keys: str = "[]"
+    # Which run's map the attached keys belong to. A key is only unique within
+    # a run, so without this an old message's chips resolve against the wrong
+    # graph after a re-crawl.
+    run_id: Optional[int] = Field(default=None, foreign_key="run.id")
+    created_at: datetime = Field(default_factory=utcnow)

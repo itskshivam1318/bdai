@@ -1,6 +1,7 @@
 "use client";
 import { Handle, Position, useStore, type NodeProps } from "@xyflow/react";
 import { artifactUrl, type MapState, type Verdict } from "@/lib/api";
+import { useAttached } from "@/lib/attached";
 import { antColour, NODE_H, NODE_W } from "@/lib/map";
 
 /**
@@ -26,6 +27,9 @@ export type StateNodeData = { state: MapState; ants: string[] };
 
 export default function StateCard({ data }: NodeProps) {
   const { state, ants } = data as unknown as StateNodeData;
+  // Not from `data`: see lib/attached.tsx for why attachment must not travel
+  // on the node.
+  const attached = useAttached(state.key);
   const compact = useStore((s) => s.transform[2] < COMPACT_BELOW);
   const mark = VERDICT[state.verdict ?? "untested"] ?? VERDICT.untested;
   const name = state.label ?? state.title ?? state.url;
@@ -33,9 +37,18 @@ export default function StateCard({ data }: NodeProps) {
   // in a model-free crawl -- and that reads as "no chip", not as a grey one.
   const tint = antColour(state.found_by, ants ?? []);
 
-  const frame = `rounded-md border bg-paper ${
+  /*
+   * Attachment is drawn as a ring outside the border, never by recolouring it.
+   * The border is already saying something — solid/dashed and the verdict
+   * tone are how a healed state is told from a defect — and a second meaning
+   * on the same pixels would make the map lie about test results the moment
+   * someone clicked a node.
+   */
+  const ring = attached ? " ring-2 ring-ink ring-offset-2 ring-offset-paper" : "";
+
+  const frame = `rounded-md border bg-paper cursor-pointer ${
     mark.dashed ? "border-dashed" : "border-solid"
-  } ${state.verdict ? "border-current" : "border-rule"} ${mark.tone}`;
+  } ${state.verdict ? "border-current" : "border-rule"} ${mark.tone}${ring}`;
 
   if (compact) {
     return (
@@ -51,6 +64,7 @@ export default function StateCard({ data }: NodeProps) {
             style={{ background: tint }}
           />
         )}
+        {attached && <span className="ml-1 text-ink">@</span>}
         <Handle type="source" position={Position.Right} />
       </div>
     );
@@ -78,6 +92,9 @@ export default function StateCard({ data }: NodeProps) {
       </div>
       <div className="px-2.5 py-2">
         <div className="flex items-baseline gap-2">
+          {/* The same glyph the chat chips use, so "in context" reads the
+              same way on the map as it does above the message box. */}
+          {attached && <span className="text-sm text-ink">@</span>}
           <span className="truncate text-sm text-ink">{name}</span>
           <span className="ml-auto text-sm">{mark.glyph}</span>
         </div>

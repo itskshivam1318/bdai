@@ -911,6 +911,9 @@ def main() -> int:
         ("ant", "explorer ant"),
         ("orchestrator", "orchestrator"),
         ("critic", "coverage critic"),
+        # The console's chat reads this one. It has no tool loop to fail
+        # loudly, so a broken prompt would show up only as a vague answer.
+        ("analyst", "explorer ants built"),
     ):
         text = instructions(role)
         ok &= check(
