@@ -281,17 +281,37 @@ def main() -> int:
         # 3. The colony round trip: dispatch, run ants, fold in, finish.
         browser.close()
         browser, page, world, entry = _page_and_map(pw)
+        # `checkpoint` is what the console draws from. The map is saved to the
+        # database only when the caller is handed one, so a colony that never
+        # calls back leaves the canvas empty for the whole run and then fills
+        # it in one jump at the end -- which is exactly what a *live* map is
+        # not. Recording the state count at each call rather than just the
+        # number of calls: a callback that fires with nothing in it would
+        # satisfy a bare "was it called" and still draw an empty canvas.
+        saved_state_counts: list[int] = []
         result = run(
             page, SUT, Colony(),
             intent="check the sign-in flow",
             budget=Budget(max_waves=3, max_ants=2, ant_actions=2, max_seconds=120),
             credentials=CREDENTIALS,
             on_event=lambda level, message: None,
+            checkpoint=lambda w: saved_state_counts.append(len(w.states)),
         )
         ok &= check("the colony dispatches and finishes", result.stopped == "covered")
         ok &= check("the colony names flows", bool(result.flows))
         ok &= check("the colony reports gaps honestly", bool(result.gaps))
         ok &= check("ant reports reach the orchestrator", bool(result.reports))
+        ok &= check(
+            "the colony checkpoints its map while exploring",
+            len(saved_state_counts) > 0,
+            "run() never called checkpoint, so nothing reaches the console "
+            "until the run is over",
+        )
+        ok &= check(
+            "a checkpoint carries the states found so far",
+            bool(saved_state_counts) and saved_state_counts[0] > 0,
+            f"state counts seen at each checkpoint: {saved_state_counts}",
+        )
         browser.close()
 
         # 3b. A map must survive being written to a file and read back, or
