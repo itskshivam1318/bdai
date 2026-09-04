@@ -68,6 +68,31 @@ def _boxes(*, checked: int, total: int = 6) -> str:
     return f"<main><h1>Testing Guide</h1>{items}</main>"
 
 
+_SIDEBAR = """<div><nav aria-label="Sessions"><ul>{items}</ul>
+<a href="/new">New session</a></nav>
+<main><h1>AIVAR</h1>{extra}</main></div>"""
+
+
+def _sidebar(*names: str, extra: str = "") -> str:
+    """A session list: sibling links whose names are *data*, not affordance.
+
+    `_rows` collapses because `canonical_value` rewrites "Project 17" into
+    "Project #", leaving byte-identical neighbours for `collapse_runs` to fold.
+    These names -- hostnames somebody typed -- canonicalise to nothing alike,
+    so there is no run to fold and the count survives into the key.
+
+    Measured: run 10 crawled the console at :3000 and produced 78 states, 5
+    transitions, 1082 unexplored actions. 31 of the 78 were the same URL, `/`,
+    differing only in how many sessions the crawl had itself created by the
+    time it got there.
+    """
+    items = "".join(
+        f'<li><a href="/s/{i}">{name} <span>{i}</span></a></li>'
+        for i, name in enumerate(names, start=1)
+    )
+    return _SIDEBAR.format(items=items, extra=extra)
+
+
 PROJECTION_CASES = (
     # (label, html_a, html_b, expected, what it would cost to get wrong)
     (
@@ -125,6 +150,30 @@ PROJECTION_CASES = (
         _boxes(checked=3),
         "same",
         "N checkboxes become 2^N states; a checklist eats the whole budget",
+    ),
+    (
+        "a grown sibling list is not identity",
+        _sidebar("localhost", "thetestingmap.org", "UI wiring test"),
+        _sidebar("localhost", "thetestingmap.org", "UI wiring test", "saucedemo"),
+        "same",
+        "an app that lists what the crawler creates re-keys itself on every "
+        "write; the crawl maps its own footprints and never reaches the app",
+    ),
+    (
+        "an empty sibling list IS identity",
+        _sidebar("localhost", "thetestingmap.org", "UI wiring test"),
+        _sidebar(),
+        "different",
+        "the first-run empty state goes undiscovered -- the same boundary "
+        "_rows(17) vs _rows(0) protects, and any fix here must keep it",
+    ),
+    (
+        "collapsing a list does not swallow the page",
+        _sidebar("localhost", "thetestingmap.org"),
+        _sidebar("localhost", "thetestingmap.org", extra="<button>Start run</button>"),
+        "different",
+        "a fix aggressive enough to hide a new control costs more than the "
+        "explosion it cures",
     ),
 )
 
