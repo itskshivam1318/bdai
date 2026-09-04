@@ -14,8 +14,9 @@ __pycache__/
 # local data & artifacts
 *.db
 *.db-journal
-api/artifacts/*
-!api/artifacts/.gitkeep
+app/api/artifacts/*
+!app/api/artifacts/.gitkeep
+.playwright-mcp/
 
 # env / ports
 .env.local
