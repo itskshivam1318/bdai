@@ -311,6 +311,14 @@ the language switcher stay plain `button:` actions.
 If you loosen either stop rule, run `make probe` and watch that section: the two
 failures are opposite, and it is easy to fix one by causing the other.
 
+**Commits are checked against the index, not your working tree.** `git add
+<file>` stages the file as it *is*, not the change you made, so with a second
+session editing the same checkout you can commit a half of something and still
+pass `make check` — the other half is sitting on disk. `.githooks/pre-commit`
+materialises the staged tree and typechecks *that*. Enable it with `make hooks`
+(`make setup` does); bypass with `--no-verify` only for a WIP commit you intend
+to amend.
+
 **Widget config lives in local state**, not on the xyflow node's `data`.
 Mutating `data` is a lint error and causes stale renders; `WidgetNode` holds
 state and persists it 400ms after you stop typing.

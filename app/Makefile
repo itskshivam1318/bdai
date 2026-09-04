@@ -25,7 +25,7 @@ export API_PORT
 endif
 
 .DEFAULT_GOAL := help
-.PHONY: help setup dev api web smoke probe pipeline loop generate specs gaps explore crawl trace diff runs mcp mcp-probe worktree list rm check reset stop
+.PHONY: help setup hooks dev api web smoke probe pipeline loop generate specs gaps explore crawl trace diff runs mcp mcp-probe worktree list rm check reset stop
 
 PY_VERSION := 3.12
 
@@ -38,6 +38,11 @@ setup: ## Install all dependencies (first run only)
 	cd web && npm install
 	cd api && uv sync --python $(PY_VERSION)
 	cd api && uv run playwright install chromium
+	@$(MAKE) --no-print-directory hooks
+
+hooks: ## Point git at .githooks (clone-local config, so setup re-does it)
+	@git -C .. config core.hooksPath .githooks
+	@echo "core.hooksPath = .githooks -- commits now typecheck the staged tree"
 
 dev: ## Run the full stack (web + api)
 	./scripts/dev.sh

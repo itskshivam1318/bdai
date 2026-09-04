@@ -378,3 +378,47 @@ Measured on existing runs: run 1 30.4%, run 3 8.0%, run 6 26.9% — every one of
 them reporting `passed`.
 
 **Who:** shivam + Claude.
+
+---
+
+## 2026-09-05 01:45 — Commits are checked against the index, not against your disk
+
+`.githooks/pre-commit` materialises the staged tree with `git checkout-index`,
+runs `tsc --noEmit` on it, and imports the staged API. `make hooks` points git at
+it; `make setup` calls that, because `core.hooksPath` is clone-local config and
+cannot be committed.
+
+**Why:** `git add <file>` stages the file *as it is now*, not the edits you made.
+Two sessions were working in one worktree, and `d7270e8` committed a
+`SessionView` passing a prop to a `StageRail` that was still uncommitted in the
+other one. `make check` passed — the working tree had both halves. Checked out
+alone, HEAD did not compile, and nothing said so for two commits. The working
+tree is exactly the thing that cannot detect this, so the check had to move off
+it.
+
+**It found a second instance on its first run.** `StageRail.tsx` imports
+`@/components/TranscriptViewer`, which was untracked; staging the rail without
+it would have broken HEAD the same way.
+
+**The API half nearly shipped broken, which is the argument for testing a
+check against a known failure.** `python -c` puts the working directory first on
+`sys.path`, so running from the real `app/api` imported the real modules and the
+staged ones were shadowed — it passed an index with `SkippedAction` deliberately
+removed. It now runs from inside the materialised tree.
+
+**Generated types are carried in.** `next-env.d.ts` and `.next/dev/types/` come
+from `next dev` and are gitignored, so a materialised tree has neither and every
+run would report `Cannot find name 'LayoutProps'` — a fact about the checkout,
+not the commit. Copied in so a failure always means the commit is genuinely
+broken.
+
+**Cost is ~20s a commit**, most of it the APFS clone of `node_modules` — the
+same `cp -Rc` `scripts/worktree.sh` makes, for the same reason. `--no-verify`
+remains, for a WIP commit you intend to amend.
+
+**Not chosen: a worktree per session.** It removes the concurrent writer outright
+and the machinery already exists (`make worktree name=x`), but it splits
+`app.db`, so the crawls and threads this demo is built on would not follow.
+Worth revisiting after the hackathon.
+
+**Who:** shivam + Claude.
