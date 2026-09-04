@@ -43,6 +43,13 @@ dropped. Read `problem/statement.md` first.
    right — so accuracy without a class breakdown means nothing.
    → `healing-and-triage.md`
 
+6. **Intrinsic self-critique reliably degrades output.** GPT-4 self-correcting
+   drops GSM8K 95.5 → 89.0 over two rounds; as a plan verifier its false
+   positive rate is **84.4%**; on graph colouring self-critique scored **1%** vs
+   16% for no iteration, and identically to **deliberately false feedback**. It
+   only works with an external, non-fabricable signal.
+   → `coverage-evaluation.md`
+
 ## Cheap mechanisms worth stealing
 
 Each is documented, specific, and needs no model call to be impressive.
@@ -55,6 +62,8 @@ Each is documented, specific, and needs no model call to be impressive.
 | **Reproducer agent** | Momentic `Mo` | A *separate* agent must reproduce a suspected bug from a clean start; one it cannot reproduce stays out of the report |
 | **ActionGuard** | Magentic-UI (MIT) | Classify every action always/never/maybe-irreversible; route "maybe" to a judge |
 | **Failure taxonomy** | mabl | Regression / Test-implementation / Environment / Network / Timing / self-blame |
+| **Invalid-transition cells** | ISTQB CTFL v4.0.1 | The empty cells of a states × events table are enumerable candidate error-state tests — the closest thing to a computable "missing error states" denominator |
+| **Extractive quotes** | Rulers, arXiv:2601.08654 | Every rubric decision must cite a verbatim span, so a judge cannot assert a gap it cannot point to |
 
 ## Standing warnings
 
