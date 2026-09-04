@@ -27,6 +27,11 @@ Nothing below needs building. It is listed so the plan does not rebuild it.
 | Static artifact serving at `/artifacts/<path>` | `app/main.py`, `app/config.py::artifacts_dir` |
 | Exploration kicked off from the UI | `app/routers/explore.py` |
 
+**Not yet wired:** `generator.scenarios()` and `runner.run()` are reachable only
+from their CLIs (`make generate`, `make loop`). `explore.py`'s background job
+stops after the map is saved. Painting the map therefore needs the pipeline
+extended past exploration, which is a task in the plan, not a given.
+
 `surfaces.ts` already carries a TODO block naming the six pipeline surfaces
 (`plan`, `coverage`, `suite`, `heal`, `defect`, `report`). This spec fills that
 block in; it does not invent the seam.
@@ -99,19 +104,29 @@ that branch is exactly "this state is new". But `record` receives an
 1. `StateNode` gains `screenshot: str | None = None` — a path relative to
    `artifacts_dir`.
 2. `WorldMap` gains `attach_screenshot(key, path)`, which replaces the node.
-3. `crawler.py` is the **only** site that holds a live page and calls
-   `record()` / `connect()` — `tools.py` is read-only over the map ("an ant
-   never tells the map what it saw"). So capture has exactly one home. After
-   each `record()` / `connect()`:
+3. **Two** sites hold a live page and file observations: `crawler.py`
+   (deterministic path, `make crawl`) and `ant.py` (colony path — the one the
+   UI runs). `tools.py` is read-only over the map ("an ant never tells the map
+   what it saw") and captures nothing.
+
+   Rather than duplicate capture in both, it is **injected**, matching how this
+   package already takes `actions_of`, `guard`, `synthesizer` and `checkpoint`:
 
    ```python
-   key = world.record(observation)
-   if world.states[key].screenshot is None:
-       path = f"run-{run_id}/{key}.png"
-       page.screenshot(path=settings.artifacts_dir / path, full_page=False)
-       world.attach_screenshot(key, path)
+   Shot = Callable[[str], str | None]   # state key -> stored path, or None
    ```
 
+   Each site calls it in one place, guarded by the node's own state:
+
+   ```python
+   key = world.connect(from_key, action, after).to_key
+   if shot is not None and world.states[key].screenshot is None:
+       world.attach_screenshot(key, shot(key))
+   ```
+
+   The callable decides where files go and what path is recorded, so
+   `explorer/` never imports `app.config` and a crawl with `shot=None` takes no
+   pictures at all — which is what `make crawl` and the probes want.
    `state_key` is a 16-char hex digest, so it is a safe filename as-is.
 4. `store.save` writes `AppState.screenshot`; `store.load` reads it back;
    `snapshot.py` serialises it so a stored map still renders offline.
@@ -119,8 +134,9 @@ that branch is exactly "this state is new". But `record` receives an
 Viewport screenshot, not `full_page`: the card is a thumbnail, and a full-page
 shot of a long catalogue is mostly wasted bytes.
 
-**Failure is non-fatal.** A screenshot that raises is swallowed and logged as a
-`warn` event. A crawl must not die because a picture failed.
+**Failure is non-fatal.** The `shot` implementation swallows its own errors
+and returns `None`; `attach_screenshot(key, None)` is a no-op. A crawl must not
+die because a picture failed, and a node with no thumbnail still renders.
 
 ## The stage rail
 
