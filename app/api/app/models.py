@@ -146,6 +146,9 @@ class AppState(SQLModel, table=True):
     # Path to one screenshot, relative to the artifacts dir, served at
     # /artifacts/<path>. Null when capture was off or the shot failed.
     screenshot: Optional[str] = None
+    # Which ant first reached this state, e.g. "w2a1". Null for a model-free
+    # crawl, which has no ants to attribute to.
+    found_by: Optional[str] = None
     is_entry: bool = False
     first_seen: datetime = Field(default_factory=utcnow)
 
@@ -168,6 +171,8 @@ class StateTransition(SQLModel, table=True):
     # separates "the click did nothing" from "the app accepted it and did not
     # re-render" -- the distinction the Healer classifies on.
     mutating: bool = False
+    # The ant that took this action.
+    found_by: Optional[str] = None
     observation_id: Optional[int] = Field(
         default=None, foreign_key="stateobservation.id"
     )

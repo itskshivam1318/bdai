@@ -102,6 +102,7 @@ def save(world: WorldMap, run_id: int, session: Session) -> int:
                     fields=_fields_of(world, node),
                     label=node.label,
                     screenshot=node.screenshot,
+                    found_by=node.found_by,
                     is_entry=(key == world.entry_key),
                 )
             )
@@ -110,6 +111,7 @@ def save(world: WorldMap, run_id: int, session: Session) -> int:
             row.actions != actions
             or row.label != node.label
             or row.screenshot != node.screenshot
+            or row.found_by != node.found_by
         ):
             # A state's action set can grow as later visits reveal controls,
             # `label` arrives from a model seam long after the crawl, and the
@@ -117,6 +119,7 @@ def save(world: WorldMap, run_id: int, session: Session) -> int:
             # row was first written by an earlier checkpoint.
             row.actions, row.label = actions, node.label
             row.screenshot = node.screenshot
+            row.found_by = node.found_by
             session.add(row)
             written += 1
 
@@ -144,6 +147,7 @@ def save(world: WorldMap, run_id: int, session: Session) -> int:
                     action=edge.action,
                     to_key=edge.to_key,
                     mutating=edge.mutating,
+                    found_by=edge.found_by,
                     observation_id=(
                         observation_ids[edge.evidence]
                         if edge.evidence < len(observation_ids)
@@ -207,6 +211,7 @@ def load(run_id: int, session: Session) -> WorldMap:
             actions=tuple(json.loads(row.actions or "[]")),
             label=row.label,
             screenshot=row.screenshot,
+            found_by=row.found_by,
             evidence=tuple(evidence_of.get(row.key, ())),
         )
         if row.is_entry:
@@ -221,6 +226,7 @@ def load(run_id: int, session: Session) -> WorldMap:
                 action=row.action,
                 to_key=row.to_key,
                 mutating=row.mutating,
+                found_by=row.found_by,
                 evidence=by_id.get(row.observation_id, 0),
             )
         )

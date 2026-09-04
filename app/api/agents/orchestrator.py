@@ -246,7 +246,7 @@ def run(
         wave_reports: list[Report] = []
         rejected: list[str] = []
 
-        for assignment in assignments:
+        for ant_index, assignment in enumerate(assignments):
             wanted = str(assignment.get("state", "")).strip()
             # The orchestrator sees 8-character ids; the map keys are 16.
             matches = [k for k in world.states if k.startswith(wanted)]
@@ -259,8 +259,14 @@ def run(
                 continue
 
             instruction = str(assignment.get("instruction", "")).strip()
-            emit("info", f"  ant -> {matches[0][:8]}: {instruction}")
+            tag = f"w{wave + 1}a{ant_index + 1}"
+            emit("info", f"  ant {tag} -> {matches[0][:8]}: {instruction}")
 
+            # Everything this ant records is stamped with it. Set here rather
+            # than passed into `explore`, because the recording happens deep in
+            # `ant.py` and `forms.py` and threading an identity down would put
+            # the colony's dispatch structure into modules that have no ants.
+            world.attribution = tag
             try:
                 report = explore(
                     page,
@@ -290,6 +296,12 @@ def run(
                     f"this ant failed before reporting ({type(exc).__name__}); "
                     "its region is still unexplored"
                 )
+            finally:
+                # Anything recorded between ants -- the orchestrator's own
+                # bookkeeping, a later crawl -- belongs to no ant, and a stale
+                # tag would quietly credit it to the last one that ran.
+                world.attribution = None
+
             ants_left -= 1
             wave_reports.append(report)
             emit(

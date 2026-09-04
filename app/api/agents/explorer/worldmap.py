@@ -69,6 +69,10 @@ class StateNode:
     # Path to one screenshot, relative to the artifacts dir. Taken the first
     # time we stood in this state and never retaken -- see `attach_screenshot`.
     screenshot: str | None = None
+    # Which ant first stood here, e.g. "w2a1" -- wave 2, ant 1. None when
+    # nothing was attributing: the model-free crawler, or a direct `record`.
+    # First finder wins; see `record`.
+    found_by: str | None = None
 
 
 @dataclass(frozen=True)
@@ -89,6 +93,9 @@ class Transition:
     to_key: str
     mutating: bool
     evidence: int  # index into WorldMap.evidence
+    # The ant that took this action. Unlike a state, an edge has exactly one
+    # walker, so there is no first-wins question here.
+    found_by: str | None = None
 
     @property
     def self_loop(self) -> bool:
@@ -172,6 +179,14 @@ class WorldMap:
     evidence: list[Observation] = field(default_factory=list)
     entry_key: str | None = None
 
+    # Who is recording right now. Mutable state on the map rather than an
+    # argument to `record`/`connect`, because those are called from a dozen
+    # places across `ant.py` and `crawler.py` and threading an identity through
+    # all of them would put the colony's dispatch structure into the crawler,
+    # which does not have ants. The orchestrator sets it around each dispatch;
+    # everything else leaves it None and gets today's behaviour.
+    attribution: str | None = None
+
     # Actions a state offers that could not be taken, and why. Measured
     # 2026-09-04: two of three public targets produced a shallow map not
     # because they were shallow but because their login form was refused here
@@ -227,6 +242,7 @@ class WorldMap:
                 title=observation.title,
                 actions=self._actions(observation),
                 evidence=(index,),
+                found_by=self.attribution,
             )
             if self.entry_key is None:
                 self.entry_key = key
@@ -239,6 +255,9 @@ class WorldMap:
                 label=existing.label,
                 evidence=existing.evidence + (index,),
                 screenshot=existing.screenshot,
+                # Not `self.attribution`: the finder is the ant that got here
+                # first, not the last one to walk past.
+                found_by=existing.found_by,
             )
 
         return key
@@ -254,6 +273,7 @@ class WorldMap:
             to_key=to_key,
             mutating=bool(observation.mutating_calls),
             evidence=len(self.evidence) - 1,
+            found_by=self.attribution,
         )
         self.transitions.setdefault((from_key, action), []).append(transition)
         return transition

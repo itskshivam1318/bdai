@@ -332,7 +332,8 @@ sees the package set as current and leaves the shebangs alone. The fix is
 `rm -rf api/.venv && uv sync`, which takes about 0.1s from uv's cache.
 
 **This branch adds columns** (`AppState.screenshot`, `AppState.fields`,
-`TestCase.path`), so an `app.db` from before it predates them. Left in place,
+`AppState.found_by`, `StateTransition.found_by`, `TestCase.path`), so an
+`app.db` from before it predates them. Left in place,
 `GET /api/runs/{id}/map` raises `no such column: appstate.fields` and 500s —
 and the failure is silent in the UI, because the map pane swallows the error.
 Clear it with `make reset`.

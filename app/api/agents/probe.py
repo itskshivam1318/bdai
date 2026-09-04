@@ -400,6 +400,64 @@ def main() -> int:
                     back.states[bare_key].screenshot == "run-7/pic.png",
                 )
 
+        # 3d-bis. Which ant found what. The colony dispatches up to twelve of
+        #     them and the map it returns is the union of their work, with no
+        #     record of who did which part -- so a run that went wrong somewhere
+        #     could not be traced to the ant that went there. `attribution` is
+        #     set by the orchestrator around each dispatch and stamped onto
+        #     whatever gets recorded while it is set.
+        #
+        #     First finder wins, deliberately: `record` already resolves a
+        #     revisit in favour of the first sighting for url, title and
+        #     actions, and a discoverer that changed on every revisit would name
+        #     the last ant to walk past rather than the one that found it.
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = _create_engine(f"sqlite:///{tmp}/ants.db")
+            _SQLModel.metadata.create_all(engine)
+            with _Session(engine) as db:
+                ants = _WorldMap()
+                ants.attribution = "w1a1"
+                found_key = ants.record(world.evidence[0])
+                ok &= check(
+                    "a state records the ant that first reached it",
+                    ants.states[found_key].found_by == "w1a1",
+                    f"found_by={ants.states[found_key].found_by!r}",
+                )
+
+                ants.attribution = "w2a1"
+                ants.record(world.evidence[0])  # a revisit by a different ant
+                ok &= check(
+                    "a revisit does not reassign the finder",
+                    ants.states[found_key].found_by == "w1a1",
+                    f"found_by={ants.states[found_key].found_by!r}",
+                )
+
+                # Lands back where it started, which is a real edge and the
+                # one this module calls most informative -- and all the
+                # scripted colony gave us is the one entry observation.
+                edge = ants.connect(found_key, "link:Courses", world.evidence[0])
+                ok &= check(
+                    "a transition records the ant that walked it",
+                    edge.found_by == "w2a1",
+                    f"found_by={edge.found_by!r}",
+                )
+
+                # Attribution the console cannot read is attribution that does
+                # not exist: the map is drawn from the database, not from the
+                # object the colony returned.
+                _store.save(ants, run_id=9, session=db)
+                back = _store.load(9, db)
+                ok &= check(
+                    "attribution survives the database round trip",
+                    back.states[found_key].found_by == "w1a1"
+                    and any(
+                        t.found_by == "w2a1"
+                        for edges in back.transitions.values()
+                        for t in edges
+                    ),
+                    f"state={back.states[found_key].found_by!r}",
+                )
+
         # 3e. A state the pipeline crossed twice takes the worse verdict. A
         #     map that showed the *last* verdict would hide a defect behind a
         #     pass, which is the one direction that must never happen.

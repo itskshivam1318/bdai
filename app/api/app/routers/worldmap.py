@@ -36,6 +36,9 @@ class StateOut(BaseModel):
     fields: list[list[str]]
     screenshot: str | None
     verdict: str | None
+    # Which ant first reached this state, e.g. "w2a1". Null for a run with no
+    # colony -- the deterministic crawler has no ants to attribute to.
+    found_by: str | None
 
 
 class TransitionOut(BaseModel):
@@ -44,6 +47,7 @@ class TransitionOut(BaseModel):
     to_key: str
     mutating: bool
     observation_id: int | None
+    found_by: str | None
 
 
 class MapOut(BaseModel):
@@ -86,6 +90,7 @@ def get_map(run_id: int, session: Session = Depends(get_session)) -> MapOut:
                 fields=fields,
                 screenshot=row.screenshot,
                 verdict=verdicts.get(row.key),
+                found_by=row.found_by,
             )
         )
 
@@ -104,6 +109,7 @@ def get_map(run_id: int, session: Session = Depends(get_session)) -> MapOut:
                 to_key=edge.to_key,
                 mutating=edge.mutating,
                 observation_id=edge.observation_id,
+                found_by=edge.found_by,
             )
             for edge in edges
         ],
