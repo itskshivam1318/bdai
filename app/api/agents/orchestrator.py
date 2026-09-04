@@ -56,6 +56,18 @@ class Budget:
     ant_actions: int = 5
     max_seconds: float = 900.0
 
+    # Which model drives the ants, when it should not be the one driving the
+    # orchestrator. `None` means "the same one", which is what every existing
+    # caller gets and what every measurement so far was taken against.
+    #
+    # Model choice belongs in Budget because it is the largest cost lever
+    # there is -- larger than `max_ants`, which is what this class was written
+    # to bound. Measured 2026-09-04 at 6,643 prompt tokens per ant call:
+    # $0.089 for a full run on `qwen/qwen3-coder-next`, ~$3.42 on
+    # `claude-opus-5`. Halving `max_ants` saves less than changing this string.
+    ant_provider: str | None = None
+    ant_model: str | None = None
+
 
 @dataclass
 class Exploration:
@@ -96,6 +108,43 @@ class Exploration:
         return "\n".join(lines)
 
 
+def ant_provider_for(budget: Budget, provider: Provider) -> Provider:
+    """Which model drives the ants. Called once, before the first wave.
+
+    The two roles in a colony are not the same job. The orchestrator makes ~6
+    calls a run and each one decides where up to 12 ants go, so a bad call
+    wastes a whole wave. An ant makes ~60 calls doing mechanical
+    click-and-observe against a budget that already bounds its damage. That
+    asymmetry is the whole argument for splitting them -- a strong model where
+    judgement compounds, a cheap one where it does not.
+
+    The cost of the split, and the reason it is a decision rather than a
+    default: `llm/__init__.py` opens by saying the point of the neutral
+    transcript is that `agent.md` "has to mean the same thing to Claude, to
+    Gemini, and to a Claude Code subagent handed the same file". A mixed run is
+    no longer a clean provider A/B -- when a run goes badly you can no longer
+    tell which of the two models to blame, and the transcript diff that would
+    have told you now compares two things that differ in more than one way.
+
+    Measured, per full run: one cheap model $0.089, one Opus $3.42, and a
+    strong orchestrator over cheap ants ~$0.35 -- roughly 112, 3, and 28 runs
+    against a $10 cap.
+
+    TODO(shivam): the policy. `budget.ant_provider` already carries the static
+    answer; what is unwritten is whether the answer should be static at all.
+    The adaptive version has evidence available to it that the static one
+    ignores -- `Report.ended` is already "stalled" when an ant achieved
+    nothing, so a colony could start every ant cheap and promote only the
+    states where cheap ants keep stalling. That spends the strong model on the
+    regions that actually resisted, rather than on a guess made before the
+    first observation. It also means two models inside one run, which is the
+    A/B cost above paid twice over.
+    """
+    if budget.ant_provider is None and budget.ant_model is None:
+        return provider
+    return load(provider=budget.ant_provider, model=budget.ant_model)
+
+
 def run(
     page,
     entry_url: str,
@@ -119,6 +168,16 @@ def run(
     credentials = credentials or Credentials.from_env()
     emit = on_event or (lambda level, message: print(f"[{level}] {message}"))
     deadline = time.monotonic() + budget.max_seconds
+
+    # Resolved once rather than per ant: a colony dispatches up to 12 of them
+    # and constructing a client 12 times would hide a config error behind the
+    # first ant's stack trace instead of failing before the first wave.
+    ant_provider = ant_provider_for(budget, provider)
+    if ant_provider is not provider:
+        emit(
+            "info",
+            f"orchestrator on {provider.model}, ants on {ant_provider.model}",
+        )
 
     world = WorldMap(actions_of=lambda obs: forms.available_actions(page, obs))
     result = Exploration(world=world)
@@ -194,7 +253,7 @@ def run(
                 report = explore(
                     page,
                     world,
-                    provider,
+                    ant_provider,
                     entry_url=entry_url,
                     start_key=matches[0],
                     instruction=instruction,
