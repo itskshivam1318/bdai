@@ -52,6 +52,34 @@ class Chatty:
         return Turn(text="Let me consider which action is best here...")
 
 
+class Ranker:
+    """Ranks two real candidates, invents a third, and omits the rest.
+
+    All three behaviours in one turn on purpose: the critic must keep what was
+    cited, discard what was fabricated, and still report what was left out.
+    """
+
+    name, model = "scripted:ranker", "none"
+
+    def turn(self, system, transcript, tool_defs):
+        return Turn(
+            text="",
+            calls=(
+                ToolCall(
+                    id="rank-1",
+                    name="prioritise",
+                    arguments={
+                        "ranked": [
+                            {"id": 1, "risk": "a customer could be charged twice"},
+                            {"id": 0, "risk": "bad input reaches the database"},
+                            {"id": 9999, "risk": "a gap nobody computed"},
+                        ]
+                    },
+                ),
+            ),
+        )
+
+
 class Explorer:
     """Takes the first untried action it is shown, then reports."""
 
@@ -392,11 +420,62 @@ def main() -> int:
                 "the old toy behaviour, any button will do",
             )
 
+        # 5. The critic. Its whole defensibility is that the model cannot
+        #    invent a finding, so that is what these check -- not whether the
+        #    ranking is good, which is not a question a probe can answer.
+        print()
+        from .critic import candidates, prioritise, render
+
+        gaps = candidates(mapped)
+        cells = [gap.citation for gap in gaps]
+
+        ok &= check(
+            "the crawl's uncovered input partitions are found",
+            any(g.kind == "unexercised-partition" for g in gaps),
+            "no partition gap on a map whose submit[invalid] edges were never walked",
+        )
+        ok &= check(
+            "no cell is reported twice",
+            len(cells) == len(set(cells)),
+            f"{len(cells) - len(set(cells))} duplicate citations",
+        )
+        ok &= check(
+            "every gap cites a state that exists in the map",
+            all(gap.state_key in mapped.states for gap in gaps),
+        )
+        ok &= check(
+            "the report carries no percentage",
+            "%" not in render(gaps),
+            "a calibrated-looking number leaked into the report",
+        )
+
+        if len(gaps) >= 2:
+            ranked = prioritise(mapped, Ranker())
+            ok &= check(
+                "a fabricated gap is discarded, not reported",
+                len(ranked) == len(gaps)
+                and set(g.citation for g in ranked) == set(cells),
+                "the critic returned a finding that was never a candidate",
+            )
+            ok &= check(
+                "the model's ordering is honoured",
+                (ranked[0].citation, ranked[1].citation) == (cells[1], cells[0]),
+            )
+            ok &= check(
+                "an omitted gap is still reported, after the ranked ones",
+                all(not g.risk for g in ranked[2:]) and len(ranked) > 2,
+                "omission deleted evidence instead of demoting it",
+            )
+
         browser.close()
 
-    # 5. The prompts are the tunable part; loading them must not silently break.
+    # 6. The prompts are the tunable part; loading them must not silently break.
     print()
-    for role, marker in (("ant", "explorer ant"), ("orchestrator", "orchestrator")):
+    for role, marker in (
+        ("ant", "explorer ant"),
+        ("orchestrator", "orchestrator"),
+        ("critic", "coverage critic"),
+    ):
         text = instructions(role)
         ok &= check(
             f"prompts/{role}.md loads without its frontmatter",

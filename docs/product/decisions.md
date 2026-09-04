@@ -227,3 +227,54 @@ justify (the `smoke_run.heal_locator` regression: any button will do).
 **Who:** shivam + Claude. Sequenced from a ChatGPT critique that correctly read
 the gap as "no executable layer" and incorrectly prescribed a linear
 Planner→Generator→Runner→Healer rebuild.
+
+---
+
+## 2026-09-04 19:00 — The critic computes the gaps; the model only orders them
+
+`agents/critic.py::candidates()` derives every coverage gap from the map with no
+model call. `prioritise()` hands the model a numbered list and one tool that
+takes ids back — there is no field in which to write a new finding, and any id
+that was not a candidate is counted and discarded.
+
+**Why:** `research/coverage-evaluation.md` is unusually blunt. GPT-4 as a plan
+verifier has an **84.4% false-positive rate**. On graph colouring, self-critique
+scored **1% against 16% for no iteration** — and scored *identically to
+deliberately fabricated feedback*, meaning the loop was resampling, not
+critique. A judge that **ranks** is achievable; one that scores is not. So the
+model is given the one job judges are reliable at and is structurally prevented
+from the one they are not.
+
+We are in the configuration the research says works: the artifact under review
+was **not written by a model**. `generator.py` compiles scenarios from recorded
+transitions, so there is no self-preference bias to inherit.
+
+**Denominators, all ISTQB CTFL v4.0.1:** unexercised input partitions (EP
+"must include invalid partitions" — a form the crawler submitted successfully
+whose rejection path nobody walked), ambiguous edges, untaken offered actions
+(0-switch shortfall), and the empty cells of the states × actions table.
+
+**Empty cells are filtered by near-universality.** A cell is a question only
+when the action is offered by at least half the states and this one is the
+exception. Unfiltered, the SUT produced **63 of 75** items — every one a correct
+cell of a real table, and collectively unreadable. This also concedes what the
+ISTQB criterion assumes and a browser does not provide: in a state machine you
+can *attempt* an invalid event, so every empty cell is testable; in a web UI you
+cannot click a control that is not rendered.
+
+**Omission is demotion, not deletion.** A gap the model leaves out of its
+ranking is reported after everything it ranked. A gap silently removed is
+exactly what the brief's "coverage gaps remaining" line exists to prevent.
+
+**No percentage anywhere.** A denominator exists, but its cells are not equally
+meaningful, so dividing by their count would produce a number that looks
+calibrated and is not.
+
+**Evidence:** `make probe` — seven new checks, including "a fabricated gap is
+discarded, not reported" (a scripted critic that cites a nonexistent id) and
+"an omitted gap is still reported, after the ranked ones". `make gaps` against
+the SUT returns six unexercised `submit[invalid]` partitions, which is correct:
+that crawl had no API key, so the synthesizer was unavailable and no form's
+invalid path was ever walked.
+
+**Who:** shivam + Claude.
