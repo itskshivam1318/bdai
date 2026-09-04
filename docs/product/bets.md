@@ -214,6 +214,24 @@ ordering:
    cannot decide what to type into an anonymous textbox, types nothing, and the
    action is disqualified. (testingchallenges)
 
+**Mode 1 fixed 2026-09-04 20:50** (`forms._implicit_scope`). A button with no
+`<form>` is now scoped to the smallest region holding it and some fields and no
+other button and no page landmark. `practicetestautomation` goes from 10 states
+— all marketing pages, login never exercised — to 12 including
+`/logged-in-successfully/`, `/practice-test-exceptions/` and
+`/practice-test-table/`, which were unreachable behind the wall. Verified not to
+resurrect the bug the `<form>` test was added for: `practicesoftwaretesting`
+gains no actions, and `Sign in with Google` stays a plain `button:`.
+
+**Mode 2 is still open**, and is the next thing to look at. `fill_form` keys on
+a field's accessible name, and `testingchallenges` offers four textboxes with
+none, so there is nothing to key on. The honest options are to type a generic
+value into every unnamed field in scope (cheap, and it submits junk to whatever
+is on the other side) or to let the synthesiser name them from surrounding text
+(a model seam, and the self-correcting-when-wrong shape that
+`docs/product/decisions.md` 17:00 says is fine to give a model). Neither is
+started.
+
 Both end the same way: the single highest-value edge is dropped, the budget then
 drains into nav links, and the run *looks* like a shallow-target problem. It is
 not. **A crawl that cannot type is a crawl that cannot leave the front page.**

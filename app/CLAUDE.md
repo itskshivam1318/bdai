@@ -269,17 +269,23 @@ Nothing else changes — not the canvas, not the backend.
 
 ## Gotchas worth not rediscovering
 
-**A page with no `<form>` element gets no form actions at all.** `forms.form_of`
-asks the DOM for a button's `<form>` ancestor and returns None when there is
-none, so `submit[valid|empty|invalid]` are never synthesised and the crawler
-just clicks the bare button. Measured against
-`practicetestautomation.com/practice-test-login/`, whose login is two inputs and
-a button with `document.querySelectorAll('form').length === 0` — the observer
-sees `textbox:Username` and `textbox:Password` and the crawl still never types
-into them. The ancestry test earns its keep (`forms.py:124` documents the
-garbage it prevents), so this is a live trade-off rather than a bug to squash
-blind: the fix has to scope fields to a button without a `<form>` and without
-re-manufacturing `submit[valid]:button:Sign in with Google`.
+**A button knows which fields it submits, `<form>` or not.** `forms.form_of`
+prefers a real `<form>` ancestor -- an author's declaration beats anything
+inferred -- and falls back to `_implicit_scope`: climb from the button, stop at
+the first ancestor holding a fillable field, and give up the moment another
+button or a page landmark comes into view. A region with two buttons in it has
+not said which one owns the fields; a region that is `<main>` is not a form.
+
+Measured both directions, and the probe's `FORM SCOPE` section holds both:
+`practicetestautomation.com/practice-test-login/` has zero `<form>` elements and
+now logs in (`submit[valid]:button:Submit -> /logged-in-successfully/`), where
+before it clicked Submit empty until the budget ran out;
+`practicesoftwaretesting.com/auth/login` -- the page that motivated the `<form>`
+requirement -- gains no new actions, and `Sign in with Google`, `Open chat` and
+the language switcher stay plain `button:` actions.
+
+If you loosen either stop rule, run `make probe` and watch that section: the two
+failures are opposite, and it is easy to fix one by causing the other.
 
 **Widget config lives in local state**, not on the xyflow node's `data`.
 Mutating `data` is a lint error and causes stale renders; `WidgetNode` holds

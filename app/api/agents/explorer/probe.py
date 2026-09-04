@@ -29,7 +29,7 @@ import sys
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
 
-from agents.explorer import Observer, state_key
+from agents.explorer import Observer, forms, state_key
 from agents.explorer.statekey import explain
 
 DEFAULT_BASE = "http://localhost:3000"
@@ -275,6 +275,82 @@ def projection_grid(page) -> bool:
     return passed
 
 
+# Which fields a button owns, on pages that did and did not say so. Each row is
+# (label, html, button text, expected -- "scoped" or "none").
+#
+# The two failures these guard are opposite and both were live: refusing a real
+# login because it wore no `<form>` (practicetestautomation.com, whose page has
+# zero form elements), and manufacturing `submit[valid]:button:Sign in with
+# Google` out of unrelated page chrome (practicesoftwaretesting.com, where ten
+# of eleven buttons had nothing to do with the login).
+SCOPE_CASES = (
+    (
+        "a real <form> is still authoritative",
+        "<main><form><label>Email <input name=e></label>"
+        "<button>Sign in</button></form></main>",
+        "Sign in",
+        "scoped",
+    ),
+    (
+        "a form-less login is scoped by its region",
+        "<main><div id=form><label>Username <input name=u></label>"
+        "<label>Password <input type=password name=p></label>"
+        "<button>Submit</button></div></main>",
+        "Submit",
+        "scoped",
+        # practicetestautomation.com/practice-test-login/ exactly: two bare
+        # inputs and a button in a plain div. Refusing this cost the whole app
+        # behind the wall -- the crawl clicked Submit empty until it timed out.
+    ),
+    (
+        "a button sharing a region with another button owns nothing",
+        "<main><div><label>Email <input name=e></label>"
+        "<button>Sign in</button><button>Sign in with Google</button>"
+        "</div></main>",
+        "Sign in with Google",
+        "none",
+    ),
+    (
+        "page chrome does not reach the login fields",
+        "<body><nav><button>Open chat</button><button>EN</button></nav>"
+        "<main><div><input name=u><button>Submit</button></div></main></body>",
+        "Open chat",
+        "none",
+    ),
+    (
+        "a button with no fields anywhere near it owns nothing",
+        "<main><div><h1>Docs</h1><button>Print</button></div>"
+        "<aside><input name=q></aside></main>",
+        "Print",
+        "none",
+    ),
+)
+
+
+def form_scope(page) -> bool:
+    """Does a button know which fields it submits?
+
+    `form_of` answers this, and it is the gate on every `submit[...]` action:
+    return None and the crawler can only ever click the button with the form
+    empty, which on a login page means never getting in.
+    """
+    print("FORM SCOPE  which fields a button submits")
+    passed = True
+
+    for label, html, button, expected in SCOPE_CASES:
+        page.set_content(html)
+        scope = forms.form_of(page, f"button:{button}")
+        verdict = "none" if scope is None else "scoped"
+        ok = verdict == expected
+        passed &= ok
+        print(f"  {'PASS' if ok else 'FAIL'}  {label:<52} {verdict}")
+        if not ok:
+            print(f"        expected {expected} for button {button!r}")
+
+    print()
+    return passed
+
+
 def main(base_url: str) -> int:
     with sync_playwright() as pw:
         browser = pw.chromium.launch()
@@ -283,6 +359,7 @@ def main(base_url: str) -> int:
         # --- 0. the projection, in isolation ----------------------------------
         projection_ok = projection_grid(page)
         projection_ok &= frontier_noise(page)
+        projection_ok &= form_scope(page)
 
         try:
             page.goto(base_url, timeout=3000)
