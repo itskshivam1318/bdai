@@ -350,6 +350,61 @@ def main() -> int:
                     back.states[bare_key].screenshot == "run-7/pic.png",
                 )
 
+        # 3e. A state the pipeline crossed twice takes the worse verdict. A
+        #     map that showed the *last* verdict would hide a defect behind a
+        #     pass, which is the one direction that must never happen.
+        from .generator import scenarios as _scenarios
+        from .runner import DEFECT as _DEFECT
+        from .runner import PASSED as _PASSED
+        from .runner import Resolution as _Resolution
+        from .runner import Result as _Result
+        from .runner import StepResult as _StepResult
+        from . import suite as _suite
+
+        drafted = _scenarios(result.world)
+        if not drafted:
+            ok &= check("the probe world yields a scenario to persist", False)
+        else:
+            one = drafted[0]
+
+            def _result(verdict: str) -> _Result:
+                return _Result(
+                    scenario=one,
+                    target_url=SUT,
+                    steps=[
+                        _StepResult(
+                            step=step,
+                            verdict=verdict,
+                            resolution=_Resolution(
+                                action=step.action, rung="exact", detail=""
+                            ),
+                            detail="probe",
+                        )
+                        for step in one.steps
+                    ],
+                )
+
+            with tempfile.TemporaryDirectory() as tmp:
+                engine = _create_engine(f"sqlite:///{tmp}/suite.db")
+                _SQLModel.metadata.create_all(engine)
+                with _Session(engine) as db:
+                    written = _suite.save_results(
+                        [_result(_PASSED), _result(_DEFECT)], run_id=9, session=db
+                    )
+                    ok &= check("both results are stored", written == 2)
+
+                    crossed = _suite.path_of(_result(_PASSED))
+                    verdicts = _suite.verdicts_by_state(9, db)
+                    ok &= check(
+                        "every state on the path gets a verdict",
+                        all(key in verdicts for key in crossed),
+                    )
+                    ok &= check(
+                        "the worse verdict wins where scenarios overlap",
+                        set(verdicts.values()) == {_DEFECT},
+                        f"got {sorted(set(verdicts.values()))}",
+                    )
+
         # 4. The executable layer: a path through the map becomes a test, and
         #    the test's failure classifies itself. These six checks are the
         #    acceptance experiment for the whole product claim, so they drive

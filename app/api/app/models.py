@@ -75,7 +75,11 @@ class TestCase(SQLModel, table=True):
     name: str
     selector: Optional[str] = None
     healed_selector: Optional[str] = None
-    status: str = "pending"  # pending | passed | failed | healed
+    # JSON list of the state keys this scenario crosses, in order. The map
+    # colours a node by the worst verdict among the scenarios naming it, so
+    # this is the join between a test result and a place on the graph.
+    path: str = "[]"
+    status: str = "pending"  # pending | passed | failed | healed | defect | escalate
     detail: Optional[str] = None
     created_at: datetime = Field(default_factory=utcnow)
 
