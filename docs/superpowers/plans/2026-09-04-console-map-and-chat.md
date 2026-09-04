@@ -1085,12 +1085,20 @@ git commit -m "API: one endpoint for the graph a run discovered"
 
 - [ ] **Step 1: Add the imports**
 
-At the top of `explore.py`, alongside the existing `from agents import orchestrator`:
+> **Base changed after this plan was written.** `ac99a8b` gave `_explore` a
+> no-model fallback: when `llm.load()` raises, `provider` stays `None` and
+> `_crawl_only` builds the map with `explorer.crawler` instead. Nothing below
+> may delete that path. It is only reachable with no API key configured, so a
+> regression here is invisible until the one run that most needs to work.
+
+Add to the imports — do not replace the block, `crawler` and `Synthesizer`
+are load-bearing for the fallback:
 
 ```python
 from agents import orchestrator, runner, suite
-from agents.explorer import store
+from agents.explorer import crawler, store
 from agents.explorer.forms import Credentials
+from agents.explorer.synth import Synthesizer
 from agents.generator import scenarios
 from agents.llm import load
 from agents.shots import shooter
@@ -1115,10 +1123,16 @@ The current body closes the browser, then saves. Generation and replay both
 need a live page, so the browser must stay open.
 
 Replace the run of lines from `browser.close()` through the end of the
-`for gap in result.gaps:` loop — **and** the two lines after it that set
-`run.status = "passed"` and `run.summary` — with the block below. Those two are
-included because the replacement sets both itself, from the tally; leaving the
-originals in place would report a run green that found a defect.
+`for gap in result.gaps:` loop — **and** the `if run:` block after it that sets
+`run.status` and `run.summary` — with the block below. That block is included
+because the replacement sets both itself, from the tally; leaving the original
+in place would report a run green that found a defect.
+
+Since `ac99a8b` that trailing `if run:` is no longer two lines: it is a
+conditional that yields `degraded` when `provider is None`. The replacement
+below preserves it. `scenarios()` is pure over the `WorldMap`, so the no-model
+path reaches every stage of this pipeline — generation and replay do not care
+where the map came from.
 
 ```python
                 rows = store.save(result.world, run_id, db)
@@ -1205,8 +1219,21 @@ originals in place would report a run green that found a defect.
             )
 
             if run:
-                run.status = "failed" if tally[runner.DEFECT] else "passed"
-                run.summary = result.summary or f"stopped: {result.stopped}"
+                # A defect is a defect whoever found it. Absent one, `degraded`
+                # survives a model-free run: a map and a suite exist, but no
+                # flow was named and no intent was honoured, so green would
+                # claim more than happened. See the fallback in `_explore`.
+                if tally[runner.DEFECT]:
+                    run.status = "failed"
+                else:
+                    run.status = "passed" if provider else "degraded"
+                run.summary = result.summary or (
+                    f"{len(result.world.states)} states, {len(plan)} scenarios "
+                    f"-- crawled without a model. Set ANTHROPIC_API_KEY for "
+                    f"flows and a summary."
+                    if provider is None
+                    else f"stopped: {result.stopped}"
+                )
 ```
 
 Note `results = []` is assigned inside the `with sync_playwright()` block but read after it. Move its initialisation above the `try:` so the `except` path still has a list to reference:
@@ -1234,6 +1261,11 @@ Run: `ls app/api/artifacts/run-*/`
 Expected: one `.png` per discovered state.
 
 - [ ] **Step 5: Confirm nothing else broke**
+
+Run: `cd app/api && uv run python -c "from app.routers import explore; print(explore.crawler, explore.Synthesizer, explore._crawl_only)"`
+Expected: all three resolve. An `AttributeError` here means Step 1 replaced the
+import block rather than adding to it, and the no-key path is broken — which no
+other check in this plan will notice, because every one of them runs with a key.
 
 Run: `cd app && make probe`
 Expected: all three sections PASS.

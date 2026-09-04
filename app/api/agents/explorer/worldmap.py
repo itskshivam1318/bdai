@@ -92,6 +92,66 @@ class Transition:
         return self.from_key == self.to_key
 
 
+def is_flow(world: "WorldMap", transition: Transition) -> bool:
+    """Is this edge worth a test? Structural signals only.
+
+    QA Wolf's rule is that a flow must describe what a user *accomplishes*; it
+    explicitly rejects test cases like "Display Search Dropdown". Before this
+    existed the Generator compiled every recorded edge, so a crawl of saucedemo
+    produced "activate the link" and "click Open Menu" beside the login flow,
+    and six sibling product links each became their own test.
+
+    Three signals, all already on the objects, and no knowledge of what an
+    action string means -- this module keeps actions opaque (see the class
+    docstring) and `submit[` appearing here would break that:
+
+        mutating        a non-GET fired. The user changed something, which is
+                        the definition of accomplishing anything. Kept even as
+                        a self-loop: "the app accepted it and did not
+                        re-render" is the most valuable edge in the graph.
+
+        self-loop with
+        nothing fired   asked, and nothing happened. `textbox:Email stays`.
+                        A test here asserts nothing.
+
+        discovered its
+        destination     the edge that first reached `to_key`. If a state is
+                        already recorded, a second route into it re-tests a
+                        screen the suite already covers.
+
+    **This is not the same question as `frontier()`.** An edge can be highly
+    informative to the *map* and worthless as a *test* -- the `Transition`
+    docstring defends self-loops, and it is right to, because the crawler needs
+    them to model the app. Modelling and testing are different jobs and this is
+    where they part.
+
+    The vocabulary rule that belongs with the Generator -- a form submission is
+    an accomplishment whatever its structure, so an unhappy path that is
+    correctly refused stays in the plan -- is in `generator.worth_testing`,
+    which may know what an action means. Together they are the whole policy.
+    """
+    if transition.mutating:
+        return True
+    if transition.self_loop:
+        return False
+    return _discovered(world, transition)
+
+
+def _discovered(world: "WorldMap", transition: Transition) -> bool:
+    """Was this the first recorded edge to reach its destination?
+
+    Insertion order is the crawl order, so the first edge into a state is the
+    one that found it -- the same tie-break `paths()` makes by exploring in
+    that order. Deterministic for a given map, which is what the check needs.
+    """
+    for (from_key, action), taken in world.transitions.items():
+        for recorded in taken:
+            if recorded.to_key != transition.to_key:
+                continue
+            return (from_key, action) == (transition.from_key, transition.action)
+    return False
+
+
 @dataclass
 class WorldMap:
     """States, the edges between them, and the observations backing both.

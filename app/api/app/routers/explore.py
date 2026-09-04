@@ -28,17 +28,20 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 # Absolute, not relative: `agents/` is a sibling of `app/` under `api/`, so a
 # relative import would climb above this package and fail at import time.
-from agents import orchestrator
-from agents.explorer import store
+from agents import orchestrator, runner
+from agents.explorer import crawler, store
 from agents.explorer.forms import Credentials
+from agents.explorer.synth import Synthesizer
+from agents.generator import scenarios
 from agents.llm import load
 from agents.tracing import start as start_tracing
+from ..config import settings
 from ..db import engine, get_session
-from ..models import Event, Run
+from ..models import Event, Run, TestCase
 
 router = APIRouter(prefix="/api/runs", tags=["explore"])
 
@@ -51,6 +54,74 @@ class ExploreRequest(BaseModel):
     max_waves: int = 3
     max_ants: int = 4
     ant_actions: int = 4
+
+
+def _crawl_only(page, target_url: str, emit, checkpoint) -> orchestrator.Exploration:
+    """The no-model path: the same WorldMap, built breadth-first with no model.
+
+    Returned as an `Exploration` so the caller's save-and-report block does not
+    have to branch. `flows` and `summary` stay empty because naming a user
+    journey is the one thing on that path that genuinely needs a model -- the
+    graph itself never did, which is the whole argument in `explorer/__init__`.
+
+    `gaps` is rendered here rather than in the caller: the orchestrator hands
+    back prose a model wrote, `WorldMap.gaps()` hands back a dict, and the
+    timeline only knows how to print strings.
+    """
+    world = crawler.crawl(
+        page,
+        target_url,
+        credentials=Credentials.from_env(),
+        # Same cache the CLI uses, so a payload the model chose on an earlier
+        # run is reused now that there is no model to ask.
+        synthesizer=Synthesizer(cache_path=settings.artifacts_dir / "invalid-payloads.json"),
+        checkpoint=checkpoint,
+    )
+    gaps = tuple(
+        f"[{key[:8]}] {', '.join(actions[:6])}"
+        for key, actions in sorted(world.gaps().items(), key=lambda kv: -len(kv[1]))
+        if actions
+    )
+    return orchestrator.Exploration(world=world, stopped="no model", gaps=gaps[:3])
+
+
+def _save_results(results, run_id: int, db: Session) -> int:
+    """Replay outcomes as `TestCase` rows. Idempotent per run.
+
+    Stands in for `suite.save_results` (Task 4), which lives on `work/map`
+    along with `agents/suite.py`. Writing it here rather than creating that
+    file keeps this change off the map branch's territory -- swap the call when
+    the branch lands, and delete this.
+
+    Rows are cleared before writing: a re-run of the same `run_id` is a second
+    opinion about the same app, not eight more tests. `store.save` takes the
+    same view of states.
+    """
+    for stale in db.exec(select(TestCase).where(TestCase.run_id == run_id)).all():
+        db.delete(stale)
+
+    for outcome in results:
+        healed = outcome.healed_steps
+        # The terminal step is what the scenario is *about* -- generator.py
+        # builds one scenario per distinct terminal action -- so its locator is
+        # the one worth recording against the row.
+        terminal = outcome.scenario.terminal
+        db.add(
+            TestCase(
+                run_id=run_id,
+                name=outcome.scenario.name,
+                selector=terminal.action,
+                healed_selector=healed[-1].resolution.action if healed else None,
+                status=outcome.verdict,
+                detail=" | ".join(
+                    f"[{s.verdict}] {s.step.intent}" for s in outcome.steps
+                )[:2000]
+                or None,
+            )
+        )
+
+    db.commit()
+    return len(results)
 
 
 def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
@@ -76,58 +147,175 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
         if traces:
             emit("info", f"traces: {traces}")
 
+        # A missing key degrades the run; it does not end it. The error message
+        # has always named `explorer.crawler` as the way to get a map anyway,
+        # and the crawler needs a browser and a URL -- both of which are right
+        # here. Returning instead was the message telling the user to go and do
+        # by hand the thing this function was already standing in front of.
+        provider = None
         try:
             provider = load(notify=emit)
         except RuntimeError as exc:
-            # No key configured. A dead end, but a legible one -- and the
-            # deterministic crawler is still a route to a map.
             emit("error", str(exc))
-            if run:
-                run.status = "error"
-                run.summary = "no model configured"
-                run.finished_at = datetime.now(timezone.utc)
-                db.add(run)
-                db.commit()
-            return
+            emit("warn", "no model: falling back to the deterministic crawler")
 
         emit("info", f"exploring {target_url}", surface="timeline")
-        emit("info", f"model: {provider.name} / {provider.model}")
+        emit(
+            "info",
+            f"model: {provider.name} / {provider.model}"
+            if provider
+            else "model: none -- breadth-first crawl, no flows and no summary",
+        )
+        if body.intent and not provider:
+            # Better than silently ignoring it: the crawler has nowhere to put
+            # an intent, and a user who typed one deserves to know that.
+            emit("warn", f"intent ignored without a model: {body.intent!r}")
+
+        # Incremental, because a map that only appears when the crawl finishes
+        # cannot be watched, and watching it is the demo. `store.save` is
+        # idempotent, so re-saving an unchanged map writes nothing.
+        seen = 0
+
+        def checkpoint(world) -> None:
+            nonlocal seen
+            store.save(world, run_id, db)
+            if len(world.states) > seen:
+                seen = len(world.states)
+                emit("info", f"  crawled {seen} state(s)")
+
+        # Assigned inside the `with` block below but read after it, and the
+        # `except` path must still find a list rather than a NameError.
+        results: list = []
 
         try:
             with sync_playwright() as pw:
                 browser = pw.chromium.launch()
                 page = browser.new_page()
-                result = orchestrator.run(
-                    page,
-                    target_url,
-                    provider,
-                    intent=body.intent,
-                    budget=orchestrator.Budget(
-                        max_waves=body.max_waves,
-                        max_ants=body.max_ants,
-                        ant_actions=body.ant_actions,
-                    ),
-                    credentials=Credentials.from_env(),
-                    on_event=emit,
-                    run_id=run_id,
+                if provider is None:
+                    result = _crawl_only(page, target_url, emit, checkpoint)
+                else:
+                    result = orchestrator.run(
+                        page,
+                        target_url,
+                        provider,
+                        intent=body.intent,
+                        budget=orchestrator.Budget(
+                            max_waves=body.max_waves,
+                            max_ants=body.max_ants,
+                            ant_actions=body.ant_actions,
+                        ),
+                        credentials=Credentials.from_env(),
+                        on_event=emit,
+                        run_id=run_id,
+                    )
+                # --- map ---------------------------------------------
+                # The browser stays open past this point: generation reads the
+                # map, but replay drives a live page, and reopening one would
+                # throw away the session the crawl just established.
+                rows = store.save(result.world, run_id, db)
+                emit(
+                    "decision",
+                    f"map saved: {len(result.world.states)} states, "
+                    f"{sum(len(t) for t in result.world.transitions.values())} "
+                    # "new": the crawl checkpoints as it goes, so a healthy run
+                    # ends at 0 here. Bare "(0 rows)" reads like a failed write.
+                    f"transitions ({rows} new rows)",
                 )
+
+                # --- plan --------------------------------------------
+                for flow in result.flows:
+                    emit("decision", f"flow: {flow.get('name')} -- {flow.get('why', '')}")
+                emit(
+                    "decision",
+                    f"plan: {len(result.flows)} flows across "
+                    f"{len(result.world.states)} states",
+                    surface="plan",
+                )
+
+                # --- coverage, before generation, as the brief requires
+                for gap in result.gaps:
+                    emit("warn", f"gap: {gap}")
+                emit(
+                    "warn" if result.gaps else "info",
+                    f"coverage: {len(result.gaps)} gap(s) before generation",
+                    surface="coverage",
+                )
+
+                # --- suite -------------------------------------------
+                plan = scenarios(result.world)
+                emit(
+                    "decision",
+                    f"suite: {len(plan)} scenarios compiled from recorded paths",
+                    surface="suite",
+                )
+
+                # --- run and heal ------------------------------------
+                credentials = Credentials.from_env()
+                for scenario in plan:
+                    try:
+                        results.append(
+                            runner.run(
+                                page,
+                                scenario,
+                                credentials=credentials,
+                                on_event=emit,
+                            )
+                        )
+                    except Exception as exc:
+                        # One scenario that cannot even be replayed must not
+                        # cost the others their verdicts.
+                        emit("error", f"{scenario.name}: {type(exc).__name__}: {exc}")
+
                 browser.close()
 
-            rows = store.save(result.world, run_id, db)
+            written = _save_results(results, run_id, db)
+
+            for outcome in results:
+                for step in outcome.healed_steps:
+                    emit(
+                        "decision",
+                        f"healed: {step.step.action} -> {step.resolution.action} "
+                        f"({step.resolution.rung})",
+                        surface="heal",
+                    )
+                if outcome.verdict in {runner.DEFECT, runner.ESCALATE}:
+                    emit(
+                        "error",
+                        f"{outcome.verdict}: {outcome.scenario.name}",
+                        surface="defect",
+                    )
+
+            tally = {
+                v: sum(1 for r in results if r.verdict == v)
+                for v in (runner.PASSED, runner.HEALED, runner.DEFECT, runner.ESCALATE)
+            }
             emit(
                 "decision",
-                f"map saved: {len(result.world.states)} states, "
-                f"{sum(len(t) for t in result.world.transitions.values())} "
-                f"transitions ({rows} rows)",
+                f"report: {tally[runner.PASSED]} passed, {tally[runner.HEALED]} healed, "
+                f"{tally[runner.DEFECT]} defect, {tally[runner.ESCALATE]} escalate, "
+                f"{len(result.gaps)} gap(s) remaining ({written} rows)",
+                surface="report",
             )
-            for flow in result.flows:
-                emit("decision", f"flow: {flow.get('name')} -- {flow.get('why', '')}")
-            for gap in result.gaps:
-                emit("warn", f"gap: {gap}")
 
             if run:
-                run.status = "passed"
-                run.summary = result.summary or f"stopped: {result.stopped}"
+                # A defect is a defect whoever found it, so it outranks the
+                # model question. Absent one, `degraded` survives a model-free
+                # run: a map and a suite exist, but no flow was named and no
+                # intent was honoured, so green would claim more than happened.
+                # `degraded` is unknown to STATUS_TONE and renders grey, which
+                # is the point -- see SessionView.tsx.
+                if tally[runner.DEFECT] or tally[runner.ESCALATE]:
+                    run.status = "failed"
+                else:
+                    run.status = "passed" if provider else "degraded"
+                run.summary = result.summary or (
+                    f"{len(result.world.states)} states, {len(plan)} scenarios, "
+                    f"{tally[runner.DEFECT] + tally[runner.ESCALATE]} needing "
+                    f"attention -- crawled without a model. Set "
+                    f"ANTHROPIC_API_KEY for flows and a summary."
+                    if provider is None
+                    else f"stopped: {result.stopped}"
+                )
 
         except Exception as exc:
             # An exploration that dies half way still discovered something, but

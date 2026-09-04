@@ -13,9 +13,12 @@ app/
 ├── api/                backend — FastAPI + SQLModel + SQLite, driven by uv
 │   ├── app/                routers/, models.py, db.py, config.py, main.py
 │   ├── agents/explorer/    observe → identify → map → crawl → store. See below
+│   ├── agents/pipeline.py  **the meta-agent** — URL in, report out. Start here
+│   ├── agents/critic.py    computes coverage gaps; the model may only rank them
 │   ├── agents/generator.py map path → scenario → runnable .spec.ts
 │   ├── agents/runner.py    execute a scenario; heal, or report a defect, or escalate
-│   ├── agent_mcp/          MCP server -- the pipeline, for an external coding agent
+│   ├── agents/orchestrator.py  the *exploration* colony — ants, not the pipeline
+│   ├── agent_mcp/          MCP server — the pipeline, for an external coding agent
 │   └── smoke_run.py        walking skeleton, superseded by `make loop`. See below
 ├── web/                frontend — Next.js 16 + React 19 + Tailwind v4
 │   ├── app/                layout, page, globals.css
@@ -50,7 +53,23 @@ execution — most heavily:
 | Healer | replays failures, repairs broken locators, and distinguishes a broken script from a genuine defect |
 
 The meta-agent evaluates coverage between stages, decides when to re-plan or
-escalate, and synthesises a final test quality report.
+escalate, and synthesises a final test quality report. That is
+**`agents/pipeline.py`** — `make pipeline` runs the whole thing from a URL with
+no stage chosen by a human. Do not confuse it with `agents/orchestrator.py`,
+which orchestrates *ants within exploration* and says so in its own docstring.
+
+Its policy is code, not a prompt, and the reason is in `decisions.md`
+(2026-09-04 19:30): the evidence it routes on was computed by something else —
+`runner.py` classified each failure from two orthogonal observations, and
+`critic.py` ranked gaps it structurally could not invent. Routing on computed
+evidence is a policy, not an opinion. Every branch records a
+`Decision(stage, choice, because, evidence)`, which is what the rubric's 15%
+for *presenting the agent's decisions* is actually asking for.
+
+The one to read first is `addressable()`: it decides whether a remaining gap is
+one more exploration could close. Six unexercised `submit[invalid]` partitions
+with no synthesizer configured are **not** a reason to explore again, and saying
+so is the difference between orchestrating and looping.
 
 `api/agents/` is where the pipeline lives; `git log --oneline -- api/agents/`
 says how far it has got. Prior art on coverage evaluation — the hardest of the
@@ -106,17 +125,34 @@ claim on an edge so two workers do not take the same one, which is a column.
 
 ### Configuration
 
-All optional; all degrade loudly rather than silently.
+Read from `.env` by `agents/__init__.py` at import — the nearest one walking up
+from `api/agents/`, bounded to the repo, so `api/.env` wins over a root `.env`.
+An exported variable always beats the file. Copy `api/.env.example` to start.
+
+It is loaded in the package rather than in one entry point because there are
+four of them (the API background task, `explorer.crawler`, `probe.py`,
+`smoke_run.py`) and all four read these out of `os.environ`.
 
 ```bash
-AIVAR_USERNAME / AIVAR_PASSWORD   # forms.Credentials — without these, any
-                                  # login wall stops the crawl at one state
-ANTHROPIC_API_KEY                 # synth.py. Without it, invalid payloads come
-                                  # from a static mutation table that knows
-                                  # nothing about the app; the crawl prints
-                                  # "PAYLOADS n from fallback" so a degraded
-                                  # run never looks like a good one
+ANTHROPIC_API_KEY / GEMINI_API_KEY  # llm.load() picks a provider by whichever
+                                    # is present. With neither, a console run
+                                    # degrades to `explorer.crawler` — a real
+                                    # map, breadth-first, but no flows, no
+                                    # summary, no intent, and status `degraded`
+                                    # rather than `passed`. Also feeds synth.py:
+                                    # without it invalid payloads come from a
+                                    # static mutation table that knows nothing
+                                    # about the app, and the crawl prints
+                                    # "PAYLOADS n from fallback" so a degraded
+                                    # run never looks like a good one
+AIVAR_USERNAME / AIVAR_PASSWORD     # optional. forms.Credentials — without
+                                    # these, any login wall stops the crawl at
+                                    # one state
 ```
+
+A run that ends in `error` puts its reason in `run.summary`, and the console's
+status label (`run 2 · error ⓘ`) discloses it on click. If a failure is ever
+invisible in the UI again, that path is what to fix — not the canvas.
 
 <!-- TODO(shivam): the handoff contract is now half-settled, and the half that
      is settled is the half that was contentious. Selectors vs intent went to
@@ -270,10 +306,13 @@ sees the package set as current and leaves the shebangs alone. The fix is
 From here or from the repo root; `make` with no arguments lists every target.
 
 ```bash
-make setup   # first run only: npm install, uv sync, playwright install
-make dev     # both servers — web :3000, api :8000
-make smoke   # the walking skeleton
-make check   # typecheck + lint — run before handing work off
-make reset   # wipe the database and artifacts
-make stop    # kill the servers
+make setup     # first run only: npm install, uv sync, playwright install
+make dev       # both servers — web :3000, api :8000
+make pipeline  # the whole claim: URL in, test quality report out
+make probe     # 41 observable checks. No API key, no quota
+make gaps      # crawl an app and rank what the crawl did not cover
+make specs     # write generated .spec.ts, then run them with Playwright
+make check     # typecheck + lint — run before handing work off
+make reset     # wipe the database and artifacts
+make stop      # kill the servers
 ```
