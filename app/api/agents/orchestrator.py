@@ -157,6 +157,7 @@ def run(
     on_event=None,
     run_id: int | None = None,
     shot: Shot | None = None,
+    checkpoint=None,
 ) -> Exploration:
     """Explore `entry_url` until the orchestrator is satisfied or the budget ends.
 
@@ -165,6 +166,13 @@ def run(
     already describes itself as "what the canvas streams to show reasoning", and
     an autonomous system that cannot show its reasoning is one nobody trusts.
     Defaults to printing.
+
+    `checkpoint(world)` is the same idea for the map rather than the reasoning:
+    it is called at the end of every wave, so a caller that persists the map can
+    draw it as it grows. Without it the colony's map exists only in memory until
+    `run` returns, and a console watching a ten-minute exploration has an empty
+    canvas for ten minutes and a finished graph in the eleventh. Optional, and
+    never allowed to end a run -- see the call site.
     """
     budget = budget or Budget()
     credentials = credentials or Credentials.from_env()
@@ -292,6 +300,17 @@ def run(
 
         result.reports += wave_reports
         result.waves = wave + 1
+
+        # The wave is the honest unit: ants mutate `world` as they go, but only
+        # here is it a settled account of what the colony knows. Failure to save
+        # must not kill an exploration that is otherwise fine -- the map is
+        # still in memory and the final save at the end of `run` gets another
+        # attempt -- so this is reported and stepped over, like a dead ant.
+        if checkpoint is not None:
+            try:
+                checkpoint(world)
+            except Exception as exc:
+                emit("error", f"  checkpoint failed: {type(exc).__name__}: {exc}")
 
         feedback = tools.brief(
             world,

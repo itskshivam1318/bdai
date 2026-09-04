@@ -235,6 +235,12 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
                         # Without this no state gets a picture and every card on
                         # the map is an empty box.
                         shot=shooter(page, run_id, settings.artifacts_dir),
+                        # The same callback the no-model path already gets. The
+                        # console polls `/runs/{id}/map`, which reads the
+                        # database, so without this the colony's map is invisible
+                        # until the run ends -- an empty canvas for the whole
+                        # exploration and a finished graph in one jump.
+                        checkpoint=checkpoint,
                     )
                 # --- map ---------------------------------------------
                 # The browser stays open past this point: generation reads the
