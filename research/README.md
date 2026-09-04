@@ -64,6 +64,15 @@ Each is documented, specific, and needs no model call to be impressive.
 | **Failure taxonomy** | mabl | Regression / Test-implementation / Environment / Network / Timing / self-blame |
 | **Invalid-transition cells** | ISTQB CTFL v4.0.1 | The empty cells of a states × events table are enumerable candidate error-state tests — the closest thing to a computable "missing error states" denominator |
 | **Extractive quotes** | Rulers, arXiv:2601.08654 | Every rubric decision must cite a verbatim span, so a judge cannot assert a gap it cannot point to |
+| **Fixed external checklist** | ISTQB + Bach + Hendrickson | The checklist IS the external signal a critic needs — authored by standards bodies, not invented at runtime |
+
+## Two rules that fall out of the research
+
+1. **Report a prioritised list of gaps, never a calibrated percentage.** LLM
+   judges rank reliably (Spearman ρ > 0.6) but score unreliably, and 33–41pp of
+   kappa deflation makes any "coverage = 72%" claim indefensible.
+2. **Never let the model that wrote the plan be the model that judges it.**
+   Self-preference bias is measured and significant.
 
 ## Standing warnings
 
