@@ -2,7 +2,7 @@
 # scripts/dev.sh reads .worktree-env for ports, falling back to 3000/8000.
 
 .DEFAULT_GOAL := help
-.PHONY: help setup dev api web smoke worktree list rm check reset stop
+.PHONY: help setup dev api web smoke probe explore crawl trace diff runs worktree list rm check reset stop
 
 PY_VERSION := 3.12
 
@@ -27,6 +27,27 @@ web: ## Run only the frontend
 
 smoke: ## Walking skeleton: drive a browser, break a locator, heal it
 	cd api && uv run python smoke_run.py http://localhost:$${WEB_PORT:-3000}
+
+probe: ## Observable checks for the explorer and the agents. No API key needed.
+	cd api && uv run python -m agents.explorer.probe
+	cd api && uv run python -m agents.probe
+
+explore: ## Map an app with the agent colony. URL=... [INTENT=...]
+	cd api && uv run python -m agents.orchestrator "$${URL:-http://localhost:$${WEB_PORT:-3000}/sut}" "$${INTENT}"
+
+crawl: ## Map an app deterministically -- no model, no API key. URL=...
+	cd api && uv run python -m agents.explorer.crawler "$${URL:-http://localhost:$${WEB_PORT:-3000}/sut}"
+
+trace: ## Local LLM observability UI (Phoenix) on :6006. Leave running.
+	cd api && uv run python -m agents.tracing
+
+runs: ## List saved run maps, newest last
+	@ls -1t api/artifacts/runs/*.json 2>/dev/null | tail -r || echo "no runs yet"
+
+diff: ## Compare two saved runs. BEFORE=... AFTER=...  (defaults: last two)
+	@cd api && uv run python -m agents.explorer.snapshot \
+		"$${BEFORE:-$$(ls -1t artifacts/runs/*.json | sed -n 2p)}" \
+		"$${AFTER:-$$(ls -1t artifacts/runs/*.json | sed -n 1p)}"
 
 worktree: ## Create a worktree with its own ports and database
 	@test -n "$(name)" || { echo "usage: make worktree name=alice"; exit 1; }
