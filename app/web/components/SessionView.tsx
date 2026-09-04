@@ -46,6 +46,51 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
   const latest = runs[runs.length - 1];
   const reasonOpen = latest != null && reasonFor === latest.id;
 
+  /*
+   * The stage rail earns its 40% of the window while stages are advancing and
+   * stops earning it the moment they stop. So it follows the run by default and
+   * defers to the user the moment they say otherwise:
+   *
+   *   pinned === null   follow the run
+   *   pinned === true   held open
+   *   pinned === false  held shut
+   *
+   * A new run clears the pin. A preference expressed about the last run is not
+   * a preference about this one, and the start of a run is the single moment
+   * the rail is certainly worth looking at.
+   */
+  const [pinned, setPinned] = useState<boolean | null>(null);
+  const [autoHidden, setAutoHidden] = useState(false);
+
+  const running = latest?.status === "running";
+  const latestId = latest?.id ?? null;
+  const runKey = latest ? `${latest.id}:${latest.status}` : "none";
+  const [seenRunKey, setSeenRunKey] = useState(runKey);
+
+  // Adjusting state during render rather than in an effect: React re-renders
+  // immediately with the corrected value, so the rail never paints one frame
+  // shut on the run that just started. `runKey` carries the status, so this
+  // fires on a transition and not on every three-second poll.
+  if (runKey !== seenRunKey) {
+    setSeenRunKey(runKey);
+    if (running) {
+      setPinned(null);
+      setAutoHidden(false);
+    }
+  }
+
+  // Terminal status: let the verdict sit long enough to read, then give the
+  // width back to the map. Keyed on the run's id rather than the run object,
+  // which `refreshRuns` replaces every three seconds -- depending on the object
+  // would restart this timer forever and it would never fire.
+  useEffect(() => {
+    if (running || latestId == null || pinned !== null) return;
+    const t = setTimeout(() => setAutoHidden(true), 4000);
+    return () => clearTimeout(t);
+  }, [running, latestId, pinned]);
+
+  const railOpen = pinned ?? !autoHidden;
+
   // Runs are scoped maps, not versions of one map: re-crawling after the app
   // changes writes a second graph beside the first, which is the drift story.
   // So the picker is not a convenience — it is how you compare two builds.
@@ -180,13 +225,46 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
         >
           Advanced
         </button>
+        <button
+          type="button"
+          onClick={() => setPinned(!railOpen)}
+          aria-expanded={railOpen}
+          aria-controls="stage-rail"
+          aria-label={railOpen ? "Hide stage rail" : "Show stage rail"}
+          title={railOpen ? "Hide stage rail" : "Show stage rail"}
+          className="rounded-md p-1.5 text-muted hover:bg-hush hover:text-ink"
+        >
+          {/* The left panel's icon with the bar on the other edge: both say
+              "this side moves", so the pair reads as one control scheme. */}
+          <svg
+            aria-hidden
+            viewBox="0 0 16 16"
+            className="size-4"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.5"
+          >
+            <rect x="1.5" y="2.5" width="13" height="11" rx="2" />
+            <line x1="10" y1="2.5" x2="10" y2="13.5" />
+          </svg>
+        </button>
       </header>
 
-      <div className="grid min-h-0 flex-1 grid-cols-[3fr_2fr]">
+      {/* One column when the rail is away, so the graph reflows into the width
+          rather than staying crowded into the left two-thirds of the window. */}
+      <div
+        className={`grid min-h-0 flex-1 ${
+          railOpen ? "grid-cols-[3fr_2fr]" : "grid-cols-1"
+        }`}
+      >
         <div className="min-w-0">
           <MapPane runId={shownRunId} />
         </div>
-        <StageRail sessionId={sessionId} runId={shownRunId} />
+        {railOpen && (
+          <div id="stage-rail" className="min-w-0 overflow-hidden">
+            <StageRail sessionId={sessionId} runId={shownRunId} />
+          </div>
+        )}
       </div>
 
       <form
