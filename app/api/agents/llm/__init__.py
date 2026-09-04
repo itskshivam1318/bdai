@@ -133,15 +133,28 @@ def load(
     import os
 
     if provider is None:
-        if os.environ.get("ANTHROPIC_API_KEY"):
+        # OpenRouter is probed first *on cost*, not on quality. A full colony
+        # run is ~78 model calls; measured against this budget that is ~$2.15
+        # on `claude-opus-5` and ~$0.06 on `qwen/qwen3-coder-next`. Auto-detect
+        # is the path taken by someone who has not thought about which model
+        # they want, and defaulting that person to the option that buys ~160
+        # runs a day rather than ~5 is the useful default for a workspace whose
+        # last two live runs both died on an exhausted key.
+        #
+        # This only decides ties. An explicit `provider=` still wins, which is
+        # what the mixed-colony split -- a strong orchestrator over cheap ants
+        # -- would use.
+        if os.environ.get("OPENROUTER_API_KEY"):
+            provider = "openrouter"
+        elif os.environ.get("ANTHROPIC_API_KEY"):
             provider = "claude"
         elif os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
             provider = "gemini"
         else:
             raise RuntimeError(
-                "No model configured. Export ANTHROPIC_API_KEY or GEMINI_API_KEY, "
-                "or run the deterministic crawler instead: "
-                "python -m agents.explorer.crawler <url>"
+                "No model configured. Export OPENROUTER_API_KEY, "
+                "ANTHROPIC_API_KEY or GEMINI_API_KEY, or run the deterministic "
+                "crawler instead: python -m agents.explorer.crawler <url>"
             )
 
     if provider == "claude":
@@ -153,7 +166,22 @@ def load(
 
         return Gemini(model=model, notify=notify) if model else Gemini(notify=notify)
 
-    raise ValueError(f"unknown provider {provider!r}; expected claude or gemini")
+    # Every OpenAI-compatible endpoint is this one class behind a base URL, so
+    # `openrouter` is a named default rather than a distinct provider. Point
+    # OPENROUTER_BASE_URL at DeepSeek, Groq, Cerebras or a local Ollama and the
+    # same code path serves them; only the key and the model string change.
+    if provider in ("openrouter", "openai-compat"):
+        from .openai_compat import DEFAULT_BASE_URL, DEFAULT_MODEL, OpenAICompat
+
+        return OpenAICompat(
+            model=model or os.environ.get("OPENROUTER_MODEL") or DEFAULT_MODEL,
+            base_url=os.environ.get("OPENROUTER_BASE_URL") or DEFAULT_BASE_URL,
+            notify=notify,
+        )
+
+    raise ValueError(
+        f"unknown provider {provider!r}; expected claude, gemini or openrouter"
+    )
 
 
 __all__ = [

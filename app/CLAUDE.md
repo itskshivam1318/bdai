@@ -134,6 +134,15 @@ four of them (the API background task, `explorer.crawler`, `probe.py`,
 `smoke_run.py`) and all four read these out of `os.environ`.
 
 ```bash
+OPENROUTER_API_KEY                  # probed FIRST by llm.load(), on cost. One
+                                    # colony run is ~78 model calls: measured
+                                    # 2026-09-04 at $0.089 on qwen3-coder-next
+                                    # vs ~$3.42 on claude-opus-5 — 112 runs per
+                                    # $10 against 3. Optional companions:
+                                    # OPENROUTER_MODEL (any model string) and
+                                    # OPENROUTER_BASE_URL, which repoints the
+                                    # same OpenAICompat class at DeepSeek,
+                                    # Groq, Cerebras or a local Ollama
 ANTHROPIC_API_KEY / GEMINI_API_KEY  # llm.load() picks a provider by whichever
                                     # is present. With neither, a console run
                                     # degrades to `explorer.crawler` — a real
