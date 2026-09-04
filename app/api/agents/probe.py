@@ -289,6 +289,43 @@ def main() -> int:
                 not compare(world, stripped).identical,
             )
 
+        # 3c. A thumbnail is attached once and must survive both a revisit and
+        #     a round trip through a file. Losing it on revisit is silent: the
+        #     node still renders, just without its picture, and only on the
+        #     states the crawler visited more than once.
+        from .explorer.worldmap import WorldMap as _WorldMap
+
+        shots = _WorldMap()
+        first = world.evidence[0]
+        shot_key = shots.record(first)
+        shots.attach_screenshot(shot_key, "run-1/abc.png")
+        shots.record(first)  # a revisit
+        ok &= check(
+            "a revisit does not lose the thumbnail",
+            shots.states[shot_key].screenshot == "run-1/abc.png",
+        )
+        shots.attach_screenshot(shot_key, "run-1/second.png")
+        ok &= check(
+            "the first thumbnail wins",
+            shots.states[shot_key].screenshot == "run-1/abc.png",
+        )
+        ok &= check(
+            "attaching None is a no-op, not a wipe",
+            (
+                shots.attach_screenshot(shot_key, None),
+                shots.states[shot_key].screenshot == "run-1/abc.png",
+            )[1],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            from .explorer.snapshot import load as _load
+            from .explorer.snapshot import save as _save
+
+            reloaded = _load(_save(shots, f"{tmp}/shots.json", target=SUT))
+            ok &= check(
+                "a saved map keeps its thumbnails",
+                reloaded.states[shot_key].screenshot == "run-1/abc.png",
+            )
+
         # 4. The executable layer: a path through the map becomes a test, and
         #    the test's failure classifies itself. These six checks are the
         #    acceptance experiment for the whole product claim, so they drive

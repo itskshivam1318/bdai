@@ -41,7 +41,7 @@ to explore when the frontier stalls.
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable
 from urllib.parse import urlparse
 
@@ -66,6 +66,9 @@ class StateNode:
     actions: tuple[str, ...]  # element descriptors, e.g. 'button:Sign in'
     label: str | None = None  # human name. A model seam; None until asked.
     evidence: tuple[int, ...] = ()  # indices into WorldMap.evidence
+    # Path to one screenshot, relative to the artifacts dir. Taken the first
+    # time we stood in this state and never retaken -- see `attach_screenshot`.
+    screenshot: str | None = None
 
 
 @dataclass(frozen=True)
@@ -157,6 +160,7 @@ class WorldMap:
                 actions=existing.actions,
                 label=existing.label,
                 evidence=existing.evidence + (index,),
+                screenshot=existing.screenshot,
             )
 
         return key
@@ -175,6 +179,20 @@ class WorldMap:
         )
         self.transitions.setdefault((from_key, action), []).append(transition)
         return transition
+
+    def attach_screenshot(self, key: str, path: str | None) -> None:
+        """Give a state its thumbnail. First one wins; `None` is a no-op.
+
+        Both guards matter. The map is written from two places (`crawler.py`
+        and `ant.py`), so "first wins" is what keeps a re-entered state from
+        paying for a second picture. And the shooter returns `None` when the
+        screenshot failed, which must leave the node alone rather than erase a
+        picture an earlier visit already took.
+        """
+        node = self.states.get(key)
+        if node is None or path is None or node.screenshot is not None:
+            return
+        self.states[key] = replace(node, screenshot=path)
 
     # --- reading ---------------------------------------------------------
 
