@@ -210,6 +210,73 @@ def collapse_runs(lines: list[str]) -> list[str]:
     return collapsed
 
 
+_LISTITEM = re.compile(r"^\s*- listitem\b")
+
+
+def _depth(line: str) -> int:
+    return len(line) - len(line.lstrip())
+
+
+def collapse_siblings(lines: list[str]) -> list[str]:
+    """Replace a run of sibling `listitem` subtrees with one bucket line.
+
+    `collapse_runs` folds *byte-identical* neighbours, which works because
+    `canonical_value` rewrites "Project 17" into "Project #" first and leaves
+    the rows literally the same. A list whose labels are user data defeats
+    that: session names, hostnames, filenames canonicalise to nothing alike,
+    no run forms, and the count survives into the key.
+
+    That is only a nuisance until the crawler can *write* to the list. Then the
+    list is downstream of the agent's own actions, every submit re-keys every
+    page, and the walk maps its own footprints. Measured: crawling the console
+    at :3000 gave 78 states and 5 transitions, 31 of them the same URL,
+    separated only by how many sessions the crawl had created by the time it
+    arrived. It never reached Settings or the canvas.
+
+    So the labels have to go, and only inside the container. Scoped to
+    `listitem` because that is what a list actually emits -- the console and
+    thetestingmap both do, saucedemo has no list at all and is untouched --
+    and because a role we did not ask for keeps its name. A bare `generic`
+    sibling run stays as it is; collapsing those would hide real controls.
+
+    Keeping the first item's name would not have worked: the console prepends,
+    so the name in position one changes every time somebody adds a row.
+
+    Buckets are `{1, many}`, the same boundary `collapse_runs` keeps and for
+    the same reason -- an empty collection renders a different affordance from
+    a populated one, and one item is a real design a list of many is not. A
+    single item keeps its subtree, and recursion collapses any list nested
+    inside it.
+    """
+    out: list[str] = []
+    index = 0
+
+    while index < len(lines):
+        if not _LISTITEM.match(lines[index]):
+            out.append(lines[index])
+            index += 1
+            continue
+
+        # Walk the run of siblings: each `listitem` at this depth, plus
+        # everything indented under it, is one item.
+        depth = _depth(lines[index])
+        start, count, end = index, 0, index
+        while end < len(lines) and _LISTITEM.match(lines[end]) and _depth(lines[end]) == depth:
+            count += 1
+            end += 1
+            while end < len(lines) and _depth(lines[end]) > depth:
+                end += 1
+
+        if count == 1:
+            out.append(lines[start])
+            out.extend(collapse_siblings(lines[start + 1 : end]))
+        else:
+            out.append(f"{' ' * depth}- listitem  xmany")
+        index = end
+
+    return out
+
+
 def normalize(snapshot: str, *, keep_values: bool = False) -> str:
     """Reduce a snapshot to the part we treat as identity.
 
@@ -220,6 +287,7 @@ def normalize(snapshot: str, *, keep_values: bool = False) -> str:
         canonical_value  is rendered text identity?  the prose is, digits are not
         field_value      is typed input identity?    presence is, content is not
         collapse_runs    is *how many* identity?     no, past one-vs-several
+        collapse_siblings  ... when the rows are not alike?  still no
 
     Also gone: injected chrome that is not the application (`noise.py`), and the
     trailing `:` that marks a node as having children.
@@ -260,7 +328,7 @@ def normalize(snapshot: str, *, keep_values: bool = False) -> str:
         # case is identity.
         lines.append(line.rstrip().removesuffix(":").rstrip())
 
-    return "\n".join(collapse_runs(lines))
+    return "\n".join(collapse_runs(collapse_siblings(lines)))
 
 
 def state_key(snapshot: str, *, keep_values: bool = False) -> str:
