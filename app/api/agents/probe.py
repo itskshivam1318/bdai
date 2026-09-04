@@ -58,6 +58,34 @@ class Chatty:
         return Turn(text="Let me consider which action is best here...")
 
 
+class Ranker:
+    """Ranks two real candidates, invents a third, and omits the rest.
+
+    All three behaviours in one turn on purpose: the critic must keep what was
+    cited, discard what was fabricated, and still report what was left out.
+    """
+
+    name, model = "scripted:ranker", "none"
+
+    def turn(self, system, transcript, tool_defs):
+        return Turn(
+            text="",
+            calls=(
+                ToolCall(
+                    id="rank-1",
+                    name="prioritise",
+                    arguments={
+                        "ranked": [
+                            {"id": 1, "risk": "a customer could be charged twice"},
+                            {"id": 0, "risk": "bad input reaches the database"},
+                            {"id": 9999, "risk": "a gap nobody computed"},
+                        ]
+                    },
+                ),
+            ),
+        )
+
+
 class Explorer:
     """Takes the first untried action it is shown, then reports."""
 
@@ -422,6 +450,94 @@ def main() -> int:
                         ) == [],
                     )
 
+        # 3f. What is worth a test. `is_flow` is structural and lives in
+        #     worldmap.py, which never learns what an action *means*; the
+        #     vocabulary rule (a submission is always a flow) lives in the
+        #     generator, which does. Both halves are checked here because the
+        #     split is the point -- putting `submit[` in worldmap.py would be
+        #     the easy fix and would break the module's stated invariant.
+        print()
+        from .explorer.worldmap import Transition as _T
+        from .explorer.worldmap import WorldMap as _WM
+        from .explorer.worldmap import is_flow
+
+        flows = _WM()
+        flows.entry_key = "a"
+        # a --click--> a  (nothing happened)          not a flow
+        # a --type---> a  but a POST fired            a flow: accepted, no re-render
+        # a --nav----> b  b reachable only this way   a flow
+        # a --alt----> b  b already reachable         not a flow, b is recorded
+        edges = {
+            ("a", "button:Nothing"): _T("a", "button:Nothing", "a", False, 0),
+            ("a", "textbox:Email"): _T("a", "textbox:Email", "a", True, 0),
+            ("a", "link:Only way"): _T("a", "link:Only way", "b", False, 0),
+            ("a", "link:Also"): _T("a", "link:Also", "b", False, 0),
+        }
+        flows.transitions = {k: [v] for k, v in edges.items()}
+        ok &= check(
+            "an edge where nothing happened is not worth a test",
+            not is_flow(flows, edges[("a", "button:Nothing")]),
+        )
+        ok &= check(
+            "staying put with a request fired IS worth a test",
+            is_flow(flows, edges[("a", "textbox:Email")]),
+            "the app accepted input and did not re-render -- the bug this catches",
+        )
+        ok &= check(
+            "the only recorded way into a state is worth a test",
+            is_flow(flows, edges[("a", "link:Only way")]),
+        )
+        ok &= check(
+            "a second way into an already-recorded state is not",
+            not is_flow(flows, edges[("a", "link:Also")]),
+        )
+
+        # 3g. The vocabulary half of the same policy. A submission the app
+        #     correctly refuses is a self-loop that fires nothing -- structurally
+        #     indistinguishable from `textbox:Email stays` -- and the brief wants
+        #     unhappy paths, so the Generator overrides `is_flow` for it.
+        from .generator import worth_testing
+
+        refused = _T("a", "submit[empty]:button:Sign in", "a", False, 0)
+        idle = _T("a", "textbox:Email", "a", False, 0)
+        flows.transitions[("a", refused.action)] = [refused]
+        ok &= check(
+            "a submission the app refuses is still a flow",
+            worth_testing(flows, refused),
+            "an unhappy path was dropped for looking structurally inert",
+        )
+        ok &= check(
+            "a non-submission that does nothing is still dropped",
+            not worth_testing(flows, idle),
+        )
+
+        # 3h. Diversity. Ranking alone let one kind eat the whole suite:
+        #     saucedemo's login page is several states, each contributing a
+        #     submit edge, and forms outrank everything -- so 7 of 8 scenarios
+        #     were the login form and every product link was crowded out.
+        from .generator import interleave
+
+        crowded = {
+            "submit[valid]": ["v1", "v2", "v3", "v4", "v5", "v6", "v7"],
+            "link": ["l1", "l2"],
+            "button": ["b1"],
+        }
+        picked = interleave(crowded, 4)
+        ok &= check(
+            "one kind of action cannot crowd out the whole suite",
+            len(picked) == 4 and len({*picked} & {"l1", "l2", "b1"}) >= 2,
+            f"picked {picked}",
+        )
+        ok &= check(
+            "the best of the best-ranked kind is still picked first",
+            picked[0] == "v1",
+            f"picked {picked}",
+        )
+        ok &= check(
+            "a suite smaller than the limit keeps everything",
+            sorted(interleave({"a": ["x"], "b": ["y"]}, 8)) == ["x", "y"],
+        )
+
         # 4. The executable layer: a path through the map becomes a test, and
         #    the test's failure classifies itself. These six checks are the
         #    acceptance experiment for the whole product claim, so they drive
@@ -582,11 +698,142 @@ def main() -> int:
                 "the old toy behaviour, any button will do",
             )
 
+        # 5. The critic. Its whole defensibility is that the model cannot
+        #    invent a finding, so that is what these check -- not whether the
+        #    ranking is good, which is not a question a probe can answer.
+        print()
+        from .critic import candidates, prioritise, render
+
+        gaps = candidates(mapped)
+        cells = [gap.citation for gap in gaps]
+
+        ok &= check(
+            "the crawl's uncovered input partitions are found",
+            any(g.kind == "unexercised-partition" for g in gaps),
+            "no partition gap on a map whose submit[invalid] edges were never walked",
+        )
+        ok &= check(
+            "no cell is reported twice",
+            len(cells) == len(set(cells)),
+            f"{len(cells) - len(set(cells))} duplicate citations",
+        )
+        ok &= check(
+            "every gap cites a state that exists in the map",
+            all(gap.state_key in mapped.states for gap in gaps),
+        )
+        ok &= check(
+            "the report carries no percentage",
+            "%" not in render(gaps),
+            "a calibrated-looking number leaked into the report",
+        )
+
+        if len(gaps) >= 2:
+            ranked = prioritise(mapped, Ranker())
+            ok &= check(
+                "a fabricated gap is discarded, not reported",
+                len(ranked) == len(gaps)
+                and set(g.citation for g in ranked) == set(cells),
+                "the critic returned a finding that was never a candidate",
+            )
+            ok &= check(
+                "the model's ordering is honoured",
+                (ranked[0].citation, ranked[1].citation) == (cells[1], cells[0]),
+            )
+            ok &= check(
+                "an omitted gap is still reported, after the ranked ones",
+                all(not g.risk for g in ranked[2:]) and len(ranked) > 2,
+                "omission deleted evidence instead of demoting it",
+            )
+
+        # 6. The meta-agent. The brief's headline requirement is that nobody
+        #    chooses the stages, so what these check is the *deciding*, not the
+        #    stages -- each of which is already covered above.
+        print()
+        from .pipeline import Budget as PipeBudget
+        from .pipeline import addressable, report, verifiable
+        from .pipeline import run as pipeline
+
+        pipe = pipeline(
+            page, SUT,
+            budget=PipeBudget(explore_actions=12, explore_seconds=90, max_scenarios=4),
+            verify_against=(f"{SUT}?v=2", f"{SUT}?bug=1"),
+        )
+
+        ok &= check(
+            "a URL alone drives the whole pipeline",
+            pipe.stopped == "complete" and bool(pipe.plan) and bool(pipe.results),
+            f"stopped={pipe.stopped!r} scenarios={len(pipe.plan)} runs={len(pipe.results)}",
+        )
+        stages = [d.stage for d in pipe.decisions]
+        ok &= check(
+            "every stage of the brief is decided, in order",
+            stages[:1] == ["explore"]
+            and {"critique", "replan", "generate", "run", "stop"} <= set(stages),
+            f"stages seen: {stages}",
+        )
+        ok &= check(
+            "every decision carries the evidence it cites",
+            all(d.because and (d.evidence or d.stage == "stop") for d in pipe.decisions),
+            "a decision was recorded without a reason or its numbers",
+        )
+
+        # The decision the file exists for: a gap with no mechanism to close it
+        # must not trigger another exploration round.
+        invalid_gaps = tuple(g for g in pipe.gaps if "submit[invalid]" in g.action)
+        ok &= check(
+            "a gap with no mechanism to close it does not trigger a re-plan",
+            not addressable(invalid_gaps, has_synthesizer=False)
+            and len(addressable(invalid_gaps, has_synthesizer=True)) == len(invalid_gaps),
+            "submit[invalid] was treated as explorable without a synthesizer",
+        )
+        ok &= check(
+            "re-verification drops scenarios that navigate by link",
+            all(
+                not any(s.action.startswith("link:") for s in scenario.steps)
+                for scenario in verifiable(pipe.plan)
+            ),
+            "a link-following scenario would be re-run against a different base",
+        )
+
+        # `?v=2` and `?bug=1` are knobs on *our* SUT and nothing else. Appended
+        # to a third-party URL they are query parameters the app ignores, so the
+        # suite gets re-run against a byte-identical target and the report calls
+        # the result a verification. Measured against saucedemo before this
+        # check existed: 4 of 12 reported runs meant nothing.
+        from .pipeline import fixture_variants
+
+        ok &= check(
+            "the SUT's fixture knobs are not appended to a third-party URL",
+            fixture_variants("https://www.saucedemo.com") == ()
+            and fixture_variants(SUT) == (f"{SUT}?v=2", f"{SUT}?bug=1"),
+            "a real target would be re-verified against itself",
+        )
+
+        written = report(pipe)
+        ok &= check(
+            "the report answers every line the brief asks for",
+            all(
+                heading in written
+                for heading in (
+                    "HOW THE AGENT DECIDED", "SCENARIOS COVERED", "OUTCOMES",
+                    "HEALER ACTIONS", "COVERAGE GAPS REMAINING",
+                )
+            ),
+        )
+        ok &= check(
+            "the report carries no coverage percentage",
+            "%" not in written,
+        )
+
         browser.close()
 
-    # 5. The prompts are the tunable part; loading them must not silently break.
+    # 7. The prompts are the tunable part; loading them must not silently break.
     print()
-    for role, marker in (("ant", "explorer ant"), ("orchestrator", "orchestrator")):
+    for role, marker in (
+        ("ant", "explorer ant"),
+        ("orchestrator", "orchestrator"),
+        ("critic", "coverage critic"),
+    ):
         text = instructions(role)
         ok &= check(
             f"prompts/{role}.md loads without its frontmatter",

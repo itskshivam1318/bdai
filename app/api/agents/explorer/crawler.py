@@ -160,7 +160,10 @@ def crawl(
 
     deadline = time.monotonic() + budget.max_seconds
     actions_taken = 0
-    skipped: set[tuple[str, str]] = set()
+    # Lives on the map, not in this frame: a refused action is a fact about the
+    # application that every reader of the map needs, and the frame is gone by
+    # the time anyone asks.
+    skipped = world.skipped
 
     def visit(url: str) -> Observation:
         observer.start_window()
@@ -219,6 +222,11 @@ def crawl(
             and len(routes.get(edge[0], ("",) * 99)) < budget.max_depth
         ]
         if not pending:
+            # The distinction this whole change exists for. Both arrive here.
+            world.stopped = (
+                "every remaining action was refused" if skipped
+                else "frontier empty -- nothing left to try"
+            )
             break
 
         # Three ordering rules, most significant first.
@@ -252,7 +260,9 @@ def crawl(
             here = _replay(from_key)
             here_key = from_key if here is not None else None
             if here is None:
-                skipped.add((from_key, action))
+                skipped[(from_key, action)] = (
+                    "could not get back to this state to try it"
+                )
                 continue
 
         observer.start_window()
@@ -265,7 +275,16 @@ def crawl(
             #
             # A half-filled form is still a changed page, so we no longer know
             # where we are standing and must not assume.
-            skipped.add((from_key, action))
+            skipped[(from_key, action)] = (
+                # The two failures measured on real targets, named so the map
+                # says which one happened. A form action that cannot be filled
+                # is the expensive case: it is usually the login wall, and
+                # everything behind it stays unreachable.
+                "nothing here could be filled -- the fields have no accessible "
+                "name, or the button is in no <form>"
+                if action.startswith("submit[")
+                else "the control did not resolve, or did not respond"
+            )
             here, here_key = None, None
             continue
 
@@ -273,7 +292,7 @@ def crawl(
         actions_taken += 1
 
         if not _same_origin(entry_url, after.url):
-            skipped.add((from_key, action))
+            skipped[(from_key, action)] = f"left the origin, for {after.url}"
             here, here_key = None, None
             continue
 
@@ -288,7 +307,15 @@ def crawl(
             checkpoint(world)
 
         if len(world.states) >= budget.max_states:
+            world.stopped = f"budget: reached max_states={budget.max_states}"
             break
+    else:
+        # The `while` condition went false rather than a `break` firing.
+        world.stopped = (
+            f"budget: reached max_actions={budget.max_actions}"
+            if actions_taken >= budget.max_actions
+            else f"budget: reached max_seconds={budget.max_seconds:.0f}"
+        )
 
     if checkpoint is not None:
         checkpoint(world)

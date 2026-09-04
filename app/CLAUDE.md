@@ -13,8 +13,12 @@ app/
 ├── api/                backend — FastAPI + SQLModel + SQLite, driven by uv
 │   ├── app/                routers/, models.py, db.py, config.py, main.py
 │   ├── agents/explorer/    observe → identify → map → crawl → store. See below
+│   ├── agents/pipeline.py  **the meta-agent** — URL in, report out. Start here
+│   ├── agents/critic.py    computes coverage gaps; the model may only rank them
 │   ├── agents/generator.py map path → scenario → runnable .spec.ts
 │   ├── agents/runner.py    execute a scenario; heal, or report a defect, or escalate
+│   ├── agents/orchestrator.py  the *exploration* colony — ants, not the pipeline
+│   ├── agent_mcp/          MCP server — the pipeline, for an external coding agent
 │   └── smoke_run.py        walking skeleton, superseded by `make loop`. See below
 ├── web/                frontend — Next.js 16 + React 19 + Tailwind v4
 │   ├── app/                layout, page, globals.css
@@ -49,7 +53,23 @@ execution — most heavily:
 | Healer | replays failures, repairs broken locators, and distinguishes a broken script from a genuine defect |
 
 The meta-agent evaluates coverage between stages, decides when to re-plan or
-escalate, and synthesises a final test quality report.
+escalate, and synthesises a final test quality report. That is
+**`agents/pipeline.py`** — `make pipeline` runs the whole thing from a URL with
+no stage chosen by a human. Do not confuse it with `agents/orchestrator.py`,
+which orchestrates *ants within exploration* and says so in its own docstring.
+
+Its policy is code, not a prompt, and the reason is in `decisions.md`
+(2026-09-04 19:30): the evidence it routes on was computed by something else —
+`runner.py` classified each failure from two orthogonal observations, and
+`critic.py` ranked gaps it structurally could not invent. Routing on computed
+evidence is a policy, not an opinion. Every branch records a
+`Decision(stage, choice, because, evidence)`, which is what the rubric's 15%
+for *presenting the agent's decisions* is actually asking for.
+
+The one to read first is `addressable()`: it decides whether a remaining gap is
+one more exploration could close. Six unexercised `submit[invalid]` partitions
+with no synthesizer configured are **not** a reason to explore again, and saying
+so is the difference between orchestrating and looping.
 
 `api/agents/` is where the pipeline lives; `git log --oneline -- api/agents/`
 says how far it has got. Prior art on coverage evaluation — the hardest of the
@@ -105,17 +125,43 @@ claim on an edge so two workers do not take the same one, which is a column.
 
 ### Configuration
 
-All optional; all degrade loudly rather than silently.
+Read from `.env` by `agents/__init__.py` at import — the nearest one walking up
+from `api/agents/`, bounded to the repo, so `api/.env` wins over a root `.env`.
+An exported variable always beats the file. Copy `api/.env.example` to start.
+
+It is loaded in the package rather than in one entry point because there are
+four of them (the API background task, `explorer.crawler`, `probe.py`,
+`smoke_run.py`) and all four read these out of `os.environ`.
 
 ```bash
-AIVAR_USERNAME / AIVAR_PASSWORD   # forms.Credentials — without these, any
-                                  # login wall stops the crawl at one state
-ANTHROPIC_API_KEY                 # synth.py. Without it, invalid payloads come
-                                  # from a static mutation table that knows
-                                  # nothing about the app; the crawl prints
-                                  # "PAYLOADS n from fallback" so a degraded
-                                  # run never looks like a good one
+OPENROUTER_API_KEY                  # probed FIRST by llm.load(), on cost. One
+                                    # colony run is ~78 model calls: measured
+                                    # 2026-09-04 at $0.089 on qwen3-coder-next
+                                    # vs ~$3.42 on claude-opus-5 — 112 runs per
+                                    # $10 against 3. Optional companions:
+                                    # OPENROUTER_MODEL (any model string) and
+                                    # OPENROUTER_BASE_URL, which repoints the
+                                    # same OpenAICompat class at DeepSeek,
+                                    # Groq, Cerebras or a local Ollama
+ANTHROPIC_API_KEY / GEMINI_API_KEY  # llm.load() picks a provider by whichever
+                                    # is present. With neither, a console run
+                                    # degrades to `explorer.crawler` — a real
+                                    # map, breadth-first, but no flows, no
+                                    # summary, no intent, and status `degraded`
+                                    # rather than `passed`. Also feeds synth.py:
+                                    # without it invalid payloads come from a
+                                    # static mutation table that knows nothing
+                                    # about the app, and the crawl prints
+                                    # "PAYLOADS n from fallback" so a degraded
+                                    # run never looks like a good one
+AIVAR_USERNAME / AIVAR_PASSWORD     # optional. forms.Credentials — without
+                                    # these, any login wall stops the crawl at
+                                    # one state
 ```
+
+A run that ends in `error` puts its reason in `run.summary`, and the console's
+status label (`run 2 · error ⓘ`) discloses it on click. If a failure is ever
+invisible in the UI again, that path is what to fix — not the canvas.
 
 <!-- TODO(shivam): the handoff contract is now half-settled, and the half that
      is settled is the half that was contentious. Selectors vs intent went to
@@ -137,6 +183,59 @@ ANTHROPIC_API_KEY                 # synth.py. Without it, invalid payloads come
      otherwise unreachable, and path length from the entry. A function
      `is_flow(map, transition) -> bool` in `worldmap.py` settles it for every
      packet after it. -->
+
+## The MCP server
+
+`api/agent_mcp/` exposes the pipeline to Claude Code and any other MCP client.
+Same claim as the console, different consumer: the brief complains that a human
+supplies application context over and over, and the other party with that
+problem is **the coding agent that just changed the app** -- it holds the diff
+and knows nothing about behaviour.
+
+```bash
+make mcp         # stdio server. Needs `make dev` running.
+make mcp-probe   # observable checks. Also needs `make dev`.
+```
+
+Registered for this repo in `.mcp.json`, so Claude Code picks it up on open.
+
+| Tool | Answers | Needs a key |
+|---|---|---|
+| `sessions` | what has been mapped already | no |
+| `crawl` | map an app deterministically | **no** |
+| `explore` | map an app with the agent colony | yes |
+| `map` | states, transitions, flows, gaps | no |
+| `impact` | which flows touch these user-visible strings | no |
+| `verify` | replay flows; passed / healed / defect / escalate | no |
+
+**The join is an accessible name, not a file path.** `impact` takes the strings a
+diff changed (`- Place Order` / `+ Complete Purchase`) because that is what a
+diff contains and what `statekey.normalize()` keys on. Mapping source ranges back
+to files would be a subsystem, and the client can already read its own diff.
+
+**Every mutation goes over HTTP** (`agent_mcp/client.py`), never straight to
+SQLite. `list_sessions` computes `run_count` by query and `Canvas.tsx` polls
+`sessions/{id}/events` for a `surface` -- both are behaviours of the API, so a
+row written around it exists but stays invisible. Driving the API is what makes
+an MCP-started run indistinguishable from a browser-started one.
+`agent_mcp/probe.py` has a check named `visible` whose only job is to stop that
+regressing.
+
+**`crawl` exists so the server works with no API key at all.** An agent
+connecting over MCP is on someone else's machine; a server whose every tool needs
+a key the user has not set looks broken. `routers/explore.py` already names the
+deterministic crawler as the other route to a map.
+
+**It owns no file another track owns.** Reads that want `GET /api/runs/{id}/map`
+go through `store.load` instead, because the console track owns that router and
+it has not merged. Swap it when that lands -- `agent_mcp/read.py:world_of` is the
+only place that knows.
+
+**Crawling our own SUT maps three apps, not one.** `web/app/sut/page.tsx` links
+to `?v=1|2|3`, so an unrestricted `crawl` walks into every drift variant and the
+map mixes them. Flows recorded in one variant then classify correctly; a flow
+recorded across two does not. `make loop` avoids this by using a single scenario.
+Point `crawl` at a real target, or expect the mixture.
 
 ## Hardcoded on purpose
 
@@ -179,6 +278,24 @@ Nothing else changes — not the canvas, not the backend.
 
 ## Gotchas worth not rediscovering
 
+**A button knows which fields it submits, `<form>` or not.** `forms.form_of`
+prefers a real `<form>` ancestor -- an author's declaration beats anything
+inferred -- and falls back to `_implicit_scope`: climb from the button, stop at
+the first ancestor holding a fillable field, and give up the moment another
+button or a page landmark comes into view. A region with two buttons in it has
+not said which one owns the fields; a region that is `<main>` is not a form.
+
+Measured both directions, and the probe's `FORM SCOPE` section holds both:
+`practicetestautomation.com/practice-test-login/` has zero `<form>` elements and
+now logs in (`submit[valid]:button:Submit -> /logged-in-successfully/`), where
+before it clicked Submit empty until the budget ran out;
+`practicesoftwaretesting.com/auth/login` -- the page that motivated the `<form>`
+requirement -- gains no new actions, and `Sign in with Google`, `Open chat` and
+the language switcher stay plain `button:` actions.
+
+If you loosen either stop rule, run `make probe` and watch that section: the two
+failures are opposite, and it is easy to fix one by causing the other.
+
 **Widget config lives in local state**, not on the xyflow node's `data`.
 Mutating `data` is a lint error and causes stale renders; `WidgetNode` holds
 state and persists it 400ms after you stop typing.
@@ -210,10 +327,13 @@ Clear it with `make reset`.
 From here or from the repo root; `make` with no arguments lists every target.
 
 ```bash
-make setup   # first run only: npm install, uv sync, playwright install
-make dev     # both servers — web :3000, api :8000
-make smoke   # the walking skeleton
-make check   # typecheck + lint — run before handing work off
-make reset   # wipe the database and artifacts
-make stop    # kill the servers
+make setup     # first run only: npm install, uv sync, playwright install
+make dev       # both servers — web :3000, api :8000
+make pipeline  # the whole claim: URL in, test quality report out
+make probe     # 41 observable checks. No API key, no quota
+make gaps      # crawl an app and rank what the crawl did not cover
+make specs     # write generated .spec.ts, then run them with Playwright
+make check     # typecheck + lint — run before handing work off
+make reset     # wipe the database and artifacts
+make stop      # kill the servers
 ```

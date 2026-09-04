@@ -95,6 +95,66 @@ class Transition:
         return self.from_key == self.to_key
 
 
+def is_flow(world: "WorldMap", transition: Transition) -> bool:
+    """Is this edge worth a test? Structural signals only.
+
+    QA Wolf's rule is that a flow must describe what a user *accomplishes*; it
+    explicitly rejects test cases like "Display Search Dropdown". Before this
+    existed the Generator compiled every recorded edge, so a crawl of saucedemo
+    produced "activate the link" and "click Open Menu" beside the login flow,
+    and six sibling product links each became their own test.
+
+    Three signals, all already on the objects, and no knowledge of what an
+    action string means -- this module keeps actions opaque (see the class
+    docstring) and `submit[` appearing here would break that:
+
+        mutating        a non-GET fired. The user changed something, which is
+                        the definition of accomplishing anything. Kept even as
+                        a self-loop: "the app accepted it and did not
+                        re-render" is the most valuable edge in the graph.
+
+        self-loop with
+        nothing fired   asked, and nothing happened. `textbox:Email stays`.
+                        A test here asserts nothing.
+
+        discovered its
+        destination     the edge that first reached `to_key`. If a state is
+                        already recorded, a second route into it re-tests a
+                        screen the suite already covers.
+
+    **This is not the same question as `frontier()`.** An edge can be highly
+    informative to the *map* and worthless as a *test* -- the `Transition`
+    docstring defends self-loops, and it is right to, because the crawler needs
+    them to model the app. Modelling and testing are different jobs and this is
+    where they part.
+
+    The vocabulary rule that belongs with the Generator -- a form submission is
+    an accomplishment whatever its structure, so an unhappy path that is
+    correctly refused stays in the plan -- is in `generator.worth_testing`,
+    which may know what an action means. Together they are the whole policy.
+    """
+    if transition.mutating:
+        return True
+    if transition.self_loop:
+        return False
+    return _discovered(world, transition)
+
+
+def _discovered(world: "WorldMap", transition: Transition) -> bool:
+    """Was this the first recorded edge to reach its destination?
+
+    Insertion order is the crawl order, so the first edge into a state is the
+    one that found it -- the same tie-break `paths()` makes by exploring in
+    that order. Deterministic for a given map, which is what the check needs.
+    """
+    for (from_key, action), taken in world.transitions.items():
+        for recorded in taken:
+            if recorded.to_key != transition.to_key:
+                continue
+            return (from_key, action) == (transition.from_key, transition.action)
+    return False
+
+
 @dataclass
 class WorldMap:
     """States, the edges between them, and the observations backing both.
@@ -111,6 +171,24 @@ class WorldMap:
     )
     evidence: list[Observation] = field(default_factory=list)
     entry_key: str | None = None
+
+    # Actions a state offers that could not be taken, and why. Measured
+    # 2026-09-04: two of three public targets produced a shallow map not
+    # because they were shallow but because their login form was refused here
+    # -- `testingchallenges` has four textboxes with no accessible name,
+    # `practicetestautomation` has no `<form>` element at all. Both dropped the
+    # single highest-value edge, and neither said so. An unexplored action and a
+    # refused one look identical in `frontier()`, so without this the crawl
+    # cannot report the difference between "nothing left to try" and "we gave
+    # up on the front door".
+    #
+    # A fact about the application, not a crawler fault -- which is why it
+    # belongs on the map beside `gaps()` rather than in a log.
+    skipped: dict[tuple[str, str], str] = field(default_factory=dict)
+
+    # Why the crawl ended. `frontier empty` and `everything left refused` are
+    # opposite outcomes that both arrive at the same `break`.
+    stopped: str = ""
 
     # What actions a state offers. Injected rather than imported so this module
     # never learns what an action *means* -- to everything here an action is an
@@ -287,6 +365,16 @@ class WorldMap:
             f"{sum(len(v) for v in gaps.values())} untried cells",
         ]
 
+        if self.stopped:
+            lines.append(f"stopped: {self.stopped}")
+        if self.skipped:
+            lines.append(
+                f"{len(self.skipped)} action(s) offered but refused -- these are "
+                f"NOT unexplored, they were tried and could not be done:"
+            )
+            for (key, action), why in self.skipped.items():
+                lines.append(f"    {key[:8]} --{action}--  {why}")
+
         loose = self.nondeterministic()
         if loose:
             lines.append(
@@ -302,7 +390,10 @@ class WorldMap:
             for action in node.actions:
                 taken = self.transitions.get((key, action))
                 if not taken:
-                    lines.append(f"      .  {action}  (unexplored)")
+                    why = self.skipped.get((key, action))
+                    # `x` not `.`: refused is a result, unexplored is a to-do.
+                    mark, note = ("x", why) if why else (".", "unexplored")
+                    lines.append(f"      {mark}  {action}  ({note})")
                     continue
                 for transition in taken:
                     mark = "*" if transition.mutating else "-"

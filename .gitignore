@@ -19,6 +19,7 @@ app/api/artifacts/*
 .playwright-mcp/
 
 # env / ports
+.env
 .env.local
 .worktree-env
 

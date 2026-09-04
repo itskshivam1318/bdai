@@ -122,7 +122,8 @@ def value_for(role: str, name: str, credentials: Credentials) -> str:
 
 
 def form_of(page: Page, descriptor: str):
-    """The `<form>` a button lives in, or None if it lives in no form with inputs.
+    """The fields a button submits: its `<form>`, or the region standing in for
+    one on a page that never wrote the tag. None if the button owns no fields.
 
     **A page having fields does not make every button on it a submit.** An
     earlier version assumed it did, and on a real login page
@@ -137,14 +138,108 @@ def form_of(page: Page, descriptor: str):
     from a styling wrapper. So this is the one place we ask the DOM directly.
     It is a narrow question -- ancestry, not content -- and the alternative was
     a heuristic over sibling nesting that would be wrong silently.
+
+    **A real `<form>` still wins.** It is a declaration by the page's author of
+    which fields belong to which submit, and nothing inferred beats being told.
+    `_implicit_scope` runs only when there is no such declaration -- see its
+    docstring for why that fallback does not undo the paragraph above.
     """
-    form = locate(page, descriptor).locator("xpath=ancestor::form[1]")
+    element = locate(page, descriptor)
+    form = element.locator("xpath=ancestor::form[1]")
     try:
-        if form.count() == 0:
-            return None
-        return form if form.locator("input, textarea, select").count() else None
+        if form.count() and form.locator("input, textarea, select").count():
+            return form
     except Exception:
         return None
+    return _implicit_scope(element)
+
+
+# How far to climb looking for a form that was never marked up as one. Six is
+# past every real case measured (practicetestautomation's login is one hop) and
+# short enough that a button in a page-level container runs out of rope before
+# it reaches unrelated fields.
+_MAX_HOPS = 6
+
+_FILLABLE = (
+    "input:not([type=hidden]):not([type=submit]):not([type=button]),"
+    "textarea,select"
+)
+_CLICKABLE = "button,input[type=submit],input[type=button]"
+
+# A form region is not a page region. If the smallest area holding the button
+# and some fields is itself a landmark, or straddles one, then the two are in
+# different parts of the page and the "region" is really just the page.
+#
+# This is the rule that stops a lone Print button adopting the search box in
+# the sidebar -- caught by `form_scope` in explorer/probe.py, which is exactly
+# the `submit[valid]:button:Print` shape the <form> test was protecting against.
+_LANDMARK = "main,nav,aside,header,footer,body,html,section[role],form"
+
+# Climb from the button; stop at the first ancestor holding a fillable field,
+# and give up the moment another button comes into view.
+#
+# The second half is the whole safety argument. A `<form>` is a *declaration* of
+# which fields belong to which submit, and without one the honest proxy is "the
+# smallest region containing this button and some fields and no other button" --
+# because a region with two buttons in it has not told us which one owns the
+# fields.
+_SCOPE_JS = """(el) => {
+  const fillable = %s;
+  const clickable = %s;
+  const landmark = %s;
+  let node = el, hop = 0;
+  while (node.parentElement && hop < %d) {
+    node = node.parentElement; hop++;
+    if (node.matches(landmark)) return 0;
+    if ([...node.querySelectorAll(clickable)].some(x => x !== el)) return 0;
+    if (node.querySelector(landmark)) return 0;
+    if (node.querySelectorAll(fillable).length) return hop;
+  }
+  return 0;
+}""" % (repr(_FILLABLE), repr(_CLICKABLE), repr(_LANDMARK), _MAX_HOPS)
+
+
+def _implicit_scope(element):
+    """The fields a button owns on a page that never wrote a `<form>` tag.
+
+    **Measured, not guessed.** `practicetestautomation.com/practice-test-login/`
+    has `document.querySelectorAll('form').length === 0`: its login is two bare
+    inputs and a button in a `<div id="form">`. The observer saw
+    `textbox:Username` and `textbox:Password`, `form_of` returned None, no
+    `submit[...]` action was ever synthesised, and the crawler clicked Submit
+    with nothing filled in until its budget ran out. A crawl that cannot type
+    cannot get past a login wall, and everything behind the wall stayed
+    unmapped.
+
+    **Why this does not resurrect the bug the `<form>` test was added for.**
+    Simulated against `practicesoftwaretesting.com/auth/login`, the page that
+    motivated that test -- all ten of its clickables, under this rule:
+
+        Sign in with Google     rejected at hop2 (2 other buttons)
+        Open chat               rejected at hop3 (9 other buttons)
+        EN (language)           rejected at hop2 (1 other button)
+        Toggle navigation       rejected at hop1 (2 other buttons)
+        Testing Guide           rejected at hop1 (1 other button)
+        Bug Hunting             rejected at hop1 (1 other button)
+        Categories              rejected at hop3 (1 other button)
+        Login, and one unnamed  already inside a <form> -- fast path, unchanged
+
+    Zero new actions on that page. The dangerous buttons are dangerous
+    *because* they sit among other buttons in shared page chrome, which is
+    exactly what the stop rule keys on.
+
+    Returns None rather than a page-wide scope when it finds nothing, so the
+    caller's existing "no form here" behaviour is unchanged.
+    """
+    try:
+        hop = element.evaluate(_SCOPE_JS)
+    except Exception:
+        return None
+    if not hop:
+        return None
+    # The ancestor axis is reverse-ordered, so [1] is the parent and [hop] is
+    # the element the rule stopped on.
+    return element.locator(f"xpath=ancestor::*[{hop}]")
 
 
 def leaves_origin(here: str, href: str | None) -> bool:

@@ -11,7 +11,7 @@
 export WEB_PORT API_PORT
 
 .DEFAULT_GOAL := help
-.PHONY: help setup dev api web smoke probe loop generate specs explore crawl trace diff runs worktree list rm check reset stop
+.PHONY: help setup dev api web smoke probe pipeline loop generate specs gaps explore crawl trace diff runs mcp mcp-probe worktree list rm check reset stop
 
 PY_VERSION := 3.12
 
@@ -42,8 +42,14 @@ probe: ## Observable checks for the explorer and the agents. No API key needed.
 	cd api && uv run python -m agents.probe
 	cd api && uv run python -m app.probe
 
+pipeline: ## URL in, test quality report out. No stage chosen by a human. URL=...
+	cd api && uv run python -m agents.pipeline "$${URL:-http://localhost:$${WEB_PORT:-3000}/sut}"
+
 loop: ## The whole claim, in one command: crawl, generate, run, drift, defect. URL=...
 	cd api && uv run python -m agents.runner "$${URL:-http://localhost:$${WEB_PORT:-3000}/sut}"
+
+gaps: ## Crawl an app and rank what the crawl did not cover. URL=...
+	cd api && uv run python -m agents.critic "$${URL:-http://localhost:$${WEB_PORT:-3000}/sut}"
 
 generate: ## Crawl an app and print the test plan it compiles to. URL=...
 	cd api && uv run python -m agents.generator "$${URL:-http://localhost:$${WEB_PORT:-3000}/sut}"
@@ -57,6 +63,12 @@ explore: ## Map an app with the agent colony. URL=... [INTENT=...]
 
 crawl: ## Map an app deterministically -- no model, no API key. URL=...
 	cd api && uv run python -m agents.explorer.crawler "$${URL:-http://localhost:$${WEB_PORT:-3000}/sut}"
+
+mcp: ## MCP server, for Claude Code and other agents. Needs `make dev` running.
+	cd api && uv run python -m agent_mcp.server
+
+mcp-probe: ## Observable checks for the MCP layer. Needs `make dev` running.
+	cd api && uv run python -m agent_mcp.probe
 
 trace: ## Local LLM observability UI (Phoenix) on :6006. Leave running.
 	cd api && uv run python -m agents.tracing
