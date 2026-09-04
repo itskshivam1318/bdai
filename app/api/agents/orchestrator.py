@@ -216,6 +216,23 @@ def run(
     )
     ants_left = budget.max_ants
 
+    # States an ant was sent to and could not reach. A state is a place the
+    # colony *stood*, not a place it can necessarily stand again: `navigate`
+    # replays the shortest path from the entry and verifies the landing, and on
+    # an app that carries data the replay stops reproducing the state the
+    # moment the data moves underneath it. saucedemo's inventory page is the
+    # measured case -- `Add to cart` re-keys it, so every state recorded behind
+    # one is gone as soon as the cart is not empty.
+    #
+    # `navigate` returning None is correct and the ant reporting `stuck` is
+    # correct. What was wrong is that nothing carried the fact back up: the
+    # orchestrator sees the map, the map still lists the state, and it kept
+    # spending ants on it. Measured 2026-09-05 against saucedemo: 4 of 12 ants
+    # ended `stuck`, all of them in the last two waves, all on inventory states
+    # a `Add to cart` had already destroyed -- a third of the colony's budget
+    # spent arriving nowhere.
+    perished: set[str] = set()
+
     for wave in range(budget.max_waves):
         if time.monotonic() > deadline or ants_left <= 0:
             break
@@ -255,6 +272,18 @@ def run(
                     f"{wanted!r} is not a state in the map"
                     if not matches
                     else f"{wanted!r} is ambiguous"
+                )
+                continue
+
+            if matches[0] in perished:
+                # Refused before the ant is built, not after it dies. The ant
+                # would cost a model call and a page load to rediscover what
+                # the last one already established.
+                rejected.append(
+                    f"{wanted!r} can no longer be reached -- an earlier ant "
+                    "tried and could not get back to it. Something the colony "
+                    "did has changed the application underneath that state. "
+                    "Send this ant somewhere reachable instead"
                 )
                 continue
 
@@ -302,6 +331,18 @@ def run(
                 # tag would quietly credit it to the last one that ran.
                 world.attribution = None
 
+            if report.ended == "stuck":
+                # The one ending that says something about the *map* rather
+                # than about the ant. Recorded so the next wave cannot repeat
+                # it; not removed from the map, because the state was really
+                # observed and its transitions are still evidence.
+                perished.add(matches[0])
+                emit(
+                    "warn",
+                    f"  {matches[0][:8]} is no longer reachable -- not "
+                    f"assigning further ants to it",
+                )
+
             ants_left -= 1
             wave_reports.append(report)
             emit(
@@ -330,6 +371,20 @@ def run(
             waves_left=budget.max_waves - wave - 1,
             ants_left=ants_left,
         )
+        if perished:
+            # Stated every wave, not once. The orchestrator's context is the
+            # transcript, and a fact mentioned in wave 2 competes with
+            # everything since; a standing list is what stops wave 5 proposing
+            # what wave 4 already learned was impossible.
+            feedback = (
+                "these states are recorded but NO LONGER REACHABLE -- the "
+                "colony changed the application and cannot get back to them. "
+                "Do not assign ants here: "
+                + ", ".join(sorted(k[:8] for k in perished))
+                + "\n\n"
+                + feedback
+            )
+
         if rejected:
             feedback = (
                 "some assignments were refused: "
