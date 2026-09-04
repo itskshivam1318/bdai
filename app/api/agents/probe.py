@@ -356,12 +356,25 @@ def main() -> int:
 
         with tempfile.TemporaryDirectory() as tmp:
             shot_page = browser.new_page()
+
+            # Counting the *invocations*, not the files: `shooter` names each
+            # file after the state key, so a second shot at a state it already
+            # captured silently overwrites the first and leaves the file count
+            # unchanged. Only the call log can tell "captured once" from
+            # "captured twice", and "captured once" is the whole property.
+            taken: list[str] = []
+            capture_once = shooter(shot_page, run_id=1, root=_Path(tmp))
+
+            def counting_shot(key: str) -> str | None:
+                taken.append(key)
+                return capture_once(key)
+
             shot_world = crawl(
                 shot_page,
                 SUT,
                 CrawlBudget(max_actions=12, max_seconds=90),
                 credentials=CREDENTIALS,
-                shot=shooter(shot_page, run_id=1, root=_Path(tmp)),
+                shot=counting_shot,
             )
             shot_page.close()
             files = list((_Path(tmp) / "run-1").glob("*.png"))
@@ -380,6 +393,11 @@ def main() -> int:
                     n.screenshot.startswith("run-1/") and n.screenshot.endswith(".png")
                     for n in shot_world.states.values()
                 ),
+            )
+            ok &= check(
+                "no state is captured twice",
+                len(taken) == len(set(taken)) == len(shot_world.states),
+                f"{len(taken)} shots for {len(set(taken))} distinct states",
             )
 
         plan = scenarios(mapped)
