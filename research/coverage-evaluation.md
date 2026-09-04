@@ -337,3 +337,134 @@ targeted mutation viability (one deployment, Kotlin/Android not web).
 art); whether "cannot self-correct" transfers from single-answer reasoning to
 open-ended gap enumeration (untested — plausible both ways); **"untested flow
 risk" as a reportable quantity — no source defines or validates such a metric.**
+
+---
+
+## Additions and corrections from the full report
+
+### ⚠️ Three items reported as found that do NOT exist — never cite these
+
+The researching agent initially claimed these and then retracted them on review:
+
+- **"MAEWU 16-operator catalog" with per-operator mutation scores** — **no
+  evidence this exists.** The real, DBLP-verified web mutation line is
+  Praphamontripong & Offutt (ICSTW 2010, ICST 2012, ICSTW 2016 "An Experimental
+  Evaluation of Web Mutation Operators", ICSTW 2017 "Finding Redundancy in Web
+  Mutation Operators") — all IEEE-paywalled and **not retrieved**. If we want an
+  operator catalogue, that is where to look, but we do not have one.
+- **SpecBench** — no such benchmark found. Unverified.
+- **T-BERT** — real prior art (Lin et al., ICSE 2021, arXiv:2102.04411) but
+  **not fetched**, so we have **no numbers**. A known lead, not a finding.
+
+Note also: **arXiv has essentially no coverage of mutation testing for web/E2E.**
+That literature lives in ICST/ICSTW/TSE behind paywalls — itself a finding about
+how much accessible evidence exists.
+
+### Self-preference bias — a direct risk for our architecture
+
+**arXiv:2410.21819** — *"GPT-4 exhibits a significant degree of self-preference
+bias"*, hypothesised to track lower perplexity (familiarity).
+
+**If the same model family writes the plan and judges it, expect inflated
+scores.** Straightforward mitigation: have a different model judge than the one
+that planned.
+
+### Evidence-grounding measurably improves critic calibration
+
+**Agent-Testing Agent (arXiv:2508.17393)** is architecturally close to this
+brief: a meta-agent combining static analysis, designer interrogation,
+literature mining and persona-driven adversarial test generation, with
+difficulty adapted via judge feedback. Surfaced *"more diverse and severe
+failures than expert annotators while matching severity"*, in 20–30 minutes vs
+days.
+
+**The ablation is the useful part:** *"Ablating code analysis and web search
+increases variance and miscalibration, underscoring the value of
+evidence-grounded test generation."*
+
+### Bach's nine general test techniques — the best top-level rubric decomposition
+
+Each is a distinct *gap lens*, and this is arguably the cleanest decomposition
+found anywhere:
+
+1. **Function Testing** — "test what it can do… and not what it isn't supposed
+   to do"
+2. **Domain Testing** — "partition the data"; look at **outputs as well as
+   inputs**; *"use inputs that force the whole range of possible outputs"*
+3. **Stress Testing** — "overwhelm the product"
+4. **Flow Testing** — *"do one thing after another… **don't reset the system
+   between actions**. Vary timing and sequencing, try parallel threads."*
+   ← **the direct heuristic for user-flow gaps, and the one E2E plans most often
+   miss**
+5. **Scenario Testing** — *"a compelling story of how someone who matters might
+   do something that matters"*
+6. **Claims Testing** — ← **this is the PRD-gap bonus, decomposed into steps**
+7. **User Testing** · 8. **Risk Testing** ("imagine a problem, then look for
+   it") · 9. **Tool-Supported Testing**
+
+Framing sentence worth giving to any plan critic verbatim: *"For each item
+below, determine if it is important to your project, then think how you would
+recognize if the product worked well or poorly in that regard."*
+
+### Feedback granularity barely matters once the signal is sound
+
+From the Blocksworld study — note how little detail buys once you have a
+**sound** verifier:
+
+| Feedback type | Accuracy |
+|---|---|
+| No feedback | 40% |
+| **Binary only** | **74%** |
+| Binary + first error | 86% |
+| Binary + all errors | 86% |
+
+**The existence of a sound signal does nearly all the work.** Elaborate critique
+prose adds little. Combined with the 2026 finding that *"error location hints
+hurt all models"*, this argues for a terse, hard signal over a chatty critic.
+
+### Reflexion — the clearest "external signal works" datapoint
+
+Unit tests / environment feedback stored as verbal reflections in episodic
+memory: **91% pass@1 on HumanEval vs GPT-4's 80%** (arXiv:2303.11366).
+
+### CriticGPT — trained critics beat prompted ones, but still hallucinate
+
+**arXiv:2407.00215** (OpenAI): RLHF-**trained** critic model — critiques
+preferred over human critiques **63%** of the time; found *"hundreds of errors
+in ChatGPT training data rated as 'flawless'"*; caught more bugs than paid human
+code reviewers.
+
+**But**: critics *"sometimes produced hallucinated bugs that could mislead
+humans"*, and **"human-machine teams catch similar numbers of bugs to LLM
+critics while hallucinating less than LLMs alone."**
+
+Consistent with the 84.4% false-positive rate: **LLM critics have a systematic
+false-positive problem; pairing with a hard signal or a human is what suppresses
+it.**
+
+### The single strongest conclusion
+
+**The checklist IS the external signal.**
+
+The value of a gap-evaluation step comes from confronting the plan with a
+**fixed, externally-authored checklist** — ISTQB coverage items, Bach's SFDIPOT
+× quality criteria, Hendrickson's heuristics — **not** from asking a model to
+introspect.
+
+Supported independently by three lines of evidence: Kamoi's condition (2)
+(external feedback is what works), the Agent-Testing Agent ablation (grounding
+improves calibration), and Self-Refine's attribution (**61% of failures are bad
+feedback, 6% bad revision**).
+
+This turns must-have #3 from an unsolved research problem into a tractable
+engineering one: the rubric is authored by ISTQB and Bach, not invented by us or
+by the model at runtime.
+
+### Two reporting rules that follow from all of this
+
+1. **Report a prioritised list of gaps, never a calibrated percentage.**
+   Rank-order agreement holds (ρ > 0.6) where absolute accuracy does not, and κ
+   deflation makes any "coverage = 72%" claim indefensible.
+2. **Label any flow-coverage figure as an estimate against a self-generated
+   denominator.** E2EBench needed hand-enumeration plus instrumentation to reach
+   79%; Crawljax gets 12%.
