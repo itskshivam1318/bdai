@@ -7,8 +7,22 @@
 # this, `make probe` inside a worktree drives whichever checkout happens to own
 # port 3000, which is somebody else's code. `-include` keeps a plain clone,
 # which has no such file, working unchanged.
+#
+# Exported one at a time, and only when set: `export FOO` on an *undefined*
+# make variable still puts FOO="" in the child environment, and an empty string
+# is not the same as absent to everything downstream. Every shell use here
+# spells the fallback `$${WEB_PORT:-3000}` and survives it, but Python does not
+# -- pydantic-settings reads the empty value as one to parse and `make probe`
+# died on `api_port: Input should be a valid integer`, with config.py's own
+# default never consulted. `ifdef` is false for undefined *and* for empty, so
+# leaving the variable unexported is what lets each consumer's default apply.
 -include .worktree-env
-export WEB_PORT API_PORT
+ifdef WEB_PORT
+export WEB_PORT
+endif
+ifdef API_PORT
+export API_PORT
+endif
 
 .DEFAULT_GOAL := help
 .PHONY: help setup dev api web smoke probe pipeline loop generate specs gaps explore crawl trace diff runs mcp mcp-probe worktree list rm check reset stop
