@@ -374,6 +374,33 @@ def main() -> int:
             not worth_testing(flows, idle),
         )
 
+        # 3f. Diversity. Ranking alone let one kind eat the whole suite:
+        #     saucedemo's login page is several states, each contributing a
+        #     submit edge, and forms outrank everything -- so 7 of 8 scenarios
+        #     were the login form and every product link was crowded out.
+        from .generator import interleave
+
+        crowded = {
+            "submit[valid]": ["v1", "v2", "v3", "v4", "v5", "v6", "v7"],
+            "link": ["l1", "l2"],
+            "button": ["b1"],
+        }
+        picked = interleave(crowded, 4)
+        ok &= check(
+            "one kind of action cannot crowd out the whole suite",
+            len(picked) == 4 and len({*picked} & {"l1", "l2", "b1"}) >= 2,
+            f"picked {picked}",
+        )
+        ok &= check(
+            "the best of the best-ranked kind is still picked first",
+            picked[0] == "v1",
+            f"picked {picked}",
+        )
+        ok &= check(
+            "a suite smaller than the limit keeps everything",
+            sorted(interleave({"a": ["x"], "b": ["y"]}, 8)) == ["x", "y"],
+        )
+
         # 4. The executable layer: a path through the map becomes a test, and
         #    the test's failure classifies itself. These six checks are the
         #    acceptance experiment for the whole product claim, so they drive

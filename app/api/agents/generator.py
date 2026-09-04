@@ -269,6 +269,36 @@ def _equivalence(from_key: str, action: str, expect: Expectation) -> tuple:
     )
 
 
+def interleave(groups: dict[str, list], limit: int) -> list:
+    """Fill the suite by rotating through kinds of action, best of each first.
+
+    Ranking alone is not enough. `_terminal_rank` puts every form action ahead
+    of every non-form one, which is the right *preference* and the wrong
+    *allocation*: saucedemo's login page is several states (pristine, showing a
+    validation error, filled), each contributing its own submit edge with its
+    own effect shape and so its own equivalence class. Seven classes, eight
+    slots, and every product link crowded out -- a suite that tests one form
+    seven ways and the rest of the application not at all.
+
+    Rotating keeps the preference where it belongs. The best-ranked kind still
+    supplies the first scenario, and the second-best kind gets a slot before the
+    best kind takes a second one. A suite smaller than the limit is unaffected.
+
+    `groups` must already be ordered best-first, both between kinds and within
+    them; `scenarios()` sorts by rank before grouping.
+    """
+    picked: list = []
+    queues = {kind: list(items) for kind, items in groups.items()}
+    while len(picked) < limit and any(queues.values()):
+        for kind in list(queues):
+            if not queues[kind]:
+                continue
+            picked.append(queues[kind].pop(0))
+            if len(picked) == limit:
+                break
+    return picked
+
+
 def scenarios(world: WorldMap, limit: int = 8) -> tuple[Scenario, ...]:
     """Every recorded edge, as a runnable scenario. Best first, capped.
 
@@ -329,8 +359,14 @@ def scenarios(world: WorldMap, limit: int = 8) -> tuple[Scenario, ...]:
                     ),
                 )
 
-    ordered = sorted(best.values(), key=lambda pair: pair[0])
-    return tuple(scenario for _, scenario in ordered[:limit])
+    # Rank first, then allocate. Sorting decides which scenario represents a
+    # kind; `interleave` decides how many slots a kind may have. Doing only the
+    # first is what let one form fill an entire suite -- see `interleave`.
+    ordered = sorted(best.items(), key=lambda item: item[1][0])
+    groups: dict[str, list[Scenario]] = {}
+    for klass, (_, scenario) in ordered:
+        groups.setdefault(klass[0], []).append(scenario)
+    return tuple(interleave(groups, limit))
 
 
 # --- artifacts -----------------------------------------------------------
