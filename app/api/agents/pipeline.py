@@ -558,15 +558,33 @@ def main(entry_url: str, verify_against: tuple[str, ...] = ()) -> int:
     provider = None
     synthesizer = None
     try:
+        from pathlib import Path
+
         from .explorer.synth import Synthesizer
         from .llm import load
 
         provider = load()
-        synthesizer = Synthesizer(provider)
+        # `Synthesizer` takes a cache path, not a provider -- it builds its own
+        # client from the model name. Passing `provider` here raised
+        # AttributeError on `cache_path.exists()`, which the `except` below
+        # then reported as "no model configured", and every run since the
+        # meta-agent landed has explored with no synthesizer while saying the
+        # model was missing. It was not missing; the critic was using it.
+        synthesizer = Synthesizer(cache_path=Path("artifacts/invalid-payloads.json"))
         print(f"model: {provider.name}\n")
     except Exception as error:
-        print(f"no model configured ({type(error).__name__}) -- "
-              "deterministic exploration and ranking\n")
+        # Two different failures, and conflating them cost hours. No provider
+        # means the run really is deterministic. A provider that loaded and
+        # then something else broke means the model is live and only the
+        # synthesizer is gone -- which shows up as every `submit[invalid]` gap
+        # being declared unclosable, with nothing on screen explaining why.
+        if provider is None:
+            print(f"no model configured ({type(error).__name__}) -- "
+                  "deterministic exploration and ranking\n")
+        else:
+            print(f"model: {provider.name}, but no synthesizer "
+                  f"({type(error).__name__}: {error}) -- invalid-input "
+                  "partitions cannot be exercised this run\n")
 
     # Say it up front. A run with no second target cannot heal and cannot find a
     # defect, and a report that is silent about that reads like it looked.
