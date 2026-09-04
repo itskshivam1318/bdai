@@ -28,17 +28,25 @@ _SEVERITY = {ESCALATE: 0, DEFECT: 1, HEALED: 2, PASSED: 3}
 
 
 def path_of(result: Result) -> list[str]:
-    """The state keys a scenario crosses, in order.
+    """The state keys a run actually crossed, in order.
 
-    Every step names where it started; the last one also names where it landed.
-    That final key is why this is not just a comprehension: a scenario whose
-    terminal action opened a confirmation state must colour that state too, or
-    the most interesting node on the map stays grey.
+    Derived from `result.steps` -- what executed -- and never from
+    `result.scenario.steps` -- what was planned. `runner.run` stops at the first
+    ESCALATE or DEFECT, so on a failing multi-step scenario the plan outlives
+    the run, and colouring the planned remainder would paint a verdict onto
+    states the browser never opened.
+
+    The final key is where the last executed step actually landed, falling back
+    to where it expected to. On a defect those differ by definition, and the
+    honest answer is where the application actually went.
     """
-    keys = [step.from_key for step in result.scenario.steps]
-    terminal = result.scenario.terminal.expect.to_key
-    if terminal and terminal != keys[-1]:
-        keys.append(terminal)
+    if not result.steps:
+        return []
+    keys = [outcome.step.from_key for outcome in result.steps]
+    last = result.steps[-1]
+    landed = last.actual_key or last.step.expect.to_key
+    if landed and landed != keys[-1]:
+        keys.append(landed)
     return keys
 
 

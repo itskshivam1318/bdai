@@ -388,8 +388,13 @@ def main() -> int:
                 engine = _create_engine(f"sqlite:///{tmp}/suite.db")
                 _SQLModel.metadata.create_all(engine)
                 with _Session(engine) as db:
+                    # DEFECT first, PASSED second, on purpose: the reduction is
+                    # supposed to keep the worse verdict, so the better one must
+                    # arrive LATER and lose. Written the other way round, a
+                    # last-write-wins bug would produce the same answer as the
+                    # correct code and the check would prove nothing.
                     written = _suite.save_results(
-                        [_result(_PASSED), _result(_DEFECT)], run_id=9, session=db
+                        [_result(_DEFECT), _result(_PASSED)], run_id=9, session=db
                     )
                     ok &= check("both results are stored", written == 2)
 
@@ -400,9 +405,19 @@ def main() -> int:
                         all(key in verdicts for key in crossed),
                     )
                     ok &= check(
-                        "the worse verdict wins where scenarios overlap",
+                        "the worse verdict survives a better one written later",
                         set(verdicts.values()) == {_DEFECT},
                         f"got {sorted(set(verdicts.values()))}",
+                    )
+
+                    # A Result whose steps list is empty against a scenario that
+                    # has steps: reading the plan instead of the run would
+                    # return keys here, and returning none is the whole fix.
+                    ok &= check(
+                        "a run that executed no steps colours no states",
+                        _suite.path_of(
+                            _Result(scenario=one, target_url=SUT, steps=[])
+                        ) == [],
                     )
 
         # 4. The executable layer: a path through the map becomes a test, and
