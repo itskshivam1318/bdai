@@ -35,9 +35,9 @@ worktree: ## Create a worktree with its own ports and database
 list: ## Show every worktree, its ports, and whether it is running
 	@./scripts/worktree.sh list
 
-rm: ## Remove a worktree (keeps its branch)
-	@test -n "$(name)" || { echo "usage: make rm name=alice"; exit 1; }
-	./scripts/worktree.sh rm $(name)
+rm: ## Remove a worktree, keeping its branch (add force=1 if dirty)
+	@test -n "$(name)" || { echo "usage: make rm name=alice [force=1]"; exit 1; }
+	./scripts/worktree.sh rm $(name) $(if $(force),--force)
 
 check: ## Typecheck and lint the frontend
 	cd web && npx tsc --noEmit && npm run lint

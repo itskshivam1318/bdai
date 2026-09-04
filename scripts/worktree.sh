@@ -116,10 +116,12 @@ cmd_list() {
 cmd_rm() {
   local name="${1:-}"
   if [ -z "$name" ]; then
-    echo "usage: worktree.sh rm <name>" >&2
+    echo "usage: worktree.sh rm <name> [--force]" >&2
     exit 1
   fi
-  git -C "$REPO_ROOT" worktree remove "$WORKTREE_DIR/$name" "${2:-}"
+  shift
+  # "$@" rather than "${2:-}": an empty extra argument makes git exit 129.
+  git -C "$REPO_ROOT" worktree remove "$WORKTREE_DIR/$name" "$@"
   echo "removed worktree '$name' (branch work/$name kept)"
 }
 
