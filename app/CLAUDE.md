@@ -13,8 +13,11 @@ app/
 ├── api/                backend — FastAPI + SQLModel + SQLite, driven by uv
 │   ├── app/                routers/, models.py, db.py, config.py, main.py
 │   ├── agents/explorer/    observe → identify → map → crawl → store. See below
+│   ├── agents/pipeline.py  **the meta-agent** — URL in, report out. Start here
+│   ├── agents/critic.py    computes coverage gaps; the model may only rank them
 │   ├── agents/generator.py map path → scenario → runnable .spec.ts
 │   ├── agents/runner.py    execute a scenario; heal, or report a defect, or escalate
+│   ├── agents/orchestrator.py  the *exploration* colony — ants, not the pipeline
 │   └── smoke_run.py        walking skeleton, superseded by `make loop`. See below
 ├── web/                frontend — Next.js 16 + React 19 + Tailwind v4
 │   ├── app/                layout, page, globals.css
@@ -49,7 +52,23 @@ execution — most heavily:
 | Healer | replays failures, repairs broken locators, and distinguishes a broken script from a genuine defect |
 
 The meta-agent evaluates coverage between stages, decides when to re-plan or
-escalate, and synthesises a final test quality report.
+escalate, and synthesises a final test quality report. That is
+**`agents/pipeline.py`** — `make pipeline` runs the whole thing from a URL with
+no stage chosen by a human. Do not confuse it with `agents/orchestrator.py`,
+which orchestrates *ants within exploration* and says so in its own docstring.
+
+Its policy is code, not a prompt, and the reason is in `decisions.md`
+(2026-09-04 19:30): the evidence it routes on was computed by something else —
+`runner.py` classified each failure from two orthogonal observations, and
+`critic.py` ranked gaps it structurally could not invent. Routing on computed
+evidence is a policy, not an opinion. Every branch records a
+`Decision(stage, choice, because, evidence)`, which is what the rubric's 15%
+for *presenting the agent's decisions* is actually asking for.
+
+The one to read first is `addressable()`: it decides whether a remaining gap is
+one more exploration could close. Six unexercised `submit[invalid]` partitions
+with no synthesizer configured are **not** a reason to explore again, and saying
+so is the difference between orchestrating and looping.
 
 `api/agents/` is where the pipeline lives; `git log --oneline -- api/agents/`
 says how far it has got. Prior art on coverage evaluation — the hardest of the
@@ -204,10 +223,13 @@ sees the package set as current and leaves the shebangs alone. The fix is
 From here or from the repo root; `make` with no arguments lists every target.
 
 ```bash
-make setup   # first run only: npm install, uv sync, playwright install
-make dev     # both servers — web :3000, api :8000
-make smoke   # the walking skeleton
-make check   # typecheck + lint — run before handing work off
-make reset   # wipe the database and artifacts
-make stop    # kill the servers
+make setup     # first run only: npm install, uv sync, playwright install
+make dev       # both servers — web :3000, api :8000
+make pipeline  # the whole claim: URL in, test quality report out
+make probe     # 41 observable checks. No API key, no quota
+make gaps      # crawl an app and rank what the crawl did not cover
+make specs     # write generated .spec.ts, then run them with Playwright
+make check     # typecheck + lint — run before handing work off
+make reset     # wipe the database and artifacts
+make stop      # kill the servers
 ```
