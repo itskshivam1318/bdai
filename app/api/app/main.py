@@ -6,7 +6,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import settings
 from .db import init_db
-from .routers import canvas, chat, explore, runs, sessions, worldmap
+from .routers import canvas, chat, explore, progress, runs, sessions, worldmap
 
 
 @asynccontextmanager
@@ -32,6 +32,7 @@ app.include_router(chat.router)
 app.include_router(runs.router)
 app.include_router(sessions.router)
 app.include_router(explore.router)
+app.include_router(progress.router)
 app.include_router(worldmap.router)
 
 # Screenshots and diffs are written here and rendered straight into canvas

@@ -225,3 +225,27 @@ class ChatMessage(SQLModel, table=True):
     # graph after a re-crawl.
     run_id: Optional[int] = Field(default=None, foreign_key="run.id")
     created_at: datetime = Field(default_factory=utcnow)
+
+
+class SkippedAction(SQLModel, table=True):
+    """An action a state offered that the crawler tried and could not take.
+
+    The distinction this table exists to make: a refused action is **not**
+    unexplored. `worldmap.summary()` has always said so in prose -- "these are
+    NOT unexplored, they were tried and could not be done" -- but the fact lived
+    only on the in-memory map, so anything reading the database counted a login
+    wall it could not fill as frontier it had not reached yet.
+
+    That is the difference between a progress number that can reach 100% and one
+    that structurally cannot. `reason` is one of the three `crawler.py` records,
+    verbatim, because *why* it was refused is the useful half: "nothing here
+    could be filled" on a sign-in form is usually the most expensive fact in the
+    whole crawl.
+    """
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    run_id: Optional[int] = Field(default=None, foreign_key="run.id", index=True)
+    state_key: str = Field(index=True)
+    action: str
+    reason: str
+    created_at: datetime = Field(default_factory=utcnow)

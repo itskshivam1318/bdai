@@ -327,3 +327,54 @@ a line on `make pipeline`. Left untouched because the console work has that file
 open; it is the one doc edit outstanding for this change.
 
 **Who:** shivam + Claude.
+
+---
+
+## 2026-09-04 23:30 — A crawl-progress ratio is allowed; a coverage percentage still is not
+
+`GET /api/runs/{id}/progress` reports `walked / offered` — of the (state, action)
+pairs the application put in front of the crawler, how many it took — and the
+map shows it as `EXPLORED n%`. Everything beside it is a count.
+
+**Why this does not reopen 19:00.** That decision refused a percentage because
+its denominator would be the states × actions table from `gaps()`, whose cells
+are not equally meaningful: unfiltered, the SUT produced 63 of 75 items, each a
+correct cell and collectively noise. Dividing by that count produces a number
+that looks calibrated and is not.
+
+`frontier()` is a different denominator, and the difference is not cosmetic.
+Every cell in it is a control the **application itself rendered**. It was either
+taken or it was not. Nobody has to judge whether the cell was worth having, so
+the ratio needs no judgement to read. It says how far the crawler got. It says
+nothing about how well the app is tested, and the word "coverage" appears
+nowhere on it.
+
+**The report still carries no percentage.** `make probe` still checks `"%" not
+in written`, and that check is now load-bearing twice: it is what keeps a
+progress number on a map from migrating into a quality claim in a document.
+
+**Refused actions had to be persisted first.** `worldmap.summary()` has always
+said a refused action is "NOT unexplored — tried and could not be done", but
+`skipped` lived only on the in-memory map. Anything reading the database counted
+a login wall it could not fill as frontier it had not reached, so the ratio
+could never reach 100% on any app with one. `SkippedAction` stores it with the
+crawler's own reason, and `store.save`/`store.load` round-trip it — which also
+stops a resumed crawl re-attempting what it already established it cannot do.
+
+**Its denominator grows, and the UI says so.** Discovering a new state adds its
+offered actions, so the number can fall while the crawl is working. That is the
+crawler finding more application, not losing ground; the readout carries that
+sentence rather than hiding the effect.
+
+**The honest coverage line is a count, not a ratio:** `states nothing tested`.
+Absence of a verdict is not a pass, and saying "4 states, nothing crossed them"
+needs no denominator at all.
+
+**Evidence:** 16 checks on the endpoint (parts sum to the whole; a walked action
+beats a refused one; an edge whose origin no longer offers it cannot inflate the
+numerator; an empty map is zeroes, not a division by zero) and a `store`
+round-trip check that a refusal is written once across repeated checkpoints.
+Measured on existing runs: run 1 30.4%, run 3 8.0%, run 6 26.9% — every one of
+them reporting `passed`.
+
+**Who:** shivam + Claude.

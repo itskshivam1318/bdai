@@ -2,12 +2,14 @@
 import {
   Background,
   Controls,
+  Panel,
   ReactFlow,
   type Edge,
   type Node,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { useCallback, useEffect, useMemo, useState } from "react";
+import MapProgress from "@/components/MapProgress";
 import StateCard from "@/components/StateCard";
 import StateDetail from "@/components/StateDetail";
 import { api, type MapState, type WorldMapPayload } from "@/lib/api";
@@ -190,6 +192,10 @@ export default function MapPane({
           >
             <Background />
             <Controls />
+            {/* Top-left is the only free corner: Controls own bottom-left. */}
+            <Panel position="top-left">
+              <MapProgress runId={runId} />
+            </Panel>
           </ReactFlow>
         </div>
         {detail && (

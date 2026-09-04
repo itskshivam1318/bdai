@@ -71,6 +71,30 @@ export type ChatMessage = {
 /** A question and the reply it produced. The API writes both or neither. */
 export type ChatTurn = { user: ChatMessage; assistant: ChatMessage };
 
+/** Why one offered action could not be taken, and how often. */
+export type Refusal = { reason: string; count: number };
+
+/**
+ * How far a crawl got. `walked / offered` is the one ratio in this codebase,
+ * and it is a fact about the crawl rather than a coverage score — see
+ * `routers/progress.py` and decisions.md 2026-09-04 19:00. Everything else here
+ * is a count on purpose.
+ */
+export type Progress = {
+  run_id: number;
+  status: string;
+  offered: number;
+  walked: number;
+  refused: number;
+  remaining: number;
+  states: number;
+  transitions: number;
+  mutating: number;
+  untested_states: number;
+  ambiguous_edges: number;
+  reasons: Refusal[];
+};
+
 export type Run = {
   id: number;
   session_id: number | null;
@@ -228,6 +252,7 @@ export const api = {
   listEvents: (runId: number) =>
     request<AgentEvent[]>(`/api/runs/${runId}/events`),
   getMap: (runId: number) => request<WorldMapPayload>(`/api/runs/${runId}/map`),
+  getProgress: (runId: number) => request<Progress>(`/api/runs/${runId}/progress`),
   listTests: (runId: number) => request<TestCaseRow[]>(`/api/runs/${runId}/tests`),
   addEvent: (runId: number, event: Partial<AgentEvent>) =>
     request<AgentEvent>(`/api/runs/${runId}/events`, {

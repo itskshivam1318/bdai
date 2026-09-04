@@ -29,7 +29,7 @@ import json
 
 from sqlmodel import Session, select
 
-from app.models import AppState, StateObservation, StateTransition
+from app.models import AppState, SkippedAction, StateObservation, StateTransition
 
 from .observer import Element, NetworkEvent, Observation
 from .worldmap import StateNode, Transition, WorldMap
@@ -157,6 +157,33 @@ def save(world: WorldMap, run_id: int, session: Session) -> int:
             )
             written += 1
 
+    # --- refused actions, append-only ------------------------------------
+    # Reconciled on (state, action) rather than appended blindly: `save` runs
+    # after every edge, and a refusal stays on `world.skipped` for the rest of
+    # the crawl, so an unconditional insert would write the same row once per
+    # remaining checkpoint.
+    refused = set(
+        session.exec(
+            select(SkippedAction.state_key, SkippedAction.action).where(
+                SkippedAction.run_id == run_id
+            )
+        ).all()
+    )
+
+    for (state_key, action), reason in world.skipped.items():
+        if (state_key, action) in refused:
+            continue
+        refused.add((state_key, action))
+        session.add(
+            SkippedAction(
+                run_id=run_id,
+                state_key=state_key,
+                action=action,
+                reason=reason,
+            )
+        )
+        written += 1
+
     session.commit()
     return written
 
@@ -230,6 +257,14 @@ def load(run_id: int, session: Session) -> WorldMap:
                 evidence=by_id.get(row.observation_id, 0),
             )
         )
+
+    # Refusals come back too, so `save` and `load` round-trip. Without this a
+    # resumed crawl re-attempts every action it already established it cannot
+    # take, and `summary()` silently loses the lines naming why.
+    for row in session.exec(
+        select(SkippedAction).where(SkippedAction.run_id == run_id)
+    ).all():
+        world.skipped[(row.state_key, row.action)] = row.reason
 
     return world
 

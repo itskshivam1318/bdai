@@ -898,6 +898,10 @@ def main() -> int:
                 )
             ),
         )
+        # Still true, and now load-bearing in a second way: `/progress` shows a
+        # walked/offered ratio on the map, and the thing that keeps that from
+        # becoming a coverage claim is that it never reaches the report. If a
+        # percentage ever appears here, the 19:00 decision has been lost.
         ok &= check(
             "the report carries no coverage percentage",
             "%" not in written,
