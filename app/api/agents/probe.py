@@ -19,6 +19,7 @@ Needs `make dev` for the SUT at :3000.
 
 from __future__ import annotations
 
+import os
 import sys
 
 from playwright.sync_api import Error as PlaywrightError
@@ -33,7 +34,10 @@ from .explorer.worldmap import WorldMap
 from .llm import ToolCall, Turn
 from .orchestrator import Budget, run
 
-SUT = "http://localhost:3000/sut"
+# The Makefile reads WEB_PORT from `.worktree-env` so several stacks can run at
+# once; a probe that ignored it would test whichever checkout happened to own
+# port 3000, which in a worktree is somebody else's code.
+SUT = f"http://localhost:{os.environ.get('WEB_PORT', '3000')}/sut"
 CREDENTIALS = Credentials("probe@example.com", "probe-password")
 
 
