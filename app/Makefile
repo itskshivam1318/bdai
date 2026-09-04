@@ -2,7 +2,7 @@
 # scripts/dev.sh reads .worktree-env for ports, falling back to 3000/8000.
 
 .DEFAULT_GOAL := help
-.PHONY: help setup dev api web smoke probe pipeline loop generate specs gaps explore crawl trace diff runs worktree list rm check reset stop
+.PHONY: help setup dev api web smoke probe pipeline loop generate specs gaps explore crawl trace diff runs mcp mcp-probe worktree list rm check reset stop
 
 PY_VERSION := 3.12
 
@@ -53,6 +53,12 @@ explore: ## Map an app with the agent colony. URL=... [INTENT=...]
 
 crawl: ## Map an app deterministically -- no model, no API key. URL=...
 	cd api && uv run python -m agents.explorer.crawler "$${URL:-http://localhost:$${WEB_PORT:-3000}/sut}"
+
+mcp: ## MCP server, for Claude Code and other agents. Needs `make dev` running.
+	cd api && uv run python -m agent_mcp.server
+
+mcp-probe: ## Observable checks for the MCP layer. Needs `make dev` running.
+	cd api && uv run python -m agent_mcp.probe
 
 trace: ## Local LLM observability UI (Phoenix) on :6006. Leave running.
 	cd api && uv run python -m agents.tracing

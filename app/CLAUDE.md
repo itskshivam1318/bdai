@@ -18,6 +18,7 @@ app/
 │   ├── agents/generator.py map path → scenario → runnable .spec.ts
 │   ├── agents/runner.py    execute a scenario; heal, or report a defect, or escalate
 │   ├── agents/orchestrator.py  the *exploration* colony — ants, not the pipeline
+│   ├── agent_mcp/          MCP server — the pipeline, for an external coding agent
 │   └── smoke_run.py        walking skeleton, superseded by `make loop`. See below
 ├── web/                frontend — Next.js 16 + React 19 + Tailwind v4
 │   ├── app/                layout, page, globals.css
@@ -183,6 +184,59 @@ invisible in the UI again, that path is what to fix — not the canvas.
      `is_flow(map, transition) -> bool` in `worldmap.py` settles it for every
      packet after it. -->
 
+## The MCP server
+
+`api/agent_mcp/` exposes the pipeline to Claude Code and any other MCP client.
+Same claim as the console, different consumer: the brief complains that a human
+supplies application context over and over, and the other party with that
+problem is **the coding agent that just changed the app** -- it holds the diff
+and knows nothing about behaviour.
+
+```bash
+make mcp         # stdio server. Needs `make dev` running.
+make mcp-probe   # observable checks. Also needs `make dev`.
+```
+
+Registered for this repo in `.mcp.json`, so Claude Code picks it up on open.
+
+| Tool | Answers | Needs a key |
+|---|---|---|
+| `sessions` | what has been mapped already | no |
+| `crawl` | map an app deterministically | **no** |
+| `explore` | map an app with the agent colony | yes |
+| `map` | states, transitions, flows, gaps | no |
+| `impact` | which flows touch these user-visible strings | no |
+| `verify` | replay flows; passed / healed / defect / escalate | no |
+
+**The join is an accessible name, not a file path.** `impact` takes the strings a
+diff changed (`- Place Order` / `+ Complete Purchase`) because that is what a
+diff contains and what `statekey.normalize()` keys on. Mapping source ranges back
+to files would be a subsystem, and the client can already read its own diff.
+
+**Every mutation goes over HTTP** (`agent_mcp/client.py`), never straight to
+SQLite. `list_sessions` computes `run_count` by query and `Canvas.tsx` polls
+`sessions/{id}/events` for a `surface` -- both are behaviours of the API, so a
+row written around it exists but stays invisible. Driving the API is what makes
+an MCP-started run indistinguishable from a browser-started one.
+`agent_mcp/probe.py` has a check named `visible` whose only job is to stop that
+regressing.
+
+**`crawl` exists so the server works with no API key at all.** An agent
+connecting over MCP is on someone else's machine; a server whose every tool needs
+a key the user has not set looks broken. `routers/explore.py` already names the
+deterministic crawler as the other route to a map.
+
+**It owns no file another track owns.** Reads that want `GET /api/runs/{id}/map`
+go through `store.load` instead, because the console track owns that router and
+it has not merged. Swap it when that lands -- `agent_mcp/read.py:world_of` is the
+only place that knows.
+
+**Crawling our own SUT maps three apps, not one.** `web/app/sut/page.tsx` links
+to `?v=1|2|3`, so an unrestricted `crawl` walks into every drift variant and the
+map mixes them. Flows recorded in one variant then classify correctly; a flow
+recorded across two does not. `make loop` avoids this by using a single scenario.
+Point `crawl` at a real target, or expect the mixture.
+
 ## Hardcoded on purpose
 
 Fixtures and mocks are fine and expected — but they must be visible, or the next
@@ -223,6 +277,18 @@ Deliberately out of scope unless the demo needs it:
 Nothing else changes — not the canvas, not the backend.
 
 ## Gotchas worth not rediscovering
+
+**A page with no `<form>` element gets no form actions at all.** `forms.form_of`
+asks the DOM for a button's `<form>` ancestor and returns None when there is
+none, so `submit[valid|empty|invalid]` are never synthesised and the crawler
+just clicks the bare button. Measured against
+`practicetestautomation.com/practice-test-login/`, whose login is two inputs and
+a button with `document.querySelectorAll('form').length === 0` — the observer
+sees `textbox:Username` and `textbox:Password` and the crawl still never types
+into them. The ancestry test earns its keep (`forms.py:124` documents the
+garbage it prevents), so this is a live trade-off rather than a bug to squash
+blind: the fix has to scope fields to a button without a `<form>` and without
+re-manufacturing `submit[valid]:button:Sign in with Google`.
 
 **Widget config lives in local state**, not on the xyflow node's `data`.
 Mutating `data` is a lint error and causes stale renders; `WidgetNode` holds
