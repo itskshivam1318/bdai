@@ -32,11 +32,14 @@ from sqlmodel import Session
 
 # Absolute, not relative: `agents/` is a sibling of `app/` under `api/`, so a
 # relative import would climb above this package and fail at import time.
-from agents import orchestrator
+from agents import orchestrator, runner, suite
 from agents.explorer import store
 from agents.explorer.forms import Credentials
+from agents.generator import scenarios
 from agents.llm import load
+from agents.shots import shooter
 from agents.tracing import start as start_tracing
+from ..config import settings
 from ..db import engine, get_session
 from ..models import Event, Run
 
@@ -93,6 +96,7 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
         emit("info", f"exploring {target_url}", surface="timeline")
         emit("info", f"model: {provider.name} / {provider.model}")
 
+        results: list = []
         try:
             with sync_playwright() as pw:
                 browser = pw.chromium.launch()
@@ -110,23 +114,94 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
                     credentials=Credentials.from_env(),
                     on_event=emit,
                     run_id=run_id,
+                    shot=shooter(page, run_id, settings.artifacts_dir),
                 )
+
+                rows = store.save(result.world, run_id, db)
+                emit(
+                    "decision",
+                    f"map saved: {len(result.world.states)} states, "
+                    f"{sum(len(t) for t in result.world.transitions.values())} "
+                    f"transitions ({rows} rows)",
+                )
+
+                # --- plan ------------------------------------------------
+                for flow in result.flows:
+                    emit("decision", f"flow: {flow.get('name')} -- {flow.get('why', '')}")
+                emit(
+                    "decision",
+                    f"plan: {len(result.flows)} flows across "
+                    f"{len(result.world.states)} states",
+                    surface="plan",
+                )
+
+                # --- coverage, before generation, as the brief requires ---
+                for gap in result.gaps:
+                    emit("warn", f"gap: {gap}")
+                emit(
+                    "warn" if result.gaps else "info",
+                    f"coverage: {len(result.gaps)} gap(s) before generation",
+                    surface="coverage",
+                )
+
+                # --- suite -----------------------------------------------
+                plan = scenarios(result.world)
+                emit(
+                    "decision",
+                    f"suite: {len(plan)} scenarios compiled from recorded paths",
+                    surface="suite",
+                )
+
+                # --- run and heal ----------------------------------------
+                credentials = Credentials.from_env()
+                results = []
+                for scenario in plan:
+                    try:
+                        results.append(
+                            runner.run(
+                                page,
+                                scenario,
+                                credentials=credentials,
+                                on_event=emit,
+                            )
+                        )
+                    except Exception as exc:
+                        # One scenario that cannot even be replayed must not
+                        # cost the other ten their verdicts.
+                        emit("error", f"{scenario.name}: {type(exc).__name__}: {exc}")
+
                 browser.close()
 
-            rows = store.save(result.world, run_id, db)
+            written = suite.save_results(results, run_id, db)
+
+            for outcome in results:
+                for step in outcome.healed_steps:
+                    emit(
+                        "decision",
+                        f"healed: {step.step.action} -> {step.resolution.action} "
+                        f"({step.resolution.rung})",
+                        surface="heal",
+                    )
+                if outcome.verdict in {runner.DEFECT, runner.ESCALATE}:
+                    emit(
+                        "error",
+                        f"{outcome.verdict}: {outcome.scenario.name}",
+                        surface="defect",
+                    )
+
+            tally = {v: sum(1 for r in results if r.verdict == v) for v in (
+                runner.PASSED, runner.HEALED, runner.DEFECT, runner.ESCALATE
+            )}
             emit(
                 "decision",
-                f"map saved: {len(result.world.states)} states, "
-                f"{sum(len(t) for t in result.world.transitions.values())} "
-                f"transitions ({rows} rows)",
+                f"report: {tally[runner.PASSED]} passed, {tally[runner.HEALED]} healed, "
+                f"{tally[runner.DEFECT]} defect, {tally[runner.ESCALATE]} escalate, "
+                f"{len(result.gaps)} gap(s) remaining ({written} rows)",
+                surface="report",
             )
-            for flow in result.flows:
-                emit("decision", f"flow: {flow.get('name')} -- {flow.get('why', '')}")
-            for gap in result.gaps:
-                emit("warn", f"gap: {gap}")
 
             if run:
-                run.status = "passed"
+                run.status = "failed" if tally[runner.DEFECT] else "passed"
                 run.summary = result.summary or f"stopped: {result.stopped}"
 
         except Exception as exc:
