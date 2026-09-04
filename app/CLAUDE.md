@@ -326,6 +326,13 @@ materialises the staged tree and typechecks *that*. Enable it with `make hooks`
 (`make setup` does); bypass with `--no-verify` only for a WIP commit you intend
 to amend.
 
+`core.hooksPath` lives in the **shared** config, so every worktree inherits the
+setting -- but the path is relative, and `.githooks/` only exists on branches
+that carry it. Point git at a directory that is not there and it runs no hook
+and says nothing, which is the one failure a guard must not have. `make hooks`
+therefore refuses to enable itself from a branch without the file; a worktree on
+an older branch is unprotected until it merges one that has it.
+
 **Widget config lives in local state**, not on the xyflow node's `data`.
 Mutating `data` is a lint error and causes stale renders; `WidgetNode` holds
 state and persists it 400ms after you stop typing.
