@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "aivar": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "app/api",
+        "python",
+        "-m",
+        "agent_mcp.server"
+      ]
+    }
+  }
+}

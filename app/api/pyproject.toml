@@ -15,6 +15,7 @@ dependencies = [
     "pillow>=11.0",
     "numpy>=2.1",
     "google-genai>=2.22.0",
+    "mcp>=1.2",
     "arize-phoenix>=20.7.0",
     "openinference-instrumentation-google-genai>=1.4.4",
     "openinference-instrumentation-anthropic>=2.1.1",
