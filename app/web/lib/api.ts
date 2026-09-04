@@ -59,6 +59,56 @@ export type AgentEvent = {
   created_at: string;
 };
 
+/** The four things the Runner can conclude. See api/agents/runner.py. */
+export type Verdict = "passed" | "healed" | "defect" | "escalate";
+
+export type MapState = {
+  key: string;
+  url: string;
+  title: string;
+  label: string | null;
+  is_entry: boolean;
+  actions: string[];
+  /** [role, name] pairs — the fillable fields of this screen. */
+  fields: [string, string][];
+  /** Path under /artifacts, or null when capture was off or the shot failed. */
+  screenshot: string | null;
+  /** Worst verdict among scenarios crossing this state; null if untested. */
+  verdict: Verdict | null;
+};
+
+export type MapTransition = {
+  from_key: string;
+  action: string;
+  to_key: string;
+  /** A non-GET fired during this action. The signal the Runner classifies on. */
+  mutating: boolean;
+  observation_id: number | null;
+};
+
+export type WorldMapPayload = {
+  run_id: number;
+  entry_key: string | null;
+  states: MapState[];
+  transitions: MapTransition[];
+};
+
+export type TestCaseRow = {
+  id: number;
+  run_id: number | null;
+  name: string;
+  selector: string | null;
+  healed_selector: string | null;
+  status: string;
+  detail: string | null;
+  /** JSON list of the state keys this scenario crosses. */
+  path: string;
+  created_at: string;
+};
+
+/** Artifacts are served by the API, not by Next. */
+export const artifactUrl = (path: string) => `${API_BASE}/artifacts/${path}`;
+
 export const api = {
   health: () => request<{ status: string; worktree: string }>("/health"),
 
@@ -117,6 +167,8 @@ export const api = {
     }),
   listEvents: (runId: number) =>
     request<AgentEvent[]>(`/api/runs/${runId}/events`),
+  getMap: (runId: number) => request<WorldMapPayload>(`/api/runs/${runId}/map`),
+  listTests: (runId: number) => request<TestCaseRow[]>(`/api/runs/${runId}/tests`),
   addEvent: (runId: number, event: Partial<AgentEvent>) =>
     request<AgentEvent>(`/api/runs/${runId}/events`, {
       method: "POST",
