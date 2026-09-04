@@ -40,6 +40,7 @@ smoke: ## Walking skeleton: drive a browser, break a locator, heal it
 probe: ## Observable checks for the explorer and the agents. No API key needed.
 	cd api && uv run python -m agents.explorer.probe
 	cd api && uv run python -m agents.probe
+	cd api && uv run python -m app.probe
 
 loop: ## The whole claim, in one command: crawl, generate, run, drift, defect. URL=...
 	cd api && uv run python -m agents.runner "$${URL:-http://localhost:$${WEB_PORT:-3000}/sut}"
