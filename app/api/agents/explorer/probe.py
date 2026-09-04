@@ -4,10 +4,18 @@
 
 Answers four questions, in order of how much the crawler depends on them:
 
-0. **Does the projection keep the right differences?** Seven synthetic pages,
-   each isolating one thing `normalize` must ignore or must not. This section
-   needs no server and is the one that fails first when someone edits
-   `statekey.py`.
+0. **Does the projection keep the right differences?** Synthetic pages, each
+   isolating one thing `normalize` must ignore or must not. This section needs
+   no server and is the one that fails first when someone edits `statekey.py`.
+
+   The grid is deliberately two-sided, and both sides are load-bearing:
+   *invariance* (cosmetic and user-entered noise must collapse) and
+   *sensitivity* (a difference the application itself decided must survive).
+   A projection tested only for invariance passes by throwing everything away.
+   Every `same` row here has a `different` row nearby holding the same rule
+   from the other end -- ticked box vs. box that gates a submit, a rendered
+   quantity vs. one the app acts on -- because that pairing is the whole
+   hypothesis this system rests on.
 1. **Is the key stable?** Load the same page twice, cold. If the two keys
    differ, every component above this one is unbuildable -- the crawler would
    treat each revisit as a new state and never terminate.
@@ -70,6 +78,54 @@ def _boxes(*, checked: int, total: int = 6) -> str:
         for i in range(total)
     )
     return f"<main><h1>Testing Guide</h1>{items}</main>"
+
+
+def _gated(*, accepted: bool) -> str:
+    """A terms box that gates the submit. The other half of the checkbox rule.
+
+    `statekey._NOISE` strips `checked` and argues that nothing behavioural is
+    lost, because "a 'I accept the terms' box that gates a submit surfaces as
+    `[disabled]` on the button, which is kept". That is an argument, and until
+    now it was only an argument -- `_boxes` proves the stripping, and nothing
+    proved the escape hatch.
+
+    So these two pages differ in exactly two places: the `checked` flag, which
+    is stripped, and `[disabled]` on the control it gates, which is not. If
+    they separate, the flag survived on the button and the rule holds. If they
+    collapse, the strip list is unsafe and accepting the terms unlocks a flow
+    no crawl can ever reach.
+    """
+    return (
+        "<main><h1>Place order</h1>"
+        f'<label><input type=checkbox {"checked" if accepted else ""}> '
+        "I accept the terms</label>"
+        f'<button {"" if accepted else "disabled"}>Place order</button></main>'
+    )
+
+
+def _cart(*, qty: int) -> str:
+    """A cart line, and the boundary the application itself reacts to.
+
+    The pair the design has to get right in both directions. A quantity the app
+    merely renders is the user's bookkeeping and must not be identity -- keying
+    on it makes every increment a state. A quantity the app *acts on* -- here,
+    an empty cart that disables checkout and raises an alert -- is the
+    application's own decision and must be.
+
+    Which is the same rule as `_rows(17)` vs `_rows(0)`, restated where a
+    reviewer will actually look for it: numbers on a page.
+    """
+    if qty == 0:
+        return (
+            "<main><h1>Your cart</h1><p role=alert>Your cart is empty</p>"
+            "<button disabled>Checkout</button></main>"
+        )
+    return (
+        "<main><h1>Your cart</h1>"
+        f"<label>Quantity <input type=number value={qty}></label>"
+        f"<p>Subtotal: ${qty * 20}</p>"
+        "<button>Checkout</button></main>"
+    )
 
 
 _SIDEBAR = """<div><nav aria-label="Sessions"><ul>{items}</ul>
@@ -154,6 +210,31 @@ PROJECTION_CASES = (
         _boxes(checked=3),
         "same",
         "N checkboxes become 2^N states; a checklist eats the whole budget",
+    ),
+    (
+        "a box that GATES a submit IS identity",
+        _gated(accepted=False),
+        _gated(accepted=True),
+        "different",
+        "the rule above becomes unsafe: stripping `checked` would hide a "
+        "consequence instead of a preference, and whatever accepting the terms "
+        "unlocks is unreachable for every crawl that follows",
+    ),
+    (
+        "a rendered quantity is not identity",
+        _cart(qty=1),
+        _cart(qty=2),
+        "same",
+        "every increment of every counter is a state; a cart with a quantity "
+        "field is an infinite frontier",
+    ),
+    (
+        "a quantity the app ACTS on IS identity",
+        _cart(qty=1),
+        _cart(qty=0),
+        "different",
+        "the empty-cart branch -- its alert and its blocked checkout -- "
+        "collapses into the populated one and is never tested",
     ),
     (
         "a grown sibling list is not identity",
@@ -270,7 +351,7 @@ def projection_grid(page) -> bool:
         ok = verdict == expected
         passed &= ok
 
-        print(f"  {'PASS' if ok else 'FAIL'}  {label:<32} {verdict}")
+        print(f"  {'PASS' if ok else 'FAIL'}  {label:<46} {verdict}")
         if not ok:
             print(f"        expected {expected}; if wrong, {cost}")
             print(f"        {explain(_snapshot_html(page, html_a), _snapshot_html(page, html_b))}")
