@@ -291,11 +291,7 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
         </div>
         {railOpen && (
           <div id="stage-rail" className="min-w-0 overflow-hidden">
-            <StageRail
-              sessionId={sessionId}
-              runId={shownRunId}
-              running={running && shownRunId === latestId}
-            />
+            <StageRail sessionId={sessionId} runId={shownRunId} />
           </div>
         )}
       </div>
