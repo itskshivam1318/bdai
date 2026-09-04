@@ -33,6 +33,7 @@ from .explorer.forms import Credentials
 from .explorer.observer import Observation, Observer
 from .explorer.worldmap import WorldMap
 from .llm import Exchange, Provider, ToolResult, Transcript, load
+from .shots import Shot
 from .tracing import save_transcript, start as start_tracing
 
 PROMPTS = Path(__file__).parent / "prompts"
@@ -132,6 +133,7 @@ def explore(
     credentials: Credentials | None = None,
     budget: int = 5,
     run_id: int | None = None,
+    shot: Shot | None = None,
 ) -> Report:
     """Run one ant to completion.
 
@@ -261,6 +263,8 @@ def explore(
 
             from_key = here_key
             to_key = world.connect(from_key, action, after).to_key
+            if shot is not None and world.states[to_key].screenshot is None:
+                world.attach_screenshot(to_key, shot(to_key))
             report.trail.append(f"{action}  -> {to_key[:8]}")
             here, here_key = after, to_key
 

@@ -347,6 +347,41 @@ def main() -> int:
         browser = pw.chromium.launch()
         page = browser.new_page()
         mapped = crawl(page, SUT, CrawlBudget(max_actions=10, max_seconds=90))
+
+        # 4b. One picture per state, and not one more. A revisit that shoots
+        #     again is invisible in the UI and quadratic in a real crawl.
+        from pathlib import Path as _Path
+
+        from .shots import shooter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            shot_page = browser.new_page()
+            shot_world = crawl(
+                shot_page,
+                SUT,
+                CrawlBudget(max_actions=12, max_seconds=90),
+                credentials=CREDENTIALS,
+                shot=shooter(shot_page, run_id=1, root=_Path(tmp)),
+            )
+            shot_page.close()
+            files = list((_Path(tmp) / "run-1").glob("*.png"))
+            ok &= check(
+                "one screenshot per state, never two",
+                len(files) == len(shot_world.states),
+                f"{len(files)} files for {len(shot_world.states)} states",
+            )
+            ok &= check(
+                "every state carries a thumbnail path",
+                all(n.screenshot for n in shot_world.states.values()),
+            )
+            ok &= check(
+                "the recorded path is what the API serves",
+                all(
+                    n.screenshot.startswith("run-1/") and n.screenshot.endswith(".png")
+                    for n in shot_world.states.values()
+                ),
+            )
+
         plan = scenarios(mapped)
         happy = next(
             (s for s in plan if s.terminal.action.startswith("submit[valid]")), None
