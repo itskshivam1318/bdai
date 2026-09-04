@@ -17,6 +17,10 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
   const [session, setSession] = useState<TestSession | null>(null);
   const [runs, setRuns] = useState<Run[]>([]);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // Which run's failure the reason popover is open for -- not a boolean. A
+  // reason belongs to one run, so keying it on the id means "Run again" closes
+  // it for free rather than needing an effect to chase the change.
+  const [reasonFor, setReasonFor] = useState<number | null>(null);
   const [name, setName] = useState("");
   const [intent, setIntent] = useState("");
 
@@ -38,6 +42,7 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
   }, [sessionId, refreshRuns]);
 
   const latest = runs[runs.length - 1];
+  const reasonOpen = latest != null && reasonFor === latest.id;
 
   function commitName() {
     const next = name.trim();
@@ -94,10 +99,42 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
           className="min-w-0 max-w-64 flex-1 rounded bg-transparent px-1 py-0.5 text-sm font-medium outline-none hover:bg-hush focus:bg-hush"
         />
 
+        {/*
+          The status label is the only place a failure can be read. The agent
+          writes a reason to `run.summary` on every terminal path, but until
+          this was a disclosure it went to the database and nowhere else: a run
+          could die on a missing API key and the console showed four grey
+          characters. Header-only on purpose -- the canvas belongs to the map,
+          not to the last thing that went wrong.
+        */}
         {latest && (
-          <span className={`text-xs ${STATUS_TONE[latest.status] ?? "text-muted"}`}>
-            run {runs.length} · {latest.status}
-          </span>
+          <div className="relative">
+            <button
+              type="button"
+              onClick={() =>
+                latest.summary && setReasonFor(reasonOpen ? null : latest.id)
+              }
+              aria-expanded={latest.summary ? reasonOpen : undefined}
+              title={latest.summary ?? undefined}
+              className={`rounded px-1.5 py-0.5 text-xs ${
+                STATUS_TONE[latest.status] ?? "text-muted"
+              } ${latest.summary ? "hover:bg-hush" : "cursor-default"}`}
+            >
+              run {runs.length} · {latest.status}
+              {latest.summary && <span className="ml-1 opacity-60">ⓘ</span>}
+            </button>
+
+            {reasonOpen && latest.summary && (
+              <div
+                role="status"
+                className="absolute left-0 top-full z-20 mt-1.5 w-[28rem] rounded-md border border-rule bg-paper p-3 shadow-md"
+              >
+                <p className="whitespace-pre-wrap break-words font-mono text-xs leading-relaxed text-ink">
+                  {latest.summary}
+                </p>
+              </div>
+            )}
+          </div>
         )}
 
         <a

@@ -124,17 +124,34 @@ claim on an edge so two workers do not take the same one, which is a column.
 
 ### Configuration
 
-All optional; all degrade loudly rather than silently.
+Read from `.env` by `agents/__init__.py` at import — the nearest one walking up
+from `api/agents/`, bounded to the repo, so `api/.env` wins over a root `.env`.
+An exported variable always beats the file. Copy `api/.env.example` to start.
+
+It is loaded in the package rather than in one entry point because there are
+four of them (the API background task, `explorer.crawler`, `probe.py`,
+`smoke_run.py`) and all four read these out of `os.environ`.
 
 ```bash
-AIVAR_USERNAME / AIVAR_PASSWORD   # forms.Credentials — without these, any
-                                  # login wall stops the crawl at one state
-ANTHROPIC_API_KEY                 # synth.py. Without it, invalid payloads come
-                                  # from a static mutation table that knows
-                                  # nothing about the app; the crawl prints
-                                  # "PAYLOADS n from fallback" so a degraded
-                                  # run never looks like a good one
+ANTHROPIC_API_KEY / GEMINI_API_KEY  # llm.load() picks a provider by whichever
+                                    # is present. With neither, a console run
+                                    # degrades to `explorer.crawler` — a real
+                                    # map, breadth-first, but no flows, no
+                                    # summary, no intent, and status `degraded`
+                                    # rather than `passed`. Also feeds synth.py:
+                                    # without it invalid payloads come from a
+                                    # static mutation table that knows nothing
+                                    # about the app, and the crawl prints
+                                    # "PAYLOADS n from fallback" so a degraded
+                                    # run never looks like a good one
+AIVAR_USERNAME / AIVAR_PASSWORD     # optional. forms.Credentials — without
+                                    # these, any login wall stops the crawl at
+                                    # one state
 ```
+
+A run that ends in `error` puts its reason in `run.summary`, and the console's
+status label (`run 2 · error ⓘ`) discloses it on click. If a failure is ever
+invisible in the UI again, that path is what to fix — not the canvas.
 
 <!-- TODO(shivam): the handoff contract is now half-settled, and the half that
      is settled is the half that was contentious. Selectors vs intent went to

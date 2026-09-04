@@ -33,10 +33,12 @@ from sqlmodel import Session
 # Absolute, not relative: `agents/` is a sibling of `app/` under `api/`, so a
 # relative import would climb above this package and fail at import time.
 from agents import orchestrator
-from agents.explorer import store
+from agents.explorer import crawler, store
 from agents.explorer.forms import Credentials
+from agents.explorer.synth import Synthesizer
 from agents.llm import load
 from agents.tracing import start as start_tracing
+from ..config import settings
 from ..db import engine, get_session
 from ..models import Event, Run
 
@@ -51,6 +53,35 @@ class ExploreRequest(BaseModel):
     max_waves: int = 3
     max_ants: int = 4
     ant_actions: int = 4
+
+
+def _crawl_only(page, target_url: str, emit, checkpoint) -> orchestrator.Exploration:
+    """The no-model path: the same WorldMap, built breadth-first with no model.
+
+    Returned as an `Exploration` so the caller's save-and-report block does not
+    have to branch. `flows` and `summary` stay empty because naming a user
+    journey is the one thing on that path that genuinely needs a model -- the
+    graph itself never did, which is the whole argument in `explorer/__init__`.
+
+    `gaps` is rendered here rather than in the caller: the orchestrator hands
+    back prose a model wrote, `WorldMap.gaps()` hands back a dict, and the
+    timeline only knows how to print strings.
+    """
+    world = crawler.crawl(
+        page,
+        target_url,
+        credentials=Credentials.from_env(),
+        # Same cache the CLI uses, so a payload the model chose on an earlier
+        # run is reused now that there is no model to ask.
+        synthesizer=Synthesizer(cache_path=settings.artifacts_dir / "invalid-payloads.json"),
+        checkpoint=checkpoint,
+    )
+    gaps = tuple(
+        f"[{key[:8]}] {', '.join(actions[:6])}"
+        for key, actions in sorted(world.gaps().items(), key=lambda kv: -len(kv[1]))
+        if actions
+    )
+    return orchestrator.Exploration(world=world, stopped="no model", gaps=gaps[:3])
 
 
 def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
@@ -76,41 +107,63 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
         if traces:
             emit("info", f"traces: {traces}")
 
+        # A missing key degrades the run; it does not end it. The error message
+        # has always named `explorer.crawler` as the way to get a map anyway,
+        # and the crawler needs a browser and a URL -- both of which are right
+        # here. Returning instead was the message telling the user to go and do
+        # by hand the thing this function was already standing in front of.
+        provider = None
         try:
             provider = load(notify=emit)
         except RuntimeError as exc:
-            # No key configured. A dead end, but a legible one -- and the
-            # deterministic crawler is still a route to a map.
             emit("error", str(exc))
-            if run:
-                run.status = "error"
-                run.summary = "no model configured"
-                run.finished_at = datetime.now(timezone.utc)
-                db.add(run)
-                db.commit()
-            return
+            emit("warn", "no model: falling back to the deterministic crawler")
 
         emit("info", f"exploring {target_url}", surface="timeline")
-        emit("info", f"model: {provider.name} / {provider.model}")
+        emit(
+            "info",
+            f"model: {provider.name} / {provider.model}"
+            if provider
+            else "model: none -- breadth-first crawl, no flows and no summary",
+        )
+        if body.intent and not provider:
+            # Better than silently ignoring it: the crawler has nowhere to put
+            # an intent, and a user who typed one deserves to know that.
+            emit("warn", f"intent ignored without a model: {body.intent!r}")
+
+        # Incremental, because a map that only appears when the crawl finishes
+        # cannot be watched, and watching it is the demo. `store.save` is
+        # idempotent, so re-saving an unchanged map writes nothing.
+        seen = 0
+
+        def checkpoint(world) -> None:
+            nonlocal seen
+            store.save(world, run_id, db)
+            if len(world.states) > seen:
+                seen = len(world.states)
+                emit("info", f"  crawled {seen} state(s)")
 
         try:
             with sync_playwright() as pw:
                 browser = pw.chromium.launch()
                 page = browser.new_page()
-                result = orchestrator.run(
-                    page,
-                    target_url,
-                    provider,
-                    intent=body.intent,
-                    budget=orchestrator.Budget(
-                        max_waves=body.max_waves,
-                        max_ants=body.max_ants,
-                        ant_actions=body.ant_actions,
-                    ),
-                    credentials=Credentials.from_env(),
-                    on_event=emit,
-                    run_id=run_id,
-                )
+                if provider is None:
+                    result = _crawl_only(page, target_url, emit, checkpoint)
+                else:
+                    result = orchestrator.run(
+                        page,
+                        target_url,
+                        provider,
+                        intent=body.intent,
+                        budget=orchestrator.Budget(
+                            max_waves=body.max_waves,
+                            max_ants=body.max_ants,
+                            ant_actions=body.ant_actions,
+                        ),
+                        credentials=Credentials.from_env(),
+                        on_event=emit,
+                        run_id=run_id,
+                    )
                 browser.close()
 
             rows = store.save(result.world, run_id, db)
@@ -118,7 +171,9 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
                 "decision",
                 f"map saved: {len(result.world.states)} states, "
                 f"{sum(len(t) for t in result.world.transitions.values())} "
-                f"transitions ({rows} rows)",
+                # "new": the crawl checkpoints as it goes, so a healthy run
+                # ends at 0 here. Bare "(0 rows)" reads like a failed write.
+                f"transitions ({rows} new rows)",
             )
             for flow in result.flows:
                 emit("decision", f"flow: {flow.get('name')} -- {flow.get('why', '')}")
@@ -126,8 +181,20 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
                 emit("warn", f"gap: {gap}")
 
             if run:
-                run.status = "passed"
-                run.summary = result.summary or f"stopped: {result.stopped}"
+                # Not "passed": a map exists, but no flows were named and no
+                # intent was honoured. Green would claim more than happened,
+                # and red would hide a map that is genuinely there. `degraded`
+                # is unknown to STATUS_TONE and renders grey, which is the
+                # point -- see SessionView.tsx.
+                run.status = "passed" if provider else "degraded"
+                run.summary = result.summary or (
+                    f"{len(result.world.states)} states, "
+                    f"{sum(len(t) for t in result.world.transitions.values())} "
+                    f"transitions -- crawled without a model. Set "
+                    f"ANTHROPIC_API_KEY for flows and a summary."
+                    if provider is None
+                    else f"stopped: {result.stopped}"
+                )
 
         except Exception as exc:
             # An exploration that dies half way still discovered something, but
