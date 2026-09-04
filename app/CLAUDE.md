@@ -233,6 +233,18 @@ Nothing else changes — not the canvas, not the backend.
 
 ## Gotchas worth not rediscovering
 
+**A page with no `<form>` element gets no form actions at all.** `forms.form_of`
+asks the DOM for a button's `<form>` ancestor and returns None when there is
+none, so `submit[valid|empty|invalid]` are never synthesised and the crawler
+just clicks the bare button. Measured against
+`practicetestautomation.com/practice-test-login/`, whose login is two inputs and
+a button with `document.querySelectorAll('form').length === 0` — the observer
+sees `textbox:Username` and `textbox:Password` and the crawl still never types
+into them. The ancestry test earns its keep (`forms.py:124` documents the
+garbage it prevents), so this is a live trade-off rather than a bug to squash
+blind: the fix has to scope fields to a button without a `<form>` and without
+re-manufacturing `submit[valid]:button:Sign in with Google`.
+
 **Widget config lives in local state**, not on the xyflow node's `data`.
 Mutating `data` is a lint error and causes stale renders; `WidgetNode` holds
 state and persists it 400ms after you stop typing.
