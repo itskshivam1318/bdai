@@ -223,14 +223,25 @@ other button and no page landmark. `practicetestautomation` goes from 10 states
 resurrect the bug the `<form>` test was added for: `practicesoftwaretesting`
 gains no actions, and `Sign in with Google` stays a plain `button:`.
 
-**Mode 2 is still open**, and is the next thing to look at. `fill_form` keys on
-a field's accessible name, and `testingchallenges` offers four textboxes with
-none, so there is nothing to key on. The honest options are to type a generic
-value into every unnamed field in scope (cheap, and it submits junk to whatever
-is on the other side) or to let the synthesiser name them from surrounding text
-(a model seam, and the self-correcting-when-wrong shape that
-`docs/product/decisions.md` 17:00 says is fine to give a model). Neither is
-started.
+**Mode 2 fixed 2026-09-04 21:20** (`forms._next_unnamed`), and the cause was
+not the one written above. The fields being unnamed was real but incidental;
+what actually returned zero was that `fill_form` resolved *every* unnamed field
+to `get_by_role(role).first` -- the same element each time -- and on
+`testingchallenges` that element is `<input readonly value="Norway">`. Three of
+its four textboxes are read-only. So each attempt spent the whole `fill`
+timeout on a field that can never accept input, the one real field
+(`#firstname`) was never reached, and the form was declared unfillable.
+
+Neither option this note proposed was needed. No generic-value scattergun, no
+model naming fields from context: unnamed fields are now consumed in document
+order, and a field that is not editable is skipped rather than waited on.
+`fill_form` goes 0 -> 1 there; saucedemo and practicetestautomation stay at 2.
+
+The lesson is the one this file keeps recording: the symptom named the
+*observation* (fields have no name) and the cause was in the *resolution*
+(`.first`, four times, on a read-only box). Guarded by `FORM FILL` in
+`explorer/probe.py` -- four fixtures, including the read-only and disabled
+shapes.
 
 Both end the same way: the single highest-value edge is dropped, the budget then
 drains into nav links, and the run *looks* like a shallow-target problem. It is

@@ -357,6 +357,57 @@ def fields_of(observation: Observation) -> tuple[tuple[str, str], ...]:
     )
 
 
+def _next_unnamed(root, role: str, cursor: dict[str, int]):
+    """The next fillable field of `role` that carries no accessible name.
+
+    **Two bugs, one function.** `fill_form` used to resolve every unnamed field
+    to `get_by_role(role).first`, which is the same element every time: N
+    unnamed fields meant one field typed into N times, and the others never
+    touched. And `.first` is frequently not fillable, because a read-only field
+    is still a textbox to the accessibility tree.
+
+    Measured on `testingchallenges.thetestingmap.org`, whose form has four
+    textboxes with no accessible name, three of them
+    `<input readonly value="Norway">` and one real `#firstname`. `.first` was a
+    read-only one, so every attempt spent the full `fill` timeout and returned
+    False, `submit[valid]` was refused, and the crawler could only ever click
+    Submit on an empty form. The map called it a shallow app.
+
+    **Why position, when this codebase refuses positional locators.**
+    `available_actions` argues at length that `menuitem#2` is the brittle
+    locator the whole design avoids -- and that is right, for an *action*,
+    because an action becomes a test that has to survive drift. This is not an
+    action. It is one step inside performing one, re-derived against the live
+    page every single time it runs, and never written into a spec. Nothing here
+    is recorded and replayed, so there is nothing for drift to break.
+
+    An unnamed field also has, by definition, nothing else to match on. The
+    honest options were position or nothing, and nothing is what we had.
+    """
+    candidates = root.get_by_role(role)
+    index = cursor.get(role, 0)
+    try:
+        total = candidates.count()
+    except Exception:
+        return None
+
+    while index < total:
+        field = candidates.nth(index)
+        index += 1
+        try:
+            # A read-only or disabled field is not an input the form takes.
+            # Checking costs milliseconds; discovering it through `fill` costs
+            # the whole timeout, per field, and there may be many.
+            if field.is_editable(timeout=500):
+                cursor[role] = index
+                return field
+        except Exception:
+            continue
+
+    cursor[role] = index
+    return None
+
+
 def fill_form(
     page: Page,
     observation: Observation,
@@ -385,16 +436,23 @@ def fill_form(
     """
     filled = 0
     root = scope if scope is not None else page
+    # Where the next unnamed field of each role will be looked for. Unnamed
+    # fields are the one case with nothing to match on, so they are consumed in
+    # document order -- see `_next_unnamed`.
+    cursor: dict[str, int] = {}
 
     for element in observation.interactive:
         if element.role not in FIELD_ROLES:
             continue
         try:
-            field = (
-                root.get_by_role(element.role, name=element.name, exact=True)
-                if element.name
-                else root.get_by_role(element.role)
-            ).first
+            if element.name:
+                field = root.get_by_role(
+                    element.role, name=element.name, exact=True
+                ).first
+            else:
+                field = _next_unnamed(root, element.role, cursor)
+                if field is None:
+                    continue
             value = (overrides or {}).get(
                 element.name, value_for(element.role, element.name, credentials)
             )

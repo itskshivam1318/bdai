@@ -278,6 +278,21 @@ Nothing else changes — not the canvas, not the backend.
 
 ## Gotchas worth not rediscovering
 
+**Unnamed form fields are told apart by position, and read-only ones are
+skipped.** `fill_form` matches a field by its accessible name; with no name
+there is nothing to match on, so `_next_unnamed` walks the role's fields in
+document order and takes the next *editable* one. Both halves are load-bearing:
+without the cursor, N unnamed fields all resolve to `.first` and one field gets
+typed into N times; without the editability check, a read-only field burns the
+full fill timeout and the form is declared unfillable. Measured on
+`testingchallenges.thetestingmap.org`, whose form is three
+`<input readonly>` and one real field, all unnamed.
+
+Position is used here and refused in `available_actions` for a reason that is
+not inconsistency: an *action* becomes a recorded test that must survive drift,
+while this is one step inside performing an action, re-derived against the live
+page on every run and never written into a spec.
+
 **A button knows which fields it submits, `<form>` or not.** `forms.form_of`
 prefers a real `<form>` ancestor -- an author's declaration beats anything
 inferred -- and falls back to `_implicit_scope`: climb from the button, stop at

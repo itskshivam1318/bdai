@@ -351,6 +351,78 @@ def form_scope(page) -> bool:
     return passed
 
 
+# What `fill_form` types, and where. Each row is (label, html, expected values
+# left in the form's fields, in document order). `None` means "left alone".
+#
+# A form is only reachable if something can be typed into it: `forms.perform`
+# returns False when nothing filled, and the crawler then refuses
+# `submit[valid]` permanently. Every row here is a shape that produced zero.
+FILL_CASES = (
+    (
+        "a named field is filled by its name",
+        "<form><label>Email <input name=e></label>"
+        "<button>Go</button></form>",
+        ("aivar-explorer@example.com",),
+    ),
+    (
+        "two unnamed fields are two fields, not one twice",
+        "<form><input><input><button>Go</button></form>",
+        ("AIVAR test input", "AIVAR test input"),
+    ),
+    (
+        "a read-only field is not an input the form takes",
+        "<form><input readonly value='Norway'><input>"
+        "<button>Go</button></form>",
+        ("Norway", "AIVAR test input"),
+        # testingchallenges.thetestingmap.org exactly: three read-only
+        # textboxes and one real field, all unnamed. `.first` was read-only, so
+        # every fill spent its whole timeout and the form was declared
+        # unfillable -- the crawler could only ever submit it empty.
+    ),
+    (
+        "a disabled field is skipped, and the next one still fills",
+        "<form><input disabled><input><button>Go</button></form>",
+        (None, "AIVAR test input"),
+    ),
+)
+
+
+def form_fill(page) -> bool:
+    """Can the crawler type into this form at all?
+
+    The count matters as much as the values: `forms.perform` gates
+    `submit[valid]` on `fill_form` returning non-zero, so a form that fills
+    nothing is a form the crawler can only ever submit empty.
+    """
+    print("FORM FILL   what gets typed, and into which field")
+    passed = True
+    credentials = forms.Credentials("aivar-explorer@example.com", "Test-Password-1")
+
+    for label, html, expected in FILL_CASES:
+        page.set_content(html)
+        observer = Observer(page)
+        observer.start_window()
+        observation = observer.observe(settle_ms=50)
+        forms.fill_form(page, observation, credentials,
+                        forms.form_of(page, "button:Go"))
+
+        actual = tuple(
+            page.locator("form input").nth(i).input_value()
+            for i in range(page.locator("form input").count())
+        )
+        want = tuple(v if v is not None else "" for v in expected)
+        ok = actual == want
+        passed &= ok
+        print(f"  {'PASS' if ok else 'FAIL'}  {label:<52} "
+              f"{len([a for a in actual if a])}/{len(actual)} non-empty")
+        if not ok:
+            print(f"        expected {want}")
+            print(f"        got      {actual}")
+
+    print()
+    return passed
+
+
 def main(base_url: str) -> int:
     with sync_playwright() as pw:
         browser = pw.chromium.launch()
@@ -360,6 +432,7 @@ def main(base_url: str) -> int:
         projection_ok = projection_grid(page)
         projection_ok &= frontier_noise(page)
         projection_ok &= form_scope(page)
+        projection_ok &= form_fill(page)
 
         try:
             page.goto(base_url, timeout=3000)
