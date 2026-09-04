@@ -201,7 +201,13 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
             )
 
             if run:
-                run.status = "failed" if tally[runner.DEFECT] else "passed"
+                # An escalation is not a green run. It means the locator healed AND
+                # the outcome changed -- both variables moved at once, so the failure
+                # is unattributable and a human has to look. Reporting that as
+                # "passed" while the same run emits red escalate events puts two
+                # contradictory claims side by side in the console.
+                needs_attention = tally[runner.DEFECT] + tally[runner.ESCALATE]
+                run.status = "failed" if needs_attention else "passed"
                 run.summary = result.summary or f"stopped: {result.stopped}"
 
         except Exception as exc:
