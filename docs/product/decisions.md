@@ -422,3 +422,42 @@ and the machinery already exists (`make worktree name=x`), but it splits
 Worth revisiting after the hackathon.
 
 **Who:** shivam + Claude.
+
+---
+
+## 2026-09-05 02:00 — Correction: what actually makes a worktree per session expensive
+
+The 01:45 entry, "Commits are checked against the index, not against your disk",
+closes with a reason for deferring a worktree per session that is **wrong**. An
+append-only log carrying a wrong reason is worse than one carrying none, because
+the next reader believes it.
+
+**What it said:** worktrees would split `app.db`, so "the crawls and chat threads
+this demo is built on would not follow."
+
+**What is actually true:** `app/api/app/config.py` is a pydantic `BaseSettings`,
+so every field takes an environment override. Both of the ones that matter do:
+
+    DATABASE_URL=…  ARTIFACTS_DIR=…  →  database_url  = sqlite:////tmp/x.db
+                                        artifacts_dir = /tmp/shared-artifacts
+
+A second worktree can point at this database and these artifacts with two
+variables, and the data follows fine. The objection was soft and stated as if it
+were hard.
+
+**The real cost, which the original entry did not name:** two live stacks
+writing one SQLite file. `store.save` is called after *every edge* -- that is
+deliberate, it is what makes a crawl watchable -- so two concurrent crawls
+contend on the same file and meet `database is locked`. Sharing the database is
+what makes worktrees affordable and is also exactly what makes them risky; the
+two cannot be had together without moving off SQLite or serialising crawls.
+
+**The conclusion is unchanged: defer.** But it is deferred because concurrent
+writers contend, not because the data cannot be shared. Anyone revisiting this
+should start from that, and should note the alternative it implies -- separate
+worktrees with *separate* databases are cheap and safe, and cost only that a run
+recorded in one is not visible in the other.
+
+**Evidence:** the two-variable override above, run against `app.config` directly.
+
+**Who:** shivam + Claude.
