@@ -41,10 +41,20 @@ direction — Crawljax's twenty-year history rather than first principles:
   failure rate as the reason.
 - **Behavioral partition over syntactic explosion.** Transcript 02's worked
   example — `Dashboard[17 projects]` ≡ `Dashboard[18]`, but `Dashboard[0]` splits
-  when its available actions differ — is what `normalize()` already produces,
-  because it treats roles and accessible names as identity and discards text
-  values. The gap is narrower than transcript 02 implies: it opens only where
-  behavior differs but roles and names do not.
+  when its available actions differ — is now what `normalize()` produces.
+
+  **An earlier version of this line claimed it already did, and that was wrong.**
+  Measured 2026-09-04: 17 rows and 18 rows produced *different* state keys, and
+  so did two different strings typed into the same field, and so did moving
+  focus between two fields. `canonical_value` collapsed `"Project 17"` and
+  `"Project 18"` per line, but seventeen identical lines and eighteen identical
+  lines still hash differently — and `explain()` reported that difference as an
+  empty diff, because as *sets* the two are equal.
+
+  Transcript 02 was right that the layer was missing. It was wrong about the
+  size: the fix was four projections inside `normalize()` (`statekey.py`), not a
+  new agent emitting `StateCandidate` objects with relevance scores. The seven
+  cases are now a pass/fail grid in `probe.py` section 0, which needs no server.
 
 ## Where to be careful
 

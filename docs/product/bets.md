@@ -90,3 +90,46 @@ working", not "you changed your own test".
 **Timebox:** 10 minutes, once beat 5 works at all.
 
 **Decision:** PENDING
+
+---
+
+## BET-005 — Do we have a target rich enough for the crawler to say anything?
+
+**Hypothesis:** a public demo app with real multi-step flows (log in → list →
+create → detail → error) yields a World Map whose transitions read as a
+meaningful test plan, and whose `gaps()` name error states a QA engineer would
+actually write.
+
+**Why it matters:** measured 2026-09-04, the crawler maps our own SUT in full —
+**3 states, 18 transitions, frontier empty** — and the result is correct and
+useless. The SUT is one page served three ways; it was built for the *healing*
+demo (locators drift across `?v=1|2|3`) and healing and exploration want
+opposite fixtures. Healing needs one page that changes; exploration needs many
+pages that connect. So the SUT cannot answer BET-003, and every mechanism above
+the crawler — gap ranking, flow naming, test generation — currently has nothing
+to bite on. This is now the binding constraint on the demo, not the code.
+
+**Fastest test:** point `python -m agents.explorer.crawler <url>` at each
+candidate for 3 minutes and read `world.summary()`.
+
+Candidates, in order:
+1. **Conduit / RealWorld** (`demo.realworld.io`) — Medium clone. Register, log
+   in, publish, comment, favourite, follow. Self-hostable if the demo is flaky.
+2. **saucedemo.com** — Swag Labs. Small, but `locked_out_user` is a real error
+   state and checkout has real validation, which is what the brief's "not just
+   happy paths" needs.
+3. **OWASP Juice Shop** — richest and self-hostable, but gamified in ways that
+   will waste time.
+
+**Success looks like:** ≥8 states, ≥3 flows of 3+ steps that a human would call
+a user journey, and at least one `nondeterministic()` edge — because that would
+mean the app is rich enough to expose a projection error, which is itself the
+evidence that the refinement loop is worth building.
+
+**Keep the SUT regardless.** It is the healing demo and it works. Two fixtures,
+two jobs.
+
+**Timebox:** 30 minutes. Unblocked — needs no API key and no target from the
+organiser.
+
+**Decision:** PENDING

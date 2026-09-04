@@ -12,7 +12,7 @@ app/
 ├── Makefile            the real one; the root Makefile proxies to it
 ├── api/                backend — FastAPI + SQLModel + SQLite, driven by uv
 │   ├── app/                routers/, models.py, db.py, config.py, main.py
-│   ├── agents/             the pipeline — NOT BUILT YET, see below
+│   ├── agents/explorer/    observe → identify → map → crawl → store. See below
 │   └── smoke_run.py        walking skeleton: browser → drift → heal → evidence
 ├── web/                frontend — Next.js 16 + React 19 + Tailwind v4
 │   ├── app/                layout, page, globals.css
@@ -46,20 +46,87 @@ says how far it has got. Prior art on coverage evaluation — the hardest of the
 four, and 20% of the score — is in `../docs/research/coverage-evaluation.md`;
 read `../docs/research/README.md` first to see whether you need it.
 
-<!-- TODO(shivam): the handoff contract between stages. This is the single
-     highest-leverage design decision in the build, and it belongs to you, not
-     to Claude — everything downstream is shaped by it.
+### The World Map is the spine
 
-     Define what Planner hands Generator, and what Generator hands Healer.
-     Roughly 10 lines. The choice that matters: does the plan carry *selectors*
-     (concrete, brittle, but the Generator's job gets trivial), or *intent*
-     (`the primary action on the login form` — the Generator resolves it live,
-     and healing becomes re-resolution rather than repair)?
+Decided 2026-09-04 (`../docs/product/decisions.md`). The three sub-agents are
+not a relay passing documents along — they are three operations on one
+behavioural model, `agents/explorer/worldmap.py`:
 
-     `../docs/product/thesis.md` argues hard for intent, but is stamped
-     SUPERSEDED — read it as an argument, not a decision. Write the answer here
-     as a small schema or a pair of dataclass signatures, then it is settled for
-     every agent and every packet after it. -->
+| Sub-agent | Operation on the map |
+|---|---|
+| Planner | its transitions **are** the plan; `gaps()` are the missing error states |
+| Generator | a path through the graph compiles to a test |
+| Healer | re-observe, compare state keys, and the failure classifies itself |
+
+Read `agents/explorer/__init__.py` first — it explains the four modules and why
+none of them calls a model. Then `worldmap.py`, which is the contract.
+
+Two entry points, both printing evidence rather than passing silently:
+
+```bash
+uv run python -m agents.explorer.probe     # is the state projection right? (no server needed)
+uv run python -m agents.explorer.crawler <url>   # map an app, print states/transitions/gaps
+```
+
+### The map is persisted, and it is watchable
+
+`agents/explorer/store.py` is the only place the explorer meets the database —
+everything else holds plain dicts, and `frontier()` is called every loop
+iteration, so a query in there would be a query in the hot path.
+
+Three tables, scoped to a **run** rather than a session, so re-crawling after
+the app changes leaves a second map beside the first instead of overwriting it.
+Comparing two runs' maps is the drift story:
+
+| Table | Holds |
+|---|---|
+| `StateObservation` | the raw a11y snapshot + network, verbatim. The primary record; states and transitions are derived from it |
+| `AppState` | one behavioural state, keyed by `state_key` — never by URL |
+| `StateTransition` | one edge, with `mutating` and a pointer to its evidence |
+
+`store.save()` is incremental and idempotent, so `crawl(checkpoint=...)` calls
+it after **every edge** rather than at the end. A map that only appears when the
+crawl finishes cannot be watched, and watching it is the demo. Re-saving an
+unchanged map writes zero rows.
+
+That property is also what a worker pool needs later — several processes writing
+into one run's rows. Nothing in `store.py` changes for that; what it needs is a
+claim on an edge so two workers do not take the same one, which is a column.
+
+### Configuration
+
+All optional; all degrade loudly rather than silently.
+
+```bash
+AIVAR_USERNAME / AIVAR_PASSWORD   # forms.Credentials — without these, any
+                                  # login wall stops the crawl at one state
+ANTHROPIC_API_KEY                 # synth.py. Without it, invalid payloads come
+                                  # from a static mutation table that knows
+                                  # nothing about the app; the crawl prints
+                                  # "PAYLOADS n from fallback" so a degraded
+                                  # run never looks like a good one
+```
+
+<!-- TODO(shivam): the handoff contract is now half-settled, and the half that
+     is settled is the half that was contentious. Selectors vs intent went to
+     intent: a plan step carries an `Element.descriptor` (`button:Sign in`),
+     resolved live by `crawler._locate`, which is the same resolution the
+     Generator and Healer use. Healing is re-resolution, as
+     `../docs/product/thesis.md` argued — but grounded in a state key that was
+     actually observed, rather than in a model's belief.
+
+     What is still yours, and still ~10 lines: given a `Transition`, what makes
+     it worth a test? QA Wolf's rule is that a flow must describe what a user
+     *accomplishes* — it explicitly rejects "Display Search Dropdown". Right now
+     `WorldMap.transitions` contains every edge the crawler walked, including
+     `link:v2 -> v2` and `textbox:Email stays`. Something has to filter that,
+     and the filter decides what the whole test suite looks like.
+
+     Candidate signals, all already recorded on the objects: `mutating` (a
+     POST fired), `self_loop` (it stayed put), whether the destination state is
+     otherwise unreachable, and path length from the entry. A function
+     `is_flow(map, transition) -> bool` in `worldmap.py` settles it for every
+     packet after it. -->
 
 ## Hardcoded on purpose
 
@@ -68,8 +135,14 @@ agent builds on sand:
 
 - `smoke_run.py` drives our own SUT at a fixed URL and a fixed pair of variants.
   It is a skeleton proving the loop, not a general runner.
-- No migrations. `make reset` is the migration tool.
+- No migrations. `make reset` is the migration tool. `db.init_db()` imports
+  `app.models` for a load-bearing reason — `create_all` only builds what has
+  registered itself on the metadata, so without that import it silently creates
+  nothing for any caller that has not already imported the models.
 - The SUT's three variants are hand-written drift, not a real deploy.
+- `artifacts/invalid-payloads.json` is the replay log for `synth.py`: what the
+  model chose to type, keyed by form shape. It makes a crawl reproducible and
+  re-runs free. Delete it to make the agent choose fresh payloads.
 
 If you add another, say so in a comment where it lives and add a line here.
 
