@@ -41,8 +41,12 @@ allocate_ports() {
 #   [project]/node_modules is invalid, it points out of the filesystem root"),
 #   and `npm install` costs about a minute. On APFS, `cp -c` clones
 #   copy-on-write: ~3s for 475MB and no real disk used until a file changes.
+# A worktree checks out the whole repository, and the stack lives one level in
+# at `app/` -- so every path below is `$target/app/...`, never `$target/...`.
+# `REPO_ROOT` is already the app directory (this script sits in `app/scripts/`),
+# which is why the two sides of the node_modules clone look asymmetric.
 prepare_deps() {
-  local target="$1" fresh="$2"
+  local target="$1/app" fresh="$2"
   ( cd "$target/api" && uv sync --python "$PYTHON_VERSION" --quiet )
 
   if [ "$fresh" = "fresh" ]; then
@@ -70,14 +74,14 @@ cmd_new() {
   read -r web_port api_port <<<"$(allocate_ports "$name")"
 
   git -C "$REPO_ROOT" worktree add -b "work/$name" "$target" >/dev/null
-  cat > "$target/.worktree-env" <<ENVEOF
+  cat > "$target/app/.worktree-env" <<ENVEOF
 WORKTREE_NAME=$name
 WEB_PORT=$web_port
 API_PORT=$api_port
 ENVEOF
   # Next.js inlines NEXT_PUBLIC_* into the browser bundle; this is what points
   # the UI at *this* worktree's API rather than whatever owns port 8000.
-  cat > "$target/web/.env.local" <<ENVEOF
+  cat > "$target/app/web/.env.local" <<ENVEOF
 NEXT_PUBLIC_API_BASE=http://localhost:$api_port
 NEXT_PUBLIC_WORKTREE=$name
 ENVEOF
@@ -91,7 +95,7 @@ worktree '$name' ready
   web    http://localhost:$web_port
   api    http://localhost:$api_port
 
-  cd $target && ./scripts/dev.sh
+  cd $target/app && make dev
 INFO
 }
 
@@ -101,9 +105,9 @@ cmd_list() {
     | awk '/^worktree /{ $1=""; sub(/^ /,""); print }' \
     | while read -r dir; do
         local_name=main; local_web=3000; local_api=8000
-        if [ -f "$dir/.worktree-env" ]; then
+        if [ -f "$dir/app/.worktree-env" ]; then
           # shellcheck disable=SC1090
-          . "$dir/.worktree-env"
+          . "$dir/app/.worktree-env"
           local_name="$WORKTREE_NAME"; local_web="$WEB_PORT"; local_api="$API_PORT"
         fi
         branch="$(git -C "$dir" branch --show-current 2>/dev/null || true)"
