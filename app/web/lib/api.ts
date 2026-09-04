@@ -61,6 +61,7 @@ export type CanvasNodeRow = {
 export type ChatMessage = {
   id: number;
   session_id: number | null;
+  thread_id: number | null;
   role: "user" | "assistant";
   content: string;
   node_keys: string;
@@ -68,8 +69,33 @@ export type ChatMessage = {
   created_at: string;
 };
 
-/** A question and the reply it produced. The API writes both or neither. */
-export type ChatTurn = { user: ChatMessage; assistant: ChatMessage };
+/**
+ * One chat window: its own history, its own attached states, its own place on
+ * screen.
+ *
+ * `open` and `minimised` live on the server rather than in the browser so a
+ * reload comes back to the same desk. Closing is not deleting — a closed thread
+ * is still listed, and reopening it restores the conversation.
+ */
+export type ChatThread = {
+  id: number;
+  session_id: number | null;
+  title: string;
+  open: boolean;
+  minimised: boolean;
+  created_at: string;
+};
+
+/**
+ * A question, the reply it produced, and the thread as it now stands. The API
+ * writes the pair or neither; the thread comes along because the first message
+ * names the window.
+ */
+export type ChatTurn = {
+  user: ChatMessage;
+  assistant: ChatMessage;
+  thread: ChatThread;
+};
 
 /** Why one offered action could not be taken, and how often. */
 export type Refusal = { reason: string; count: number };
@@ -196,24 +222,46 @@ export const api = {
   listSessionEvents: (id: number, after = 0) =>
     request<AgentEvent[]>(`/api/sessions/${id}/events?after=${after}`),
 
-  listChat: (sessionId: number) =>
-    request<ChatMessage[]>(`/api/sessions/${sessionId}/chat`),
+  /** Every thread of a session, open and closed. Closed ones fill the reopen list. */
+  listThreads: (sessionId: number) =>
+    request<ChatThread[]>(`/api/sessions/${sessionId}/chat/threads`),
+  createThread: (sessionId: number, title?: string) =>
+    request<ChatThread>(`/api/sessions/${sessionId}/chat/threads`, {
+      method: "POST",
+      body: JSON.stringify({ title: title ?? null }),
+    }),
+  /** Rename, close, reopen, minimise, restore — every window edit is this one. */
+  patchThread: (
+    threadId: number,
+    patch: { title?: string; open?: boolean; minimised?: boolean },
+  ) =>
+    request<ChatThread>(`/api/chat/threads/${threadId}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+  /** Destroys the thread and everything said in it. Closing is the soft one. */
+  deleteThread: (threadId: number) =>
+    request<void>(`/api/chat/threads/${threadId}`, { method: "DELETE" }),
+
+  listChat: (threadId: number) =>
+    request<ChatMessage[]>(`/api/chat/threads/${threadId}/messages`),
   /**
    * Ask about the map. Blocks for as long as the model takes — there is no
    * event stream behind this, the reply *is* the response.
    */
   sendChat: (
-    sessionId: number,
+    threadId: number,
     text: string,
     node_keys: string[],
     run_id: number | null,
   ) =>
-    request<ChatTurn>(`/api/sessions/${sessionId}/chat`, {
+    request<ChatTurn>(`/api/chat/threads/${threadId}/messages`, {
       method: "POST",
       body: JSON.stringify({ text, node_keys, run_id }),
     }),
-  clearChat: (sessionId: number) =>
-    request<void>(`/api/sessions/${sessionId}/chat`, { method: "DELETE" }),
+  /** Empties a thread without closing its window. */
+  clearChat: (threadId: number) =>
+    request<void>(`/api/chat/threads/${threadId}/messages`, { method: "DELETE" }),
 
   listNodes: (sessionId: number) =>
     request<CanvasNodeRow[]>(`/api/canvas/nodes?session_id=${sessionId}`),

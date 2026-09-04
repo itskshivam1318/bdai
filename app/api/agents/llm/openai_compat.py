@@ -123,6 +123,12 @@ class OpenAICompat:
                 for result in exchange.results
             ]
 
+            # A human follow-up is an ordinary user message here -- unlike the
+            # other two providers, chat-completions keeps tool results in their
+            # own `tool` role, so this needs no merging.
+            if exchange.follow_up:
+                messages.append({"role": "user", "content": exchange.follow_up})
+
         return messages
 
     @staticmethod

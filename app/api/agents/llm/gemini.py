@@ -22,7 +22,7 @@ import os
 import time
 import uuid
 
-from . import Tool, ToolCall, Transcript, Turn
+from . import Exchange, Tool, ToolCall, Transcript, Turn
 
 DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 
@@ -70,17 +70,9 @@ class Gemini:
             # transcripts produced by a different provider.
             if exchange.opaque is not None:
                 contents.append(exchange.opaque)
-                if exchange.results:
-                    contents.append({
-                        "role": "user",
-                        "parts": [
-                            {"functionResponse": {
-                                "name": result.name,
-                                "response": {"result": result.content},
-                            }}
-                            for result in exchange.results
-                        ],
-                    })
+                answering = self._answering(exchange)
+                if answering:
+                    contents.append({"role": "user", "parts": answering})
                 continue
 
             parts: list[dict] = []
@@ -93,23 +85,32 @@ class Gemini:
             if parts:
                 contents.append({"role": "model", "parts": parts})
 
-            if exchange.results:
-                contents.append(
-                    {
-                        "role": "user",
-                        "parts": [
-                            {
-                                "functionResponse": {
-                                    "name": result.name,
-                                    "response": {"result": result.content},
-                                }
-                            }
-                            for result in exchange.results
-                        ],
-                    }
-                )
+            answering = self._answering(exchange)
+            if answering:
+                contents.append({"role": "user", "parts": answering})
 
         return contents
+
+    @staticmethod
+    def _answering(exchange: Exchange) -> list[dict]:
+        """The user turn that answers a model turn: results, a follow-up, both.
+
+        One turn rather than two. Gemini merges consecutive user contents
+        silently rather than erroring, so appending them separately would work
+        by accident -- and stop working the day it does not.
+        """
+        parts: list[dict] = [
+            {
+                "functionResponse": {
+                    "name": result.name,
+                    "response": {"result": result.content},
+                }
+            }
+            for result in exchange.results
+        ]
+        if exchange.follow_up:
+            parts.append({"text": exchange.follow_up})
+        return parts
 
     # Gemini accepts a strict subset of JSON Schema and rejects the request --
     # not the field -- when it meets anything else. `additionalProperties` is

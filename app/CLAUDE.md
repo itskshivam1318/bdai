@@ -248,10 +248,17 @@ agent builds on sand:
   real thing is `agents/runner.py`; `agents.probe` has a check named "healing
   refuses a control it cannot justify" whose whole job is to stop that toy
   behaviour coming back. Run `make loop`, not `make smoke`.
-- No migrations. `make reset` is the migration tool. `db.init_db()` imports
-  `app.models` for a load-bearing reason — `create_all` only builds what has
-  registered itself on the metadata, so without that import it silently creates
-  nothing for any caller that has not already imported the models.
+- No migrations, with one narrow exception. `make reset` is still the tool.
+  `db._add_missing_columns()` adds columns `create_all` will never add, because
+  it only creates tables it cannot find — and a column may go on that list only
+  if an existing row is *correct* without it (nullable, or defaulted). Anything
+  needing a value computed from the old row is a real migration, and that is
+  `make reset`. `db.adopt_orphan_chat()` is the companion: it gives messages
+  written before `ChatThread` existed a thread to belong to.
+  `db.init_db()` imports `app.models` for a load-bearing reason — `create_all`
+  only builds what has registered itself on the metadata, so without that import
+  it silently creates nothing for any caller that has not already imported the
+  models.
 - The SUT's three variants are hand-written drift, not a real deploy.
 - `artifacts/invalid-payloads.json` is the replay log for `synth.py`: what the
   model chose to type, keyed by form shape. It makes a crawl reproducible and

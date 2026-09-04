@@ -31,7 +31,7 @@ from .explorer import forms
 from .explorer.forms import Credentials
 from .explorer.observer import Observer
 from .explorer.worldmap import WorldMap
-from .llm import ToolCall, Turn
+from .llm import Exchange, ToolCall, ToolResult, Transcript, Turn
 from .orchestrator import Budget, run
 
 # The Makefile reads WEB_PORT from `.worktree-env` so several stacks can run at
@@ -936,8 +936,123 @@ def main() -> int:
         "a tool requires a property it does not declare",
     )
 
+    # 8. The console's chat is the one caller with a *person* in the loop, and
+    # the only one whose transcript has to alternate user/assistant turns. It
+    # used to render its whole history into a single user message; these checks
+    # are what stops that regressing quietly, since a stateless chat still
+    # answers -- just without remembering anything you said.
+    print()
+    ok &= _chat_transcript_checks()
+
     print()
     return 0 if ok else 1
+
+
+def _chat_transcript_checks() -> bool:
+    """Does a chat thread reach the providers as a real conversation?
+
+    Imported inside the function on purpose: `app.routers.chat` imports
+    `agents.llm`, and doing this at module scope would make the agent layer
+    depend on the API layer that depends on it.
+    """
+    from app.models import ChatMessage  # noqa: PLC0415 -- see docstring
+    from app.routers.chat import _build_transcript  # noqa: PLC0415
+
+    from .llm.claude import Claude
+    from .llm.openai_compat import OpenAICompat
+
+    def message(id: int, role: str, content: str, keys: str = "[]") -> ChatMessage:
+        return ChatMessage(id=id, role=role, content=content, node_keys=keys, run_id=1)
+
+    def claude_roles(transcript) -> list[str]:
+        serialise = Claude.__dict__["_messages"]
+        return [m["role"] for m in serialise(object.__new__(Claude), transcript)]
+
+    def alternates(roles: list[str]) -> bool:
+        return all(a != b for a, b in zip(roles, roles[1:]))
+
+    ok = True
+
+    thread = [
+        message(1, "user", "why did sign-in split?", '["abc12345"]'),
+        message(2, "assistant", "the abstraction split them"),
+        message(3, "user", "which one has the password field?"),
+        message(4, "assistant", "the second"),
+    ]
+    live = _build_transcript("http://x", None, [], [], {}, thread, "and untested?", [])
+
+    ok &= check(
+        "a chat thread becomes turns, not one prompt",
+        len(live.exchanges) == 2 and all(e.follow_up for e in live.exchanges[:-1]),
+        f"{len(live.exchanges)} exchange(s) for a four-message thread",
+    )
+    ok &= check(
+        "the transcript alternates user and assistant",
+        alternates(claude_roles(live)) and claude_roles(live)[-1] == "user",
+        f"roles were {claude_roles(live)}",
+    )
+    ok &= check(
+        "the live question is the last turn, not buried in the first",
+        "and untested?" in live.exchanges[-1].follow_up
+        and "and untested?" not in live.prompt,
+    )
+    ok &= check(
+        "an older question keeps its attachment names, not its rows",
+        "[attached: abc12345]" in live.prompt and "edges leaving" not in live.prompt,
+    )
+    openai_roles = [
+        m["role"]
+        for m in OpenAICompat.__dict__["_messages"](
+            object.__new__(OpenAICompat), "sys", live
+        )
+    ]
+    ok &= check(
+        "the same transcript alternates for chat-completions too",
+        alternates(openai_roles) and openai_roles[0] == "system",
+        f"roles were {openai_roles}",
+    )
+
+    # Two questions in a row is what a deleted reply leaves behind, and what a
+    # thread adopted from before threads existed can look like. Every provider
+    # rejects consecutive user messages, so the rows cannot be trusted as-is.
+    torn = [
+        message(1, "user", "first"),
+        message(2, "user", "second"),
+        message(3, "assistant", "answer"),
+    ]
+    patched = _build_transcript("http://x", None, [], [], {}, torn, "third", [])
+    ok &= check(
+        "a torn thread still alternates, and loses no question",
+        alternates(claude_roles(patched))
+        and "first" in patched.prompt
+        and "second" in patched.prompt,
+        f"roles were {claude_roles(patched)}",
+    )
+
+    # The whole reason `follow_up` was added to `Exchange` rather than
+    # `Transcript` being widened: an ant's round must serialise exactly as it
+    # did before, with tool results and nothing else in the answering turn.
+    ant = Transcript(
+        prompt="go",
+        exchanges=[
+            Exchange(
+                text="thinking",
+                calls=(ToolCall("1", "look", {}),),
+                results=(ToolResult("1", "look", "saw a page"),),
+            )
+        ],
+    )
+    blocks = [
+        c["type"]
+        for c in Claude.__dict__["_messages"](object.__new__(Claude), ant)[-1]["content"]
+    ]
+    ok &= check(
+        "an ant's transcript is untouched by the chat's seam",
+        blocks == ["tool_result"],
+        f"answering turn held {blocks}",
+    )
+    return ok
+
 
 
 if __name__ == "__main__":

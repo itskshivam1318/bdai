@@ -1,27 +1,37 @@
-"""Ask the map a question, with states attached from the canvas.
+"""Chat windows beside the map: threads, and a real multi-turn conversation.
 
-    GET  /api/sessions/{id}/chat
-    POST /api/sessions/{id}/chat   {"text": "...", "node_keys": [...], "run_id": 3}
+    GET    /api/sessions/{id}/chat/threads      list the windows
+    POST   /api/sessions/{id}/chat/threads      open a new one
+    GET    /api/chat/threads/{tid}/messages     one thread's history
+    POST   /api/chat/threads/{tid}/messages     ask, and answer
+    PATCH  /api/chat/threads/{tid}              rename, close, minimise
+    DELETE /api/chat/threads/{tid}              destroy it and its messages
 
-**Why this is not the intent box.** The bar at the bottom of the console used to
-write `Intent: <text>` onto the run timeline and stop -- nothing read it back and
-nothing replied, so a control shaped exactly like a chat did not chat. This is
-the other half: the states the user selected on the map become context, and a
-model answers about them.
+**Why threads.** One question is rarely one subject. "Why did sign-in split in
+two" and "what has no coverage" are separate investigations, and running them
+down a single transcript makes each the other's noise. A window per subject is
+also the only way to keep two different *selections* alive at once -- each
+thread carries its own attached states.
+
+**Why this is a real conversation now.** It used to render the whole thread into
+one user message and send a single stateless completion: the model saw
+`Them: ... You: ...` as prose inside its own opening prompt, not as turns it had
+taken. `Exchange.follow_up` in `agents/llm` closed that -- an ant's round ends
+with tool results, a chat's round ends with a follow-up question, and both are
+"the user turn that answers the model". So the transcript now serialises to
+genuinely alternating messages, on all three providers.
+
+**What each turn carries.** The map index and the *full* detail of the attached
+states ride on the **current** question only; older questions keep just the
+names of what was attached to them. This is how a chat with attachments actually
+behaves -- you do not re-send yesterday's document -- and it is why the thread
+got cheaper rather than more expensive when it became multi-turn. What the model
+knew about an old state is already in its own reply, which is in the transcript.
 
 **Why the context is assembled here rather than by a tool call.** The model gets
-one shot and no tools. Everything it could ask for -- the map, the attached
-states in full, the thread -- is small enough to hand over up front, and a
-read-only question does not need a loop that could decide to crawl something.
+no tools. Everything it could ask for is small enough to hand over up front, and
+a read-only question does not need a loop that could decide to crawl something.
 `agents/orchestrator.py` is where tool-calling belongs; this is a reader.
-
-**Why the whole thread is rebuilt into `Transcript.prompt` each time.** The
-neutral `Transcript` in `agents/llm` models an *agent* loop -- one opening prompt
-followed by exchanges of assistant turn plus tool results -- and has nowhere to
-put a second user message. Widening that dataclass to carry chat turns would
-change a contract the ants depend on, to serve a surface with no tools. Rendering
-the thread into the prompt costs a few hundred tokens and touches nothing the
-colony uses.
 """
 
 from __future__ import annotations
@@ -33,18 +43,38 @@ from pydantic import BaseModel
 from sqlmodel import Session, select
 
 from agents.ant import instructions
-from agents.llm import Transcript, load
+from agents.llm import Exchange, Transcript, load
 from agents.suite import verdicts_by_state
 
 from ..db import get_session
-from ..models import AppState, ChatMessage, Run, StateTransition, TestSession
+from ..models import AppState, ChatMessage, ChatThread, Run, StateTransition, TestSession
 
-router = APIRouter(prefix="/api/sessions", tags=["chat"])
+router = APIRouter(tags=["chat"])
 
-# The thread is replayed in full on every turn, so it needs a bound. Twenty
-# messages is roughly ten exchanges -- past that a question is almost always
-# about something recent, and the map itself is re-sent every time anyway.
+# How many past messages are replayed. Twenty is roughly ten exchanges -- past
+# that a question is almost always about something recent. Lower than it could
+# be on purpose: every turn also re-sends the map, and the map is the big part.
 HISTORY_LIMIT = 20
+
+# A window's name is the first thing asked in it, truncated. Long enough to tell
+# two investigations apart in a title bar, short enough not to wrap.
+TITLE_CHARS = 42
+
+
+class ThreadCreate(BaseModel):
+    title: str | None = None
+
+
+class ThreadPatch(BaseModel):
+    """Every field optional: this is three different edits through one route.
+
+    `open` and `minimised` are window state and are written on every collapse
+    and close, so they must not require the client to know the title.
+    """
+
+    title: str | None = None
+    open: bool | None = None
+    minimised: bool | None = None
 
 
 class ChatRequest(BaseModel):
@@ -62,11 +92,18 @@ class ChatTurn(BaseModel):
 
     Both are returned because both are written in one transaction -- see
     `send()` for why the user's message is not persisted before the model
-    answers.
+    answers. `thread` comes back too because the first message of a thread
+    renames it, and the title bar should not need a second request to find out.
     """
 
     user: ChatMessage
     assistant: ChatMessage
+    thread: ChatThread
+
+
+# --------------------------------------------------------------------------
+# Rendering the map into a prompt
+# --------------------------------------------------------------------------
 
 
 def _loads(raw: str | None, fallback):
@@ -135,26 +172,51 @@ def _attached_block(
         lines.append("edges arriving")
         for edge in arriving:
             source = by_key.get(edge.from_key)
-            origin = (
-                source.label or source.title if source else edge.from_key[:8]
-            )
+            origin = source.label or source.title if source else edge.from_key[:8]
             lines.append(f"  - {edge.action} from {origin}")
 
     return "\n".join(lines)
 
 
-def _build_prompt(
-    target_url: str,
+def _name_of(key: str, by_key: dict) -> str:
+    row = by_key.get(key)
+    return (row.label or row.title or row.url) if row else key[:8]
+
+
+def _past_question(row: ChatMessage, by_key: dict) -> str:
+    """An older question: what it asked, and the names of what it asked about.
+
+    Names, not blocks. The full detail of those states was in the transcript
+    when the question was answered, and the answer that followed is still here
+    -- re-sending the rows would pay for the same context once per turn and
+    still be the *current* rows, not the ones that answer was based on.
+    """
+    keys = _loads(row.node_keys, [])
+    if not keys:
+        return row.content
+    names = ", ".join(_name_of(k, by_key) for k in keys)
+    return f"[attached: {names}]\n\n{row.content}"
+
+
+def _current_question(
+    question: str,
+    attached_keys: list[str],
     run: Run | None,
     states: list[AppState],
     edges: list[StateTransition],
     verdicts: dict,
-    attached_keys: list[str],
-    history: list[ChatMessage],
-    question: str,
+    by_key: dict,
+    opening: bool,
+    map_run_changed: bool,
 ) -> str:
-    by_key = {s.key: s for s in states}
-    parts = [f"## Target\n\n{target_url}"]
+    """The turn being asked now: the map, the attachments in full, the question.
+
+    `opening` marks the first message of a thread, which carries the target too.
+    Everything else here rides on the latest turn rather than the first because
+    the map is *live* -- a crawl can finish while the thread is open, and a
+    briefing pinned to turn one would answer turn six from a stale graph.
+    """
+    parts: list[str] = []
 
     if run is None or not states:
         parts.append(
@@ -163,8 +225,18 @@ def _build_prompt(
             "application contains."
         )
     else:
+        heading = f"## Map (run {run.id}, status {run.status})"
+        if map_run_changed and not opening:
+            # Silence here would be a contradiction the model has to resolve on
+            # its own: the state names it used three turns ago belong to a graph
+            # that is no longer the one in front of it.
+            heading += (
+                "\n\nThis is a **different run** from the one earlier in this "
+                "conversation -- the application was re-crawled, so states named "
+                "earlier may not exist on this map."
+            )
         parts.append(
-            f"## Map (run {run.id}, status {run.status})\n\n"
+            f"{heading}\n\n"
             f"{len(states)} state(s), {len(edges)} transition(s)\n\n"
             + "\n".join(_state_line(s, verdicts.get(s.key)) for s in states)
         )
@@ -198,19 +270,203 @@ def _build_prompt(
             "## Attached states\n\nNone. The question is about the map as a whole."
         )
 
-    if history:
-        parts.append(
-            "## Conversation so far\n\n"
-            + "\n\n".join(
-                f"{'Them' if m.role == 'user' else 'You'}: {m.content}"
-                for m in history
-            )
-        )
-
     parts.append(f"## Their question\n\n{question}")
     return "\n\n".join(parts)
 
 
+def _build_transcript(
+    target_url: str,
+    run: Run | None,
+    states: list[AppState],
+    edges: list[StateTransition],
+    verdicts: dict,
+    history: list[ChatMessage],
+    question: str,
+    node_keys: list[str],
+) -> Transcript:
+    """History as alternating turns, with the live context on the last one.
+
+    Roles must strictly alternate for every provider, and the rows cannot be
+    trusted to: a deleted message or a thread adopted from the pre-thread world
+    can leave two questions in a row. Same-role runs are merged rather than
+    dropped -- losing a question the person actually asked is the worse failure.
+    """
+    by_key = {s.key: s for s in states}
+    map_run_changed = any(
+        m.run_id is not None and run is not None and m.run_id != run.id
+        for m in history
+    )
+
+    turns: list[tuple[str, str]] = [
+        (
+            m.role,
+            m.content if m.role == "assistant" else _past_question(m, by_key),
+        )
+        for m in history
+    ]
+    turns.append(
+        (
+            "user",
+            _current_question(
+                question=question,
+                attached_keys=node_keys,
+                run=run,
+                states=states,
+                edges=edges,
+                verdicts=verdicts,
+                by_key=by_key,
+                opening=not history,
+                map_run_changed=map_run_changed,
+            ),
+        )
+    )
+
+    merged: list[tuple[str, str]] = []
+    for role, text in turns:
+        if merged and merged[-1][0] == role:
+            merged[-1] = (role, f"{merged[-1][1]}\n\n{text}")
+        else:
+            merged.append((role, text))
+
+    # The target heads the opening message because it is the one fact that is
+    # true of every turn and never changes.
+    header = f"## Target\n\n{target_url}\n\n"
+    if merged[0][0] != "user":  # defensive: a thread whose first row is a reply
+        merged.insert(0, ("user", "(the opening question is no longer on record)"))
+    prompt = header + merged[0][1]
+
+    exchanges: list[Exchange] = []
+    for role, text in merged[1:]:
+        if role == "assistant":
+            exchanges.append(Exchange(text=text))
+        else:
+            # A user turn answers the assistant turn before it. There is always
+            # one, because the merge above guarantees alternation from index 1.
+            last = exchanges[-1]
+            exchanges[-1] = Exchange(
+                text=last.text,
+                calls=last.calls,
+                results=last.results,
+                opaque=last.opaque,
+                follow_up=text,
+            )
+
+    return Transcript(prompt=prompt, exchanges=exchanges)
+
+
+# --------------------------------------------------------------------------
+# Threads
+# --------------------------------------------------------------------------
+
+
+def _session_or_404(session_id: int, db: Session) -> TestSession:
+    row = db.get(TestSession, session_id)
+    if row is None:
+        raise HTTPException(404, "session not found")
+    return row
+
+
+def _thread_or_404(thread_id: int, db: Session) -> ChatThread:
+    row = db.get(ChatThread, thread_id)
+    if row is None:
+        raise HTTPException(404, "thread not found")
+    return row
+
+
+@router.get("/api/sessions/{session_id}/chat/threads", response_model=list[ChatThread])
+def list_threads(session_id: int, db: Session = Depends(get_session)):
+    """Every thread, open or closed, oldest first.
+
+    Closed ones are included deliberately: the console needs them to populate
+    the "reopen" list, and a closed window that cannot be found again is a
+    deleted one wearing a friendlier word.
+    """
+    _session_or_404(session_id, db)
+    return db.exec(
+        select(ChatThread)
+        .where(ChatThread.session_id == session_id)
+        .order_by(ChatThread.id)
+    ).all()
+
+
+@router.post(
+    "/api/sessions/{session_id}/chat/threads",
+    response_model=ChatThread,
+    status_code=201,
+)
+def create_thread(
+    session_id: int, body: ThreadCreate | None = None, db: Session = Depends(get_session)
+):
+    _session_or_404(session_id, db)
+    thread = ChatThread(
+        session_id=session_id, title=(body.title if body else None) or "New chat"
+    )
+    db.add(thread)
+    db.commit()
+    db.refresh(thread)
+    return thread
+
+
+@router.patch("/api/chat/threads/{thread_id}", response_model=ChatThread)
+def patch_thread(
+    thread_id: int, body: ThreadPatch, db: Session = Depends(get_session)
+):
+    """Rename, close, reopen, minimise, restore -- all one write."""
+    thread = _thread_or_404(thread_id, db)
+    if body.title is not None:
+        title = body.title.strip()
+        if not title:
+            raise HTTPException(422, "a thread needs a name")
+        thread.title = title
+    if body.open is not None:
+        thread.open = body.open
+    if body.minimised is not None:
+        thread.minimised = body.minimised
+    db.add(thread)
+    db.commit()
+    db.refresh(thread)
+    return thread
+
+
+@router.delete("/api/chat/threads/{thread_id}", status_code=204)
+def delete_thread(thread_id: int, db: Session = Depends(get_session)):
+    """Destroy the thread and everything said in it. Closing is the soft one."""
+    thread = _thread_or_404(thread_id, db)
+    for row in db.exec(
+        select(ChatMessage).where(ChatMessage.thread_id == thread_id)
+    ):
+        db.delete(row)
+    db.delete(thread)
+    db.commit()
+
+
+@router.get(
+    "/api/chat/threads/{thread_id}/messages", response_model=list[ChatMessage]
+)
+def list_messages(thread_id: int, db: Session = Depends(get_session)):
+    """The whole thread, oldest first. Short enough not to need paging."""
+    _thread_or_404(thread_id, db)
+    return db.exec(
+        select(ChatMessage)
+        .where(ChatMessage.thread_id == thread_id)
+        .order_by(ChatMessage.id)
+    ).all()
+
+
+@router.delete("/api/chat/threads/{thread_id}/messages", status_code=204)
+def clear_messages(thread_id: int, db: Session = Depends(get_session)):
+    """Empty a thread without closing the window. The map is untouched."""
+    _thread_or_404(thread_id, db)
+    for row in db.exec(
+        select(ChatMessage).where(ChatMessage.thread_id == thread_id)
+    ):
+        db.delete(row)
+    db.commit()
+
+
+# --------------------------------------------------------------------------
+# Asking
+# --------------------------------------------------------------------------
 
 
 def _latest_run_id(session_id: int, db: Session) -> int | None:
@@ -220,20 +476,8 @@ def _latest_run_id(session_id: int, db: Session) -> int | None:
     return row.id if row else None
 
 
-@router.get("/{session_id}/chat", response_model=list[ChatMessage])
-def list_chat(session_id: int, db: Session = Depends(get_session)):
-    """The whole thread, oldest first. Short enough not to need paging."""
-    if db.get(TestSession, session_id) is None:
-        raise HTTPException(404, "session not found")
-    return db.exec(
-        select(ChatMessage)
-        .where(ChatMessage.session_id == session_id)
-        .order_by(ChatMessage.id)
-    ).all()
-
-
-@router.post("/{session_id}/chat", response_model=ChatTurn)
-def send(session_id: int, body: ChatRequest, db: Session = Depends(get_session)):
+@router.post("/api/chat/threads/{thread_id}/messages", response_model=ChatTurn)
+def send(thread_id: int, body: ChatRequest, db: Session = Depends(get_session)):
     """Ask, and answer.
 
     Deliberately `def`, not `async def`: the provider call is blocking and takes
@@ -247,7 +491,9 @@ def send(session_id: int, body: ChatRequest, db: Session = Depends(get_session))
     failure leaves the thread exactly as it was and the console can put the text
     back in the box.
     """
-    target = db.get(TestSession, session_id)
+    thread = _thread_or_404(thread_id, db)
+    session_id = thread.session_id
+    target = db.get(TestSession, session_id) if session_id is not None else None
     if target is None:
         raise HTTPException(404, "session not found")
 
@@ -265,39 +511,35 @@ def send(session_id: int, body: ChatRequest, db: Session = Depends(get_session))
     edges: list[StateTransition] = []
     verdicts: dict = {}
     if run is not None:
-        states = list(
-            db.exec(select(AppState).where(AppState.run_id == run.id)).all()
-        )
+        states = list(db.exec(select(AppState).where(AppState.run_id == run.id)).all())
         edges = list(
-            db.exec(
-                select(StateTransition).where(StateTransition.run_id == run.id)
-            ).all()
+            db.exec(select(StateTransition).where(StateTransition.run_id == run.id)).all()
         )
         verdicts = verdicts_by_state(run.id, db)
 
     history = list(
         db.exec(
             select(ChatMessage)
-            .where(ChatMessage.session_id == session_id)
+            .where(ChatMessage.thread_id == thread_id)
             .order_by(ChatMessage.id.desc())
             .limit(HISTORY_LIMIT)
         ).all()
     )[::-1]
 
-    prompt = _build_prompt(
+    transcript = _build_transcript(
         target_url=target.target_url,
         run=run,
         states=states,
         edges=edges,
         verdicts=verdicts,
-        attached_keys=body.node_keys,
         history=history,
         question=question,
+        node_keys=body.node_keys,
     )
 
     try:
         provider = load()
-        turn = provider.turn(instructions("analyst"), Transcript(prompt=prompt), [])
+        turn = provider.turn(instructions("analyst"), transcript, [])
     except Exception as exc:  # noqa: BLE001 -- the reason is the whole point
         # 502 rather than 500: the failure is almost always an absent or spent
         # API key, and `str(exc)` already says which. Swallowing it here is the
@@ -312,6 +554,7 @@ def send(session_id: int, body: ChatRequest, db: Session = Depends(get_session))
     keys = json.dumps(body.node_keys)
     user_row = ChatMessage(
         session_id=session_id,
+        thread_id=thread_id,
         role="user",
         content=question,
         node_keys=keys,
@@ -319,6 +562,7 @@ def send(session_id: int, body: ChatRequest, db: Session = Depends(get_session))
     )
     assistant_row = ChatMessage(
         session_id=session_id,
+        thread_id=thread_id,
         role="assistant",
         content=answer,
         node_keys=keys,
@@ -326,19 +570,21 @@ def send(session_id: int, body: ChatRequest, db: Session = Depends(get_session))
     )
     db.add(user_row)
     db.add(assistant_row)
+
+    # A window named after nothing is a window you cannot pick out of four.
+    # Only the first question names it, and only if nobody has renamed it --
+    # a title that follows the latest question is a title that moves while
+    # you are looking for it.
+    if not history and thread.title == "New chat":
+        thread.title = (
+            question[:TITLE_CHARS].rstrip() + "…"
+            if len(question) > TITLE_CHARS
+            else question
+        )
+        db.add(thread)
+
     db.commit()
     db.refresh(user_row)
     db.refresh(assistant_row)
-    return ChatTurn(user=user_row, assistant=assistant_row)
-
-
-@router.delete("/{session_id}/chat", status_code=204)
-def clear_chat(session_id: int, db: Session = Depends(get_session)):
-    """Start the thread over. The map is untouched."""
-    if db.get(TestSession, session_id) is None:
-        raise HTTPException(404, "session not found")
-    for row in db.exec(
-        select(ChatMessage).where(ChatMessage.session_id == session_id)
-    ):
-        db.delete(row)
-    db.commit()
+    db.refresh(thread)
+    return ChatTurn(user=user_row, assistant=assistant_row, thread=thread)

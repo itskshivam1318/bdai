@@ -59,20 +59,23 @@ class Claude:
             if content:
                 messages.append({"role": "assistant", "content": content})
 
-            if exchange.results:
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": result.call_id,
-                                "content": result.content,
-                            }
-                            for result in exchange.results
-                        ],
-                    }
-                )
+            # Tool results and a human follow-up are the same thing to the API
+            # -- the user turn that answers the model -- so they go in one
+            # message. Appending two `user` messages instead would break the
+            # alternation the Messages API requires the moment a caller has
+            # both, which is why this is built as one content list.
+            answering: list[dict] = [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": result.call_id,
+                    "content": result.content,
+                }
+                for result in exchange.results
+            ]
+            if exchange.follow_up:
+                answering.append({"type": "text", "text": exchange.follow_up})
+            if answering:
+                messages.append({"role": "user", "content": answering})
 
         return messages
 
