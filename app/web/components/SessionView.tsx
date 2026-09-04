@@ -1,7 +1,8 @@
 "use client";
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
-import Canvas from "@/components/Canvas";
+import MapPane from "@/components/MapPane";
+import StageRail from "@/components/StageRail";
 import SettingsDialog from "@/components/SettingsDialog";
 import { sessionLabel } from "@/components/Sidebar";
 import { api, type Run, type TestSession } from "@/lib/api";
@@ -23,6 +24,7 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
   const [reasonFor, setReasonFor] = useState<number | null>(null);
   const [name, setName] = useState("");
   const [intent, setIntent] = useState("");
+  const [selectedRunId, setSelectedRunId] = useState<number | null>(null);
 
   const refreshRuns = useCallback(() => {
     api.listSessionRuns(sessionId).then(setRuns).catch(() => {});
@@ -43,6 +45,11 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
 
   const latest = runs[runs.length - 1];
   const reasonOpen = latest != null && reasonFor === latest.id;
+
+  // Runs are scoped maps, not versions of one map: re-crawling after the app
+  // changes writes a second graph beside the first, which is the drift story.
+  // So the picker is not a convenience — it is how you compare two builds.
+  const shownRunId = selectedRunId ?? latest?.id ?? null;
 
   function commitName() {
     const next = name.trim();
@@ -137,6 +144,21 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
           </div>
         )}
 
+        {runs.length > 1 && (
+          <select
+            value={shownRunId ?? ""}
+            onChange={(e) => setSelectedRunId(Number(e.target.value))}
+            aria-label="Run to show on the map"
+            className="rounded border border-rule bg-paper px-1.5 py-1 text-xs"
+          >
+            {runs.map((r, i) => (
+              <option key={r.id} value={r.id}>
+                run {i + 1} · {r.status}
+              </option>
+            ))}
+          </select>
+        )}
+
         <a
           href={session?.target_url}
           target="_blank"
@@ -160,8 +182,11 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
         </button>
       </header>
 
-      <div className="min-h-0 flex-1">
-        <Canvas sessionId={sessionId} />
+      <div className="grid min-h-0 flex-1 grid-cols-[3fr_2fr]">
+        <div className="min-w-0">
+          <MapPane runId={shownRunId} />
+        </div>
+        <StageRail sessionId={sessionId} runId={shownRunId} />
       </div>
 
       <form

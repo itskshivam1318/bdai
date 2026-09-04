@@ -75,7 +75,11 @@ class TestCase(SQLModel, table=True):
     name: str
     selector: Optional[str] = None
     healed_selector: Optional[str] = None
-    status: str = "pending"  # pending | passed | failed | healed
+    # JSON list of the state keys this scenario crosses, in order. The map
+    # colours a node by the worst verdict among the scenarios naming it, so
+    # this is the join between a test result and a place on the graph.
+    path: str = "[]"
+    status: str = "pending"  # pending | passed | failed | healed | defect | escalate
     detail: Optional[str] = None
     created_at: datetime = Field(default_factory=utcnow)
 
@@ -132,8 +136,16 @@ class AppState(SQLModel, table=True):
     url: str  # first seen; descriptive only, never identity
     title: str
     actions: str = "[]"  # JSON list of action descriptors
+    # JSON list of [role, name] pairs -- the fillable fields this screen
+    # offers. Derived from the state's first observation at save time, not
+    # stored on StateNode: `worldmap.py` takes `actions_of` injected precisely
+    # so that it never learns what a control means.
+    fields: str = "[]"
     # Human-readable name. A model seam -- null until something names it.
     label: Optional[str] = None
+    # Path to one screenshot, relative to the artifacts dir, served at
+    # /artifacts/<path>. Null when capture was off or the shot failed.
+    screenshot: Optional[str] = None
     is_entry: bool = False
     first_seen: datetime = Field(default_factory=utcnow)
 

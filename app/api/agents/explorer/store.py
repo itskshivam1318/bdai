@@ -99,15 +99,24 @@ def save(world: WorldMap, run_id: int, session: Session) -> int:
                     url=node.url,
                     title=node.title,
                     actions=actions,
+                    fields=_fields_of(world, node),
                     label=node.label,
+                    screenshot=node.screenshot,
                     is_entry=(key == world.entry_key),
                 )
             )
             written += 1
-        elif row.actions != actions or row.label != node.label:
+        elif (
+            row.actions != actions
+            or row.label != node.label
+            or row.screenshot != node.screenshot
+        ):
             # A state's action set can grow as later visits reveal controls,
-            # and `label` arrives from a model seam long after the crawl.
+            # `label` arrives from a model seam long after the crawl, and the
+            # screenshot is taken on first sighting -- which may be after this
+            # row was first written by an earlier checkpoint.
             row.actions, row.label = actions, node.label
+            row.screenshot = node.screenshot
             session.add(row)
             written += 1
 
@@ -197,6 +206,7 @@ def load(run_id: int, session: Session) -> WorldMap:
             title=row.title,
             actions=tuple(json.loads(row.actions or "[]")),
             label=row.label,
+            screenshot=row.screenshot,
             evidence=tuple(evidence_of.get(row.key, ())),
         )
         if row.is_entry:
@@ -216,6 +226,23 @@ def load(run_id: int, session: Session) -> WorldMap:
         )
 
     return world
+
+
+def _fields_of(world: WorldMap, node: StateNode) -> str:
+    """The fillable fields of a state, from the first time we saw it.
+
+    First sighting rather than latest: `record()` already takes `url`, `title`
+    and `actions` from the first observation, and a card whose fields came from
+    a different visit than its screenshot would be describing two screens.
+    """
+    from .forms import fields_of
+
+    if not node.evidence:
+        return "[]"
+    index = node.evidence[0]
+    if index >= len(world.evidence):
+        return "[]"
+    return json.dumps([list(pair) for pair in fields_of(world.evidence[index])])
 
 
 def _key_of(world: WorldMap, observation: Observation) -> str:

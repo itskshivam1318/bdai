@@ -26,13 +26,17 @@ from __future__ import annotations
 
 import sys
 
+import os
+
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
 
 from agents.explorer import Observer, forms, state_key
 from agents.explorer.statekey import explain
 
-DEFAULT_BASE = "http://localhost:3000"
+# See agents/probe.py: honouring WEB_PORT is what makes a probe in a worktree
+# test that worktree rather than whatever owns port 3000.
+DEFAULT_BASE = f"http://localhost:{os.environ.get('WEB_PORT') or '3000'}"
 
 # Each case is (name, page A, page B, expected verdict). "same" means the
 # projection must ignore the difference; "different" means it must not. Both

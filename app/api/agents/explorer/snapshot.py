@@ -71,6 +71,7 @@ def save(world: WorldMap, path: str | Path, **meta) -> Path:
                         "title": node.title,
                         "actions": list(node.actions),
                         "label": node.label,
+                        "screenshot": node.screenshot,
                     }
                     for node in world.states.values()
                 ],
@@ -115,6 +116,7 @@ def load(path: str | Path) -> WorldMap:
             title=s["title"],
             actions=tuple(s["actions"]),
             label=s.get("label"),
+            screenshot=s.get("screenshot"),
         )
     for t in data["transitions"]:
         world.transitions.setdefault((t["from"], t["action"]), []).append(

@@ -1,6 +1,15 @@
 # The real Makefile. Runs from here or from the repo root, which proxies to it.
 # scripts/dev.sh reads .worktree-env for ports, falling back to 3000/8000.
 
+# Ports live in .worktree-env so several stacks can run side by side. dev.sh
+# reads that file itself, but every other target reaches the stack through
+# $$WEB_PORT / $$API_PORT -- so make has to load and export it too. Without
+# this, `make probe` inside a worktree drives whichever checkout happens to own
+# port 3000, which is somebody else's code. `-include` keeps a plain clone,
+# which has no such file, working unchanged.
+-include .worktree-env
+export WEB_PORT API_PORT
+
 .DEFAULT_GOAL := help
 .PHONY: help setup dev api web smoke probe pipeline loop generate specs gaps explore crawl trace diff runs mcp mcp-probe worktree list rm check reset stop
 
@@ -31,6 +40,7 @@ smoke: ## Walking skeleton: drive a browser, break a locator, heal it
 probe: ## Observable checks for the explorer and the agents. No API key needed.
 	cd api && uv run python -m agents.explorer.probe
 	cd api && uv run python -m agents.probe
+	cd api && uv run python -m app.probe
 
 pipeline: ## URL in, test quality report out. No stage chosen by a human. URL=...
 	cd api && uv run python -m agents.pipeline "$${URL:-http://localhost:$${WEB_PORT:-3000}/sut}"

@@ -42,6 +42,7 @@ from .observer import Observation, Observer
 from .statekey import state_key
 from .synth import Synthesizer
 from .worldmap import WorldMap
+from ..shots import Shot
 
 # Actions whose *name* suggests they destroy something. A stub, and labelled as
 # one: real coverage is Magentic-UI's ActionGuard (arXiv:2507.22358), which
@@ -138,6 +139,7 @@ def crawl(
     credentials: Credentials | None = None,
     synthesizer: Synthesizer | None = None,
     checkpoint: Callable[[WorldMap], None] | None = None,
+    shot: Shot | None = None,
 ) -> WorldMap:
     """Explore from `entry_url` until the frontier empties or the budget runs out."""
     budget = budget or Budget()
@@ -146,6 +148,16 @@ def crawl(
     # `actions_of` needs the live page (see forms.form_of), and `record` is
     # always called immediately after observing it, so binding it here is safe.
     world = WorldMap(actions_of=lambda obs: forms.available_actions(page, obs))
+
+    def capture(key: str) -> None:
+        """First sighting only. `attach_screenshot` enforces that; this avoids
+        paying for the screenshot at all on a state we already have."""
+        if shot is None:
+            return
+        node = world.states.get(key)
+        if node is not None and node.screenshot is None:
+            world.attach_screenshot(key, shot(key))
+
     deadline = time.monotonic() + budget.max_seconds
     actions_taken = 0
     # Lives on the map, not in this frame: a refused action is a fact about the
@@ -165,6 +177,7 @@ def crawl(
     # `None` means we do not know where we are and must replay to find out.
     here = visit(entry_url)
     here_key: str | None = world.record(here)
+    capture(here_key)
 
     def _replay(target_key: str) -> Observation | None:
         """Get back to `target_key`. Returns the observation there, or None.
@@ -284,6 +297,7 @@ def crawl(
             continue
 
         here_key = world.connect(from_key, action, after).to_key
+        capture(here_key)
         here = after
 
         if checkpoint is not None:

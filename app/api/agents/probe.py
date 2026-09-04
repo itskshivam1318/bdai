@@ -19,6 +19,7 @@ Needs `make dev` for the SUT at :3000.
 
 from __future__ import annotations
 
+import os
 import sys
 
 from playwright.sync_api import Error as PlaywrightError
@@ -33,7 +34,12 @@ from .explorer.worldmap import WorldMap
 from .llm import ToolCall, Turn
 from .orchestrator import Budget, run
 
-SUT = "http://localhost:3000/sut"
+# The Makefile reads WEB_PORT from `.worktree-env` so several stacks can run at
+# once; a probe that ignored it would test whichever checkout happened to own
+# port 3000, which in a worktree is somebody else's code. make exports an
+# undefined variable as an empty string, so the fallback has to catch "" and
+# not just a missing key.
+SUT = f"http://localhost:{os.environ.get('WEB_PORT') or '3000'}/sut"
 CREDENTIALS = Credentials("probe@example.com", "probe-password")
 
 
@@ -313,7 +319,138 @@ def main() -> int:
                 not compare(world, stripped).identical,
             )
 
-        # 3d. What is worth a test. `is_flow` is structural and lives in
+        # 3c. A thumbnail is attached once and must survive both a revisit and
+        #     a round trip through a file. Losing it on revisit is silent: the
+        #     node still renders, just without its picture, and only on the
+        #     states the crawler visited more than once.
+        from .explorer.worldmap import WorldMap as _WorldMap
+
+        shots = _WorldMap()
+        first = world.evidence[0]
+        shot_key = shots.record(first)
+        shots.attach_screenshot(shot_key, "run-1/abc.png")
+        shots.record(first)  # a revisit
+        ok &= check(
+            "a revisit does not lose the thumbnail",
+            shots.states[shot_key].screenshot == "run-1/abc.png",
+        )
+        shots.attach_screenshot(shot_key, "run-1/second.png")
+        ok &= check(
+            "the first thumbnail wins",
+            shots.states[shot_key].screenshot == "run-1/abc.png",
+        )
+        ok &= check(
+            "attaching None is a no-op, not a wipe",
+            (
+                shots.attach_screenshot(shot_key, None),
+                shots.states[shot_key].screenshot == "run-1/abc.png",
+            )[1],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            from .explorer.snapshot import load as _load
+            from .explorer.snapshot import save as _save
+
+            reloaded = _load(_save(shots, f"{tmp}/shots.json", target=SUT))
+            ok &= check(
+                "a saved map keeps its thumbnails",
+                reloaded.states[shot_key].screenshot == "run-1/abc.png",
+            )
+
+        # 3d. store.save is incremental and upserts states. A thumbnail that
+        #     arrives after a state's first save must reach the database on the
+        #     next checkpoint, or the UI shows a picture-less node forever.
+        from sqlmodel import Session as _Session
+        from sqlmodel import SQLModel as _SQLModel
+        from sqlmodel import create_engine as _create_engine
+
+        from .explorer import store as _store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = _create_engine(f"sqlite:///{tmp}/probe.db")
+            _SQLModel.metadata.create_all(engine)
+            with _Session(engine) as db:
+                bare = _WorldMap()
+                bare_key = bare.record(world.evidence[0])
+                _store.save(bare, run_id=7, session=db)
+                bare.attach_screenshot(bare_key, "run-7/pic.png")
+                _store.save(bare, run_id=7, session=db)
+                back = _store.load(7, db)
+                ok &= check(
+                    "a thumbnail attached after the first save still persists",
+                    back.states[bare_key].screenshot == "run-7/pic.png",
+                )
+
+        # 3e. A state the pipeline crossed twice takes the worse verdict. A
+        #     map that showed the *last* verdict would hide a defect behind a
+        #     pass, which is the one direction that must never happen.
+        from .generator import scenarios as _scenarios
+        from .runner import DEFECT as _DEFECT
+        from .runner import PASSED as _PASSED
+        from .runner import Resolution as _Resolution
+        from .runner import Result as _Result
+        from .runner import StepResult as _StepResult
+        from . import suite as _suite
+
+        drafted = _scenarios(result.world)
+        if not drafted:
+            ok &= check("the probe world yields a scenario to persist", False)
+        else:
+            one = drafted[0]
+
+            def _result(verdict: str) -> _Result:
+                return _Result(
+                    scenario=one,
+                    target_url=SUT,
+                    steps=[
+                        _StepResult(
+                            step=step,
+                            verdict=verdict,
+                            resolution=_Resolution(
+                                action=step.action, rung="exact", detail=""
+                            ),
+                            detail="probe",
+                        )
+                        for step in one.steps
+                    ],
+                )
+
+            with tempfile.TemporaryDirectory() as tmp:
+                engine = _create_engine(f"sqlite:///{tmp}/suite.db")
+                _SQLModel.metadata.create_all(engine)
+                with _Session(engine) as db:
+                    # DEFECT first, PASSED second, on purpose: the reduction is
+                    # supposed to keep the worse verdict, so the better one must
+                    # arrive LATER and lose. Written the other way round, a
+                    # last-write-wins bug would produce the same answer as the
+                    # correct code and the check would prove nothing.
+                    written = _suite.save_results(
+                        [_result(_DEFECT), _result(_PASSED)], run_id=9, session=db
+                    )
+                    ok &= check("both results are stored", written == 2)
+
+                    crossed = _suite.path_of(_result(_PASSED))
+                    verdicts = _suite.verdicts_by_state(9, db)
+                    ok &= check(
+                        "every state on the path gets a verdict",
+                        all(key in verdicts for key in crossed),
+                    )
+                    ok &= check(
+                        "the worse verdict survives a better one written later",
+                        set(verdicts.values()) == {_DEFECT},
+                        f"got {sorted(set(verdicts.values()))}",
+                    )
+
+                    # A Result whose steps list is empty against a scenario that
+                    # has steps: reading the plan instead of the run would
+                    # return keys here, and returning none is the whole fix.
+                    ok &= check(
+                        "a run that executed no steps colours no states",
+                        _suite.path_of(
+                            _Result(scenario=one, target_url=SUT, steps=[])
+                        ) == [],
+                    )
+
+        # 3f. What is worth a test. `is_flow` is structural and lives in
         #     worldmap.py, which never learns what an action *means*; the
         #     vocabulary rule (a submission is always a flow) lives in the
         #     generator, which does. Both halves are checked here because the
@@ -355,7 +492,7 @@ def main() -> int:
             not is_flow(flows, edges[("a", "link:Also")]),
         )
 
-        # 3e. The vocabulary half of the same policy. A submission the app
+        # 3g. The vocabulary half of the same policy. A submission the app
         #     correctly refuses is a self-loop that fires nothing -- structurally
         #     indistinguishable from `textbox:Email stays` -- and the brief wants
         #     unhappy paths, so the Generator overrides `is_flow` for it.
@@ -374,7 +511,7 @@ def main() -> int:
             not worth_testing(flows, idle),
         )
 
-        # 3f. Diversity. Ranking alone let one kind eat the whole suite:
+        # 3h. Diversity. Ranking alone let one kind eat the whole suite:
         #     saucedemo's login page is several states, each contributing a
         #     submit edge, and forms outrank everything -- so 7 of 8 scenarios
         #     were the login form and every product link was crowded out.
@@ -422,6 +559,59 @@ def main() -> int:
         browser = pw.chromium.launch()
         page = browser.new_page()
         mapped = crawl(page, SUT, CrawlBudget(max_actions=10, max_seconds=90))
+
+        # 4b. One picture per state, and not one more. A revisit that shoots
+        #     again is invisible in the UI and quadratic in a real crawl.
+        from pathlib import Path as _Path
+
+        from .shots import shooter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            shot_page = browser.new_page()
+
+            # Counting the *invocations*, not the files: `shooter` names each
+            # file after the state key, so a second shot at a state it already
+            # captured silently overwrites the first and leaves the file count
+            # unchanged. Only the call log can tell "captured once" from
+            # "captured twice", and "captured once" is the whole property.
+            taken: list[str] = []
+            capture_once = shooter(shot_page, run_id=1, root=_Path(tmp))
+
+            def counting_shot(key: str) -> str | None:
+                taken.append(key)
+                return capture_once(key)
+
+            shot_world = crawl(
+                shot_page,
+                SUT,
+                CrawlBudget(max_actions=12, max_seconds=90),
+                credentials=CREDENTIALS,
+                shot=counting_shot,
+            )
+            shot_page.close()
+            files = list((_Path(tmp) / "run-1").glob("*.png"))
+            ok &= check(
+                "one screenshot per state, never two",
+                len(files) == len(shot_world.states),
+                f"{len(files)} files for {len(shot_world.states)} states",
+            )
+            ok &= check(
+                "every state carries a thumbnail path",
+                all(n.screenshot for n in shot_world.states.values()),
+            )
+            ok &= check(
+                "the recorded path is what the API serves",
+                all(
+                    n.screenshot.startswith("run-1/") and n.screenshot.endswith(".png")
+                    for n in shot_world.states.values()
+                ),
+            )
+            ok &= check(
+                "no state is captured twice",
+                len(taken) == len(set(taken)) == len(shot_world.states),
+                f"{len(taken)} shots for {len(set(taken))} distinct states",
+            )
+
         plan = scenarios(mapped)
         happy = next(
             (s for s in plan if s.terminal.action.startswith("submit[valid]")), None

@@ -38,6 +38,7 @@ from .explorer.observer import Observer
 from .explorer.crawler import autosave
 from .explorer.worldmap import WorldMap
 from .llm import Exchange, Provider, ToolResult, Transcript, load
+from .shots import Shot
 from .tracing import save_transcript, start as start_tracing
 
 
@@ -155,6 +156,7 @@ def run(
     credentials: Credentials | None = None,
     on_event=None,
     run_id: int | None = None,
+    shot: Shot | None = None,
 ) -> Exploration:
     """Explore `entry_url` until the orchestrator is satisfied or the budget ends.
 
@@ -186,6 +188,8 @@ def run(
     observer.start_window()
     page.goto(entry_url)
     entry_key = world.record(observer.observe())
+    if shot is not None:
+        world.attach_screenshot(entry_key, shot(entry_key))
     emit("info", f"entry {entry_url} -> state {entry_key[:8]}")
 
     system = instructions("orchestrator")
@@ -260,6 +264,7 @@ def run(
                     credentials=credentials,
                     budget=budget.ant_actions,
                     run_id=run_id,
+                    shot=shot,
                 )
             except Exception as exc:
                 # One ant dying must not take the colony with it. A transient

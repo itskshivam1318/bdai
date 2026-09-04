@@ -32,12 +32,13 @@ from sqlmodel import Session, select
 
 # Absolute, not relative: `agents/` is a sibling of `app/` under `api/`, so a
 # relative import would climb above this package and fail at import time.
-from agents import orchestrator, runner
+from agents import orchestrator, runner, suite
 from agents.explorer import crawler, store
 from agents.explorer.forms import Credentials
 from agents.explorer.synth import Synthesizer
 from agents.generator import scenarios
 from agents.llm import load
+from agents.shots import shooter
 from agents.tracing import start as start_tracing
 from ..config import settings
 from ..db import engine, get_session
@@ -56,7 +57,7 @@ class ExploreRequest(BaseModel):
     ant_actions: int = 4
 
 
-def _crawl_only(page, target_url: str, emit, checkpoint) -> orchestrator.Exploration:
+def _crawl_only(page, target_url: str, emit, checkpoint, shot) -> orchestrator.Exploration:
     """The no-model path: the same WorldMap, built breadth-first with no model.
 
     Returned as an `Exploration` so the caller's save-and-report block does not
@@ -76,6 +77,9 @@ def _crawl_only(page, target_url: str, emit, checkpoint) -> orchestrator.Explora
         # run is reused now that there is no model to ask.
         synthesizer=Synthesizer(cache_path=settings.artifacts_dir / "invalid-payloads.json"),
         checkpoint=checkpoint,
+        # The console shows a thumbnail per state whichever path built the map,
+        # so a degraded run gets cards with pictures in them rather than boxes.
+        shot=shot,
     )
     gaps = tuple(
         f"[{key[:8]}] {', '.join(actions[:6])}"
@@ -83,45 +87,6 @@ def _crawl_only(page, target_url: str, emit, checkpoint) -> orchestrator.Explora
         if actions
     )
     return orchestrator.Exploration(world=world, stopped="no model", gaps=gaps[:3])
-
-
-def _save_results(results, run_id: int, db: Session) -> int:
-    """Replay outcomes as `TestCase` rows. Idempotent per run.
-
-    Stands in for `suite.save_results` (Task 4), which lives on `work/map`
-    along with `agents/suite.py`. Writing it here rather than creating that
-    file keeps this change off the map branch's territory -- swap the call when
-    the branch lands, and delete this.
-
-    Rows are cleared before writing: a re-run of the same `run_id` is a second
-    opinion about the same app, not eight more tests. `store.save` takes the
-    same view of states.
-    """
-    for stale in db.exec(select(TestCase).where(TestCase.run_id == run_id)).all():
-        db.delete(stale)
-
-    for outcome in results:
-        healed = outcome.healed_steps
-        # The terminal step is what the scenario is *about* -- generator.py
-        # builds one scenario per distinct terminal action -- so its locator is
-        # the one worth recording against the row.
-        terminal = outcome.scenario.terminal
-        db.add(
-            TestCase(
-                run_id=run_id,
-                name=outcome.scenario.name,
-                selector=terminal.action,
-                healed_selector=healed[-1].resolution.action if healed else None,
-                status=outcome.verdict,
-                detail=" | ".join(
-                    f"[{s.verdict}] {s.step.intent}" for s in outcome.steps
-                )[:2000]
-                or None,
-            )
-        )
-
-    db.commit()
-    return len(results)
 
 
 def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
@@ -192,7 +157,13 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
                 browser = pw.chromium.launch()
                 page = browser.new_page()
                 if provider is None:
-                    result = _crawl_only(page, target_url, emit, checkpoint)
+                    result = _crawl_only(
+                        page,
+                        target_url,
+                        emit,
+                        checkpoint,
+                        shooter(page, run_id, settings.artifacts_dir),
+                    )
                 else:
                     result = orchestrator.run(
                         page,
@@ -205,8 +176,15 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
                             ant_actions=body.ant_actions,
                         ),
                         credentials=Credentials.from_env(),
-                        on_event=emit,
+                        # Tagged, so the colony's own reasoning opens a widget
+                        # rather than only scrolling past in the timeline.
+                        on_event=lambda level, message: emit(
+                            level, message, surface="explore"
+                        ),
                         run_id=run_id,
+                        # Without this no state gets a picture and every card on
+                        # the map is an empty box.
+                        shot=shooter(page, run_id, settings.artifacts_dir),
                     )
                 # --- map ---------------------------------------------
                 # The browser stays open past this point: generation reads the
@@ -244,7 +222,7 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
                 # --- suite -------------------------------------------
                 plan = scenarios(result.world)
                 emit(
-                    "decision",
+                    "warn" if not plan else "decision",
                     f"suite: {len(plan)} scenarios compiled from recorded paths",
                     surface="suite",
                 )
@@ -268,7 +246,14 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
 
                 browser.close()
 
-            written = _save_results(results, run_id, db)
+            # Clearing stale rows is the caller's policy, not the store's: a
+            # re-run of the same `run_id` is a second opinion about the same
+            # app, not eight more tests, and `store.save` takes the same view of
+            # states. Uncommitted, so the delete and the write land together.
+            for stale in db.exec(select(TestCase).where(TestCase.run_id == run_id)).all():
+                db.delete(stale)
+
+            written = suite.save_results(results, run_id, db)
 
             for outcome in results:
                 for step in outcome.healed_steps:
@@ -304,7 +289,14 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
                 # intent was honoured, so green would claim more than happened.
                 # `degraded` is unknown to STATUS_TONE and renders grey, which
                 # is the point -- see SessionView.tsx.
-                if tally[runner.DEFECT] or tally[runner.ESCALATE]:
+                #
+                # Neither is a run that tested nothing a pass. Zero scenarios,
+                # or scenarios that all raised before returning a verdict, is
+                # not success: for a product whose claim is "a URL in, a
+                # meaningful suite out", a green badge over an empty suite is
+                # the worst thing to report.
+                incomplete = not plan or len(results) != len(plan)
+                if tally[runner.DEFECT] or tally[runner.ESCALATE] or incomplete:
                     run.status = "failed"
                 else:
                     run.status = "passed" if provider else "degraded"
