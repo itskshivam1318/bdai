@@ -1,26 +1,65 @@
 @import "tailwindcss";
 
+/* Palette: an instrument, not a marketing page. Near-neutral paper, one
+   accent (live) reserved for agent activity, one for failure. If a colour
+   appears anywhere else it is a bug -- the canvas has to stay readable when
+   eight widgets are open at once. */
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
-
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --paper: #fbfaf8;
+  --hush: #f2f0ec; /* sidebar, sunken surfaces */
+  --ink: #17171a;
+  --muted: #77757e;
+  --rule: #e6e4df;
+  --live: #1f6f4a;
+  --fault: #a4382a;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+    --paper: #121215;
+    --hush: #17171b;
+    --ink: #eceae6;
+    --muted: #8a8891;
+    --rule: #2a2a2e;
+    --live: #4ea87a;
+    --fault: #d1725f;
   }
 }
 
+@theme inline {
+  --color-paper: var(--paper);
+  --color-hush: var(--hush);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-rule: var(--rule);
+  --color-live: var(--live);
+  --color-fault: var(--fault);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-geist-sans), system-ui, sans-serif;
+}
+
+/* Keyboard focus stays visible everywhere; pointer focus doesn't shout. */
+:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* The canvas is a work surface, so it sits a shade below the page. */
+.react-flow__pane {
+  background: var(--hush);
 }

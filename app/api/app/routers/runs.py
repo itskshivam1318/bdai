@@ -12,8 +12,13 @@ router = APIRouter(prefix="/api/runs", tags=["runs"])
 
 
 @router.get("", response_model=list[Run])
-def list_runs(session: Session = Depends(get_session)):
-    return session.exec(select(Run).order_by(Run.id.desc())).all()
+def list_runs(
+    session_id: int | None = None, session: Session = Depends(get_session)
+):
+    query = select(Run)
+    if session_id is not None:
+        query = query.where(Run.session_id == session_id)
+    return session.exec(query.order_by(Run.id.desc())).all()
 
 
 @router.post("", response_model=Run, status_code=201)

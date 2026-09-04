@@ -3,15 +3,17 @@ import {
   Background,
   Controls,
   MiniMap,
+  Panel,
   ReactFlow,
   useNodesState,
   type NodeChange,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import WidgetNode, { type WidgetNodeType } from "@/components/WidgetNode";
-import { api, WORKTREE, type CanvasNodeRow } from "@/lib/api";
+import { api, type CanvasNodeRow } from "@/lib/api";
 import { WIDGETS } from "@/lib/widgets/registry";
+import { placeWidget, widgetsToOpen } from "@/lib/widgets/surfaces";
 import type { WidgetConfig } from "@/lib/widgets/types";
 
 function parseConfig(raw: string): WidgetConfig {
@@ -22,9 +24,13 @@ function parseConfig(raw: string): WidgetConfig {
   }
 }
 
-export default function Canvas() {
+export default function Canvas({ sessionId }: { sessionId: number }) {
   const [nodes, setNodes, onNodesChange] = useNodesState<WidgetNodeType>([]);
-  const [status, setStatus] = useState<"connecting" | "ok" | "down">("connecting");
+  const [showAdd, setShowAdd] = useState(false);
+  // Raw rows, kept alongside the xyflow nodes because placement and dedupe
+  // both reason about config blobs that never reach the node's `data`.
+  const rows = useRef<CanvasNodeRow[]>([]);
+  const lastEventId = useRef(0);
 
   const persistConfig = useCallback((rowId: number, next: WidgetConfig) => {
     void api.updateNode(rowId, { config: JSON.stringify(next) });
@@ -35,10 +41,7 @@ export default function Canvas() {
       id: String(row.id),
       type: "widget",
       position: { x: row.x, y: row.y },
-      style: {
-        width: row.width ?? undefined,
-        height: row.height ?? undefined,
-      },
+      style: { width: row.width ?? undefined, height: row.height ?? undefined },
       data: {
         rowId: row.id,
         widgetType: row.widget_type,
@@ -51,29 +54,64 @@ export default function Canvas() {
 
   useEffect(() => {
     api
-      .health()
-      .then(() => setStatus("ok"))
-      .catch(() => setStatus("down"));
-    api
-      .listNodes()
-      .then((rows) => setNodes(rows.map(toNode)))
+      .listNodes(sessionId)
+      .then((loaded) => {
+        rows.current = loaded;
+        setNodes(loaded.map(toNode));
+      })
       .catch(() => {});
-  }, [setNodes, toNode]);
+  }, [sessionId, setNodes, toNode]);
+
+  // The agent's half of the contract: it emits events carrying a `surface`,
+  // and we turn the ones we have widgets for into nodes. Dedupe lives in
+  // widgetsToOpen, keyed on the originating event id, so a re-poll or a reload
+  // can't clone a widget.
+  useEffect(() => {
+    let cancelled = false;
+
+    async function poll() {
+      try {
+        const events = await api.listSessionEvents(sessionId, lastEventId.current);
+        if (cancelled || !events.length) return;
+        lastEventId.current = events[events.length - 1].id;
+
+        const wanted = widgetsToOpen(events, rows.current);
+        for (const spec of wanted) {
+          const row = await api.createNode({ ...spec, session_id: sessionId });
+          if (cancelled) return;
+          rows.current = [...rows.current, row];
+          setNodes((current) => [...current, toNode(row)]);
+        }
+      } catch {
+        // API down mid-session: keep the canvas as-is and try again next tick.
+      }
+    }
+
+    poll();
+    const timer = setInterval(poll, 2000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [sessionId, setNodes, toNode]);
 
   const addWidget = useCallback(
     async (type: string, size: [number, number]) => {
+      const { x, y } = placeWidget(rows.current, size);
       const row = await api.createNode({
+        session_id: sessionId,
         widget_type: type,
-        // Slight scatter so consecutive adds don't stack perfectly.
-        x: 80 + Math.random() * 240,
-        y: 80 + Math.random() * 160,
+        x,
+        y,
         width: size[0],
         height: size[1],
         config: "{}",
       });
+      rows.current = [...rows.current, row];
       setNodes((current) => [...current, toNode(row)]);
+      setShowAdd(false);
     },
-    [setNodes, toNode],
+    [sessionId, setNodes, toNode],
   );
 
   // Position and size only reach the DB once the gesture ends — dragging
@@ -83,10 +121,11 @@ export default function Canvas() {
       onNodesChange(changes);
       for (const change of changes) {
         if (change.type === "position" && !change.dragging && change.position) {
-          void api.updateNode(Number(change.id), {
-            x: change.position.x,
-            y: change.position.y,
-          });
+          const { x, y } = change.position;
+          void api.updateNode(Number(change.id), { x, y });
+          rows.current = rows.current.map((r) =>
+            r.id === Number(change.id) ? { ...r, x, y } : r,
+          );
         }
         if (change.type === "dimensions" && change.resizing === false) {
           const dims = change.dimensions;
@@ -95,10 +134,16 @@ export default function Canvas() {
               width: dims.width,
               height: dims.height,
             });
+            rows.current = rows.current.map((r) =>
+              r.id === Number(change.id)
+                ? { ...r, width: dims.width, height: dims.height }
+                : r,
+            );
           }
         }
         if (change.type === "remove") {
           void api.deleteNode(Number(change.id));
+          rows.current = rows.current.filter((r) => r.id !== Number(change.id));
         }
       }
     },
@@ -108,50 +153,45 @@ export default function Canvas() {
   const nodeTypes = useMemo(() => ({ widget: WidgetNode }), []);
 
   return (
-    <div className="flex h-dvh flex-col">
-      <header className="flex items-center gap-3 border-b border-neutral-200 px-3 py-2 dark:border-neutral-800">
-        <span className="text-sm font-semibold">AIVAR</span>
-        {/* Which stack am I looking at? Essential once three worktrees run. */}
-        <span className="rounded bg-neutral-100 px-2 py-0.5 font-mono text-[11px] dark:bg-neutral-800">
-          {WORKTREE}
-        </span>
-        <span
-          className={`text-[11px] ${
-            status === "ok"
-              ? "text-emerald-600"
-              : status === "down"
-                ? "text-red-600"
-                : "text-neutral-400"
-          }`}
-        >
-          api {status}
-        </span>
-        <div className="ml-auto flex gap-1">
-          {WIDGETS.map((w) => (
-            <button
-              key={w.type}
-              onClick={() => addWidget(w.type, w.size)}
-              title={w.blurb}
-              className="rounded border border-neutral-200 px-2 py-1 text-xs hover:bg-neutral-50 dark:border-neutral-700 dark:hover:bg-neutral-800"
-            >
-              + {w.label}
-            </button>
-          ))}
+    <ReactFlow
+      nodes={nodes}
+      onNodesChange={handleChanges}
+      nodeTypes={nodeTypes}
+      proOptions={{ hideAttribution: true }}
+      fitView
+      // Without the cap, a canvas holding two widgets zooms them to fill the
+      // viewport and the text renders comically large.
+      fitViewOptions={{ maxZoom: 1, padding: 0.2 }}
+    >
+      <Background />
+      <Controls />
+      <MiniMap pannable zoomable />
+      <Panel position="top-right">
+        <div className="relative">
+          <button
+            onClick={() => setShowAdd((v) => !v)}
+            aria-expanded={showAdd}
+            className="rounded-md border border-rule bg-paper px-2.5 py-1.5 text-xs shadow-sm"
+          >
+            Add widget
+          </button>
+          {showAdd && (
+            <ul className="absolute right-0 mt-1 w-52 overflow-hidden rounded-md border border-rule bg-paper shadow-md">
+              {WIDGETS.map((w) => (
+                <li key={w.type}>
+                  <button
+                    onClick={() => addWidget(w.type, w.size)}
+                    className="block w-full px-3 py-2 text-left text-xs hover:bg-hush"
+                  >
+                    <span className="block">{w.label}</span>
+                    <span className="block text-muted">{w.blurb}</span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
-      </header>
-      <div className="flex-1">
-        <ReactFlow
-          nodes={nodes}
-          onNodesChange={handleChanges}
-          nodeTypes={nodeTypes}
-          proOptions={{ hideAttribution: true }}
-          fitView
-        >
-          <Background />
-          <Controls />
-          <MiniMap pannable zoomable />
-        </ReactFlow>
-      </div>
-    </div>
+      </Panel>
+    </ReactFlow>
   );
 }

@@ -6,7 +6,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import settings
 from .db import init_db
-from .routers import canvas, runs
+from .routers import canvas, explore, runs, sessions
 
 
 @asynccontextmanager
@@ -29,6 +29,8 @@ app.add_middleware(
 
 app.include_router(canvas.router)
 app.include_router(runs.router)
+app.include_router(sessions.router)
+app.include_router(explore.router)
 
 # Screenshots and diffs are written here and rendered straight into canvas
 # widgets by URL -- no upload endpoint needed.

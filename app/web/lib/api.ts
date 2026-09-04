@@ -15,8 +15,22 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return res.status === 204 ? (undefined as T) : ((await res.json()) as T);
 }
 
+export type TestSession = {
+  id: number;
+  target_url: string;
+  name: string | null;
+  created_at: string;
+};
+
+/** A session as the sidebar shows it: the row plus its run rollup. */
+export type SessionSummary = TestSession & {
+  run_count: number;
+  last_status: string | null;
+};
+
 export type CanvasNodeRow = {
   id: number;
+  session_id: number | null;
   widget_type: string;
   x: number;
   y: number;
@@ -27,6 +41,7 @@ export type CanvasNodeRow = {
 
 export type Run = {
   id: number;
+  session_id: number | null;
   target_url: string;
   status: string;
   summary: string | null;
@@ -38,13 +53,36 @@ export type AgentEvent = {
   run_id: number | null;
   level: string;
   message: string;
+  /** Set when the agent wants this surfaced on the canvas. See widgets/surfaces.ts. */
+  surface: string | null;
+  ref: string | null;
   created_at: string;
 };
 
 export const api = {
   health: () => request<{ status: string; worktree: string }>("/health"),
 
-  listNodes: () => request<CanvasNodeRow[]>("/api/canvas/nodes"),
+  listSessions: () => request<SessionSummary[]>("/api/sessions"),
+  createSession: (target_url: string) =>
+    request<TestSession>("/api/sessions", {
+      method: "POST",
+      body: JSON.stringify({ target_url }),
+    }),
+  getSession: (id: number) => request<TestSession>(`/api/sessions/${id}`),
+  renameSession: (id: number, name: string) =>
+    request<TestSession>(`/api/sessions/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ name }),
+    }),
+  deleteSession: (id: number) =>
+    request<void>(`/api/sessions/${id}`, { method: "DELETE" }),
+  listSessionRuns: (id: number) => request<Run[]>(`/api/sessions/${id}/runs`),
+  /** Tail of the session's event stream. `after` is the highest id already seen. */
+  listSessionEvents: (id: number, after = 0) =>
+    request<AgentEvent[]>(`/api/sessions/${id}/events?after=${after}`),
+
+  listNodes: (sessionId: number) =>
+    request<CanvasNodeRow[]>(`/api/canvas/nodes?session_id=${sessionId}`),
   createNode: (node: Partial<CanvasNodeRow>) =>
     request<CanvasNodeRow>("/api/canvas/nodes", {
       method: "POST",
@@ -58,12 +96,30 @@ export const api = {
   deleteNode: (id: number) =>
     request<void>(`/api/canvas/nodes/${id}`, { method: "DELETE" }),
 
-  listRuns: () => request<Run[]>("/api/runs"),
-  createRun: (target_url: string) =>
+  listRuns: (sessionId?: number) =>
+    request<Run[]>(
+      sessionId === undefined ? "/api/runs" : `/api/runs?session_id=${sessionId}`,
+    ),
+  createRun: (target_url: string, session_id?: number) =>
     request<Run>("/api/runs", {
       method: "POST",
-      body: JSON.stringify({ target_url }),
+      body: JSON.stringify({ target_url, session_id }),
+    }),
+  /**
+   * Start the agent colony on an existing run. Returns as soon as it has
+   * started, not when it finishes — progress arrives as events on the run's
+   * timeline, which the canvas is already polling.
+   */
+  explore: (runId: number, intent?: string) =>
+    request<{ run_id: number; status: string }>(`/api/runs/${runId}/explore`, {
+      method: "POST",
+      body: JSON.stringify({ intent: intent || null }),
     }),
   listEvents: (runId: number) =>
     request<AgentEvent[]>(`/api/runs/${runId}/events`),
+  addEvent: (runId: number, event: Partial<AgentEvent>) =>
+    request<AgentEvent>(`/api/runs/${runId}/events`, {
+      method: "POST",
+      body: JSON.stringify(event),
+    }),
 };

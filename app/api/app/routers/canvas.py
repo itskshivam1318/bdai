@@ -15,8 +15,18 @@ router = APIRouter(prefix="/api/canvas", tags=["canvas"])
 
 
 @router.get("/nodes", response_model=list[CanvasNode])
-def list_nodes(session: Session = Depends(get_session)):
-    return session.exec(select(CanvasNode)).all()
+def list_nodes(
+    session_id: int | None = None, session: Session = Depends(get_session)
+):
+    """Nodes for one session. Omitting `session_id` returns every node.
+
+    Each session owns its own canvas, so the unscoped form is a debugging
+    convenience, not something the UI calls.
+    """
+    query = select(CanvasNode)
+    if session_id is not None:
+        query = query.where(CanvasNode.session_id == session_id)
+    return session.exec(query).all()
 
 
 @router.post("/nodes", response_model=CanvasNode, status_code=201)
