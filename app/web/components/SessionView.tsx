@@ -149,7 +149,7 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
         <div className="min-w-0">
           <MapPane runId={shownRunId} />
         </div>
-        <StageRail sessionId={sessionId} />
+        <StageRail sessionId={sessionId} runId={shownRunId} />
       </div>
 
       <form

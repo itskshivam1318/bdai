@@ -16,6 +16,11 @@ export type Stage = {
 };
 
 export const STAGES: Stage[] = [
+  // Stage 0 is the colony walking the app, and it is the only one that reports
+  // while it is still happening. Latest-only rather than accumulate: this is a
+  // live status line ("wave 2: dispatching 3 ants"), and a scrolling wall of
+  // every decision would bury the four cards underneath it.
+  { surfaces: ["explore"], title: "Explore", ordinal: "0" },
   { surfaces: ["plan"], title: "Plan", ordinal: "1" },
   { surfaces: ["coverage"], title: "Coverage", ordinal: "2" },
   { surfaces: ["suite"], title: "Suite", ordinal: "3" },

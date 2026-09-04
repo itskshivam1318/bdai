@@ -16,8 +16,18 @@ const LEVEL_TONE: Record<string, string> = {
  * Reads the same `Event.surface` seam the widget board reads — the agent names
  * what deserves attention and never learns that a rail exists. A surface with
  * no stage falls through to the timeline, exactly as before.
+ *
+ * The rail is run-scoped like the map, even though the events endpoint is
+ * session-scoped: a stage card describing a previous run beside the current
+ * run's map is worse than an empty card.
  */
-export default function StageRail({ sessionId }: { sessionId: number }) {
+export default function StageRail({
+  sessionId,
+  runId,
+}: {
+  sessionId: number;
+  runId: number | null;
+}) {
   const [events, setEvents] = useState<AgentEvent[]>([]);
 
   useEffect(() => {
@@ -45,7 +55,9 @@ export default function StageRail({ sessionId }: { sessionId: number }) {
   return (
     <div className="h-full overflow-y-auto border-l border-rule bg-hush px-3 py-3">
       {STAGES.map((stage) => {
-        const mine = events.filter((e) => e.surface && stage.surfaces.includes(e.surface));
+        const mine = events.filter(
+          (e) => e.surface && stage.surfaces.includes(e.surface) && e.run_id === runId,
+        );
         const shown = stage.accumulate ? mine : mine.slice(-1);
         return (
           <section key={stage.title} className="mb-3 rounded-md border border-rule bg-paper p-3">

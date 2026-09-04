@@ -36,7 +36,7 @@ from agents.explorer.statekey import explain
 
 # See agents/probe.py: honouring WEB_PORT is what makes a probe in a worktree
 # test that worktree rather than whatever owns port 3000.
-DEFAULT_BASE = f"http://localhost:{os.environ.get('WEB_PORT', '3000')}"
+DEFAULT_BASE = f"http://localhost:{os.environ.get('WEB_PORT') or '3000'}"
 
 # Each case is (name, page A, page B, expected verdict). "same" means the
 # projection must ignore the difference; "different" means it must not. Both

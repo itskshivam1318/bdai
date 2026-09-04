@@ -36,8 +36,10 @@ from .orchestrator import Budget, run
 
 # The Makefile reads WEB_PORT from `.worktree-env` so several stacks can run at
 # once; a probe that ignored it would test whichever checkout happened to own
-# port 3000, which in a worktree is somebody else's code.
-SUT = f"http://localhost:{os.environ.get('WEB_PORT', '3000')}/sut"
+# port 3000, which in a worktree is somebody else's code. make exports an
+# undefined variable as an empty string, so the fallback has to catch "" and
+# not just a missing key.
+SUT = f"http://localhost:{os.environ.get('WEB_PORT') or '3000'}/sut"
 CREDENTIALS = Credentials("probe@example.com", "probe-password")
 
 

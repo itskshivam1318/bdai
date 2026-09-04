@@ -96,7 +96,6 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
         emit("info", f"exploring {target_url}", surface="timeline")
         emit("info", f"model: {provider.name} / {provider.model}")
 
-        results: list = []
         try:
             with sync_playwright() as pw:
                 browser = pw.chromium.launch()
@@ -112,7 +111,7 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
                         ant_actions=body.ant_actions,
                     ),
                     credentials=Credentials.from_env(),
-                    on_event=emit,
+                    on_event=lambda level, message: emit(level, message, surface="explore"),
                     run_id=run_id,
                     shot=shooter(page, run_id, settings.artifacts_dir),
                 )
@@ -147,7 +146,7 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
                 # --- suite -----------------------------------------------
                 plan = scenarios(result.world)
                 emit(
-                    "decision",
+                    "warn" if not plan else "decision",
                     f"suite: {len(plan)} scenarios compiled from recorded paths",
                     surface="suite",
                 )
@@ -201,13 +200,17 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
             )
 
             if run:
-                # An escalation is not a green run. It means the locator healed AND
-                # the outcome changed -- both variables moved at once, so the failure
-                # is unattributable and a human has to look. Reporting that as
-                # "passed" while the same run emits red escalate events puts two
-                # contradictory claims side by side in the console.
+                # An escalation is not a green run. It means the locator healed
+                # AND the outcome changed -- both variables moved at once, so the
+                # failure is unattributable and a human has to look.
                 needs_attention = tally[runner.DEFECT] + tally[runner.ESCALATE]
-                run.status = "failed" if needs_attention else "passed"
+                # Neither is a run that tested nothing. Zero scenarios, or
+                # scenarios that all raised before returning a verdict, is not a
+                # pass: for a product whose claim is "a URL in, a meaningful
+                # suite out", a green badge over an empty suite is the worst
+                # thing to report as success.
+                incomplete = not plan or len(results) != len(plan)
+                run.status = "failed" if (needs_attention or incomplete) else "passed"
                 run.summary = result.summary or f"stopped: {result.stopped}"
 
         except Exception as exc:

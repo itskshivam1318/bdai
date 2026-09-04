@@ -2,7 +2,6 @@
 import {
   Background,
   Controls,
-  MiniMap,
   ReactFlow,
   type Edge,
   type Node,
@@ -99,7 +98,11 @@ export default function MapPane({ runId }: { runId: number | null }) {
   }
 
   return (
+    // Switching runs replaces the node set but keeps the old viewport
+    // otherwise, which leaves the new map clipped -- keying on runId forces a
+    // fresh mount so fitView re-fits for the run now showing.
     <ReactFlow
+      key={runId}
       nodes={nodes}
       edges={edges}
       nodeTypes={nodeTypes}
@@ -109,7 +112,6 @@ export default function MapPane({ runId }: { runId: number | null }) {
     >
       <Background />
       <Controls />
-      <MiniMap pannable zoomable />
     </ReactFlow>
   );
 }

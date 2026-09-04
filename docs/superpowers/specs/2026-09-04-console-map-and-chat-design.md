@@ -68,9 +68,11 @@ that no longer exists is worse than no position.
 **A node renders:** screenshot thumbnail, `label ?? title`, the fillable field
 names parsed from `actions[]`, an action count, and a verdict badge.
 
-**Zoom-dependent detail.** Below zoom 0.6 a node collapses to a chip (icon,
-label, verdict dot). A 25-state map — the size the practicesoftwaretesting.com
-crawl actually produces — is unreadable as 25 thumbnails.
+**Zoom-dependent detail.** Below zoom 0.4 a node collapses to a chip (icon,
+label, verdict dot). Calibrated against what `fitView` actually produces, not
+against a guess: a 9-state map opens at ~0.5 and a 25-state one — the size the
+practicesoftwaretesting.com crawl actually produces — far lower; at 0.6 even
+the small map opened as chips.
 
 **Painting.** Node colour is the pipeline stage that has reached it, not test
 status alone:
@@ -79,7 +81,11 @@ status alone:
 |---|---|
 | grey | discovered; no scenario touches it |
 | outlined | a generated scenario's path includes it |
-| green / amber / red / purple | `PASSED` / `HEALED` / `DEFECT` / `ESCALATE` |
+| green ✓ solid / green ↻ dashed / red ✗ solid / red ⚠ dashed | `PASSED` / `HEALED` / `DEFECT` / `ESCALATE` |
+
+`globals.css` allows only two accents, so colour alone can say only pass or
+fail (green vs. red); the four verdicts are told apart by glyph and border
+style (solid vs. dashed) on top of that.
 
 A scenario's path is `[step.from_key for step in steps] + [terminal.expect.to_key]`.
 Where several scenarios cross one state, the **worst** verdict wins, matching
@@ -290,9 +296,11 @@ Each is an observable check, per `CLAUDE.md` operating principle 3.
 - **Map renders offline.** `snapshot.py` already writes maps to files. A stored
   map from a practicesoftwaretesting.com run loads into `MapPane` with no agent
   running. This is the fast iteration loop for the whole pane.
-- **Screenshot discipline.** After a crawl, count `.png` files under
-  `artifacts/run-<id>/` and assert it equals `len(world.states)`. A revisit that
-  shoots a second picture fails this.
+- **Screenshot discipline.** After a crawl, count `shoot()` invocations and
+  assert it equals `len(world.states)`. Counting `.png` files under
+  `artifacts/run-<id>/` instead cannot detect a repeat: `shooter` names each
+  file after the state key, so a revisit that shoots a second picture
+  overwrites the first and the file count never moves.
 - **Chat fast path.** Unit tests against a fixture map: each question shape
   returns the rows it should, and no provider is constructed.
 - **End to end.** `make probe`, then a live run against `/sut?bug=1`: the map

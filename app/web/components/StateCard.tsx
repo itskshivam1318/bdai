@@ -26,7 +26,7 @@ export type StateNodeData = { state: MapState };
 export default function StateCard({ data }: NodeProps) {
   const { state } = data as unknown as StateNodeData;
   const compact = useStore((s) => s.transform[2] < COMPACT_BELOW);
-  const mark = VERDICT[state.verdict ?? "untested"];
+  const mark = VERDICT[state.verdict ?? "untested"] ?? VERDICT.untested;
   const name = state.label ?? state.title ?? state.url;
 
   const frame = `rounded-md border bg-paper ${
