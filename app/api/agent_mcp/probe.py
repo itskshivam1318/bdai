@@ -121,6 +121,30 @@ def main() -> int:
         "a diff with no renamed strings must return no flows, not every flow",
     )
 
+    print("\n5b. impact separates acting on a control from merely seeing it")
+    latest = read.latest_run(console)
+    if latest is None:
+        print("  SKIP  no mapped run -- `make mcp-probe` after a crawl to cover this")
+    else:
+        imp = read.impact_of(latest["id"], ["Sign in"])
+        total = len(imp["affected"]) + len(imp["observing"]) + len(
+            imp["unaffected_flows"]
+        )
+        ok &= check(
+            "tiers: acting flows are a strict subset of matching ones",
+            len(imp["affected"]) < total,
+            "renaming one button once matched 8 of 8 flows -- an answer that "
+            "ranks nothing ranks everything",
+        )
+        ok &= check(
+            "tiers: every affected flow has an `acts` reason",
+            all(hit["acts"] for hit in imp["affected"]),
+        )
+        ok &= check(
+            "tiers: no observing flow acts",
+            all(not hit["acts"] for hit in imp["observing"]),
+        )
+
     print("\n6. cleanup")
     console._call("DELETE", f"/api/sessions/{first['id']}")
     ok &= check(

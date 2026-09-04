@@ -225,6 +225,11 @@ async def impact(names: list[str], run_id: int | None = None) -> dict:
 
     Answers "what might I have just broken" before you run anything.
 
+    Two tiers. `affected` flows click or fill the control -- verify these.
+    `observing` flows only expect it somewhere in a state delta, which nearly
+    every flow on the same page does; they matter when your change *removed*
+    something, and are weak evidence otherwise.
+
     Args:
         names: user-visible strings, e.g. ["Place Order", "Complete Purchase"]
         run_id: which mapped run to read; defaults to the most recent

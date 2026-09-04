@@ -19,12 +19,13 @@ locally: no rows are written, and the file is the same one the API opened.
 
 from __future__ import annotations
 
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from agents import generator, runner
 from agents.explorer import store
 from agents.explorer.worldmap import WorldMap
 from app.db import engine
+from app.models import AppState
 
 from .client import Console
 
@@ -34,20 +35,39 @@ def world_of(run_id: int) -> WorldMap:
         return store.load(run_id, db)
 
 
+def mapped_runs() -> set[int]:
+    """Run ids that actually produced states.
+
+    Not every run is a mapped run. `verify` creates one to hang its timeline
+    and its `TestCase` rows on, and it writes no `AppState` -- it replays a
+    map, it does not build one.
+    """
+    with Session(engine) as db:
+        # `select(AppState.run_id)` selects a *column*, so each row is the id
+        # itself, not an AppState. Reading `.run_id` off it raises.
+        return {
+            run_id
+            for run_id in db.exec(select(AppState.run_id).distinct())
+            if run_id is not None
+        }
+
+
 def latest_run(console: Console, target_url: str | None = None) -> dict | None:
-    """The newest run that produced something, preferring a mapped one.
+    """The newest run that has a map, so a defaulted `run_id` answers something.
 
     Tools take an optional `run_id` so an agent never has to know one. Without
     a default they would all have to call `sessions()` first, which is three
-    round-trips to ask one question.
+    round-trips to ask one question -- but a default that lands on a `verify`
+    run returns an empty map, which is worse than asking.
     """
-    runs = console.runs()
-    for run in runs:  # newest first, per `list_runs`
+    mapped = mapped_runs()
+    for run in console.runs():  # newest first, per `list_runs`
+        if run["id"] not in mapped:
+            continue
         if target_url and run.get("target_url") != target_url:
             continue
-        if run.get("status") in {"passed", "failed"}:
-            return run
-    return runs[0] if runs and not target_url else None
+        return run
+    return None
 
 
 def map_of(run_id: int, include_snapshots: bool = False) -> dict:
@@ -133,52 +153,68 @@ def _matches(name: str, needles: list[str]) -> bool:
 
 
 def impact_of(run_id: int, names: list[str]) -> dict:
-    """Which recorded flows traverse any control matching these names.
+    """Which recorded flows touch these user-visible strings.
 
-    Reported per flow with the matching step named, because "3 flows are
-    affected" is not actionable and "guest-checkout, at step 4, clicks it" is.
+    Two tiers, because they are not the same claim and collapsing them makes
+    the answer useless. Measured against the SUT: renaming one button matched
+    8 of 8 flows when every match counted equally, which tells a caller
+    nothing.
+
+      acts      the flow operates this control -- clicks it, or fills it.
+                Rename it and this flow's locator has to be re-resolved.
+      observes  the control only appears in the flow's expected state delta,
+                usually as a line that *disappears* when the flow acts. Every
+                flow starting on the page holding that control matches this
+                way, so on its own it is close to no evidence.
+
+    `affected` is the acts tier. `observing` is reported separately rather
+    than dropped: a flow that expects a heading to appear is genuinely
+    affected when you delete that heading, even though it never acts on it.
     """
     world = world_of(run_id)
     scenarios = generator.scenarios(world)
 
-    hits = []
+    affected, observing = [], []
     for scenario in scenarios:
-        touched = []
+        acts, observes = [], []
         for index, step in enumerate(scenario.steps, start=1):
             _, role, name = runner._parts(step.action)
-            reasons = []
             if _matches(name, names) or _matches(role, names):
-                reasons.append(f"acts on {step.action}")
+                acts.append({"step": index, "intent": step.intent,
+                             "why": f"acts on {step.action}"})
             for field_role, field_name in step.fields:
                 if _matches(field_name, names):
-                    reasons.append(f"fills {field_role}:{field_name}")
+                    acts.append({"step": index, "intent": step.intent,
+                                 "why": f"fills {field_role}:{field_name}"})
             for line in step.expect.added + step.expect.removed:
                 if _matches(line, names):
-                    reasons.append(f"expects {line.strip()}")
-            if reasons:
-                touched.append(
-                    {"step": index, "intent": step.intent, "why": reasons}
-                )
-        if touched:
-            hits.append(
-                {
-                    "flow": scenario.name,
-                    "steps": len(scenario.steps),
-                    "target_url": scenario.target_url,
-                    "touches": touched,
-                }
-            )
+                    observes.append({"step": index, "intent": step.intent,
+                                     "why": f"expects {line.strip()}"})
 
+        entry = {
+            "flow": scenario.name,
+            "steps": len(scenario.steps),
+            "target_url": scenario.target_url,
+            "acts": acts,
+            "observes": observes,
+        }
+        if acts:
+            affected.append(entry)
+        elif observes:
+            observing.append(entry)
+
+    named = {e["flow"] for e in affected} | {e["flow"] for e in observing}
     return {
         "run_id": run_id,
         "names": names,
-        "affected": hits,
+        # Verify these. The flow acts on a control you changed.
+        "affected": affected,
+        # Weaker. Verify after `affected` if the change removed something.
+        "observing": observing,
         # An honest empty answer. Nothing matching is a real result -- the
-        # change is in code no recorded flow exercises -- but it is also what an
-        # unmapped area looks like, and those need different responses.
+        # change is in code no recorded flow exercises -- but it is also what
+        # an unmapped area looks like, and those need different responses.
         "unaffected_flows": [
-            scenario.name
-            for scenario in scenarios
-            if scenario.name not in {hit["flow"] for hit in hits}
+            scenario.name for scenario in scenarios if scenario.name not in named
         ],
     }
