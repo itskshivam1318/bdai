@@ -37,7 +37,7 @@ def crawl(
     url: str,
     name: str | None = None,
     max_states: int = 30,
-    max_seconds: float = 180.0,
+    max_seconds: float = 90.0,
 ) -> dict:
     from playwright.sync_api import sync_playwright
 

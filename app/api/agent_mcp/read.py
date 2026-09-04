@@ -93,7 +93,13 @@ def map_of(run_id: int, include_snapshots: bool = False) -> dict:
 
     return {
         "run_id": run_id,
-        "summary": world.summary(),
+        # Headline only. `world.summary()` renders every state and its
+        # actions as text below the counts -- the same data `states` and
+        # `transitions` carry structurally, costing 21-49% of the payload
+        # to say twice. Measured: the console crawl spent 56k of 115k
+        # characters on the duplicate. The console still stores the full
+        # rendering via `patch_run`; this is the agent-facing copy.
+        "summary": world.summary().split("\n\n")[0],
         "states": [
             {
                 "key": node.key,

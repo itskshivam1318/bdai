@@ -162,7 +162,7 @@ async def crawl(
     url: str,
     name: str | None = None,
     max_states: int = 30,
-    max_seconds: float = 180.0,
+    max_seconds: float = 90.0,
 ) -> dict:
     """Map an app without a model. Faster than `explore`, and needs no API key.
 
@@ -176,7 +176,14 @@ async def crawl(
         url: the running application to map
         name: optional label for the session in the sidebar
         max_states: stop after this many distinct states
-        max_seconds: stop after this long
+        max_seconds: stop after this long. The default is sized to return
+            inside the caller's tool window rather than to the crawler's
+            appetite: an MCP client moves a call to the background at 120s,
+            and a crawl overshoots its own deadline slightly (measured: 125s
+            for a 120s budget) because the step in flight has to finish. 90
+            leaves room for browser start-up and serialising the map. Raise
+            it if you would rather have the coverage and read the result
+            from the console.
     """
 
     def job() -> dict:
