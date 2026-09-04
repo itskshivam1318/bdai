@@ -1,7 +1,10 @@
-# Thesis — DRAFT
+# Thesis — SUPERSEDED, PENDING REWRITE
 
-> Status: proposed by Claude, not yet agreed by the team. Argue with it before
-> anyone writes code against it.
+> Written against the video alone, before the PDF was available. The PDF names
+> an explicit Planner/Generator/Healer + meta-agent architecture and weights
+> orchestration intelligence heavily, which this draft underweights. Kept for
+> the demo-script thinking and the live-DOM-mutation idea; do not build from it
+> until rewritten against `problem/statement.md`.
 
 ## The claim
 
