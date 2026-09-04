@@ -128,6 +128,27 @@ def _cart(*, qty: int) -> str:
     )
 
 
+_PRODUCTS = ("Backpack", "Bike Light", "Bolt T-Shirt")
+
+
+def _catalogue(*, in_cart: tuple[int, ...] = (), sale_on: int | None = None) -> str:
+    """saucedemo's shape: sibling rows whose button toggles with the cart.
+
+    Not a list -- `<div>` siblings, which is exactly why `collapse_siblings`
+    never reached it. `sale_on` gives one row a control its neighbours lack, so
+    the same fixture holds the rule and the guard against it.
+    """
+    badge = f"<span>{len(in_cart)}</span>" if in_cart else ""
+    rows = "".join(
+        f"<div><h2>{name}</h2><p>$29.99</p>"
+        f'<button>{"Remove" if i in in_cart else "Add to cart"}</button>'
+        + ("<button>Sale</button>" if sale_on == i else "")
+        + "</div>"
+        for i, name in enumerate(_PRODUCTS)
+    )
+    return f"<main><header>Products{badge}</header><section>{rows}</section></main>"
+
+
 _SIDEBAR = """<div><nav aria-label="Sessions"><ul>{items}</ul>
 <a href="/new">New session</a></nav>
 <main><h1>AIVAR</h1>{extra}</main></div>"""
@@ -235,6 +256,30 @@ PROJECTION_CASES = (
         "different",
         "the empty-cart branch -- its alert and its blocked checkout -- "
         "collapses into the populated one and is never tested",
+    ),
+    (
+        "which rows are toggled is not identity",
+        _catalogue(in_cart=(0,)),
+        _catalogue(in_cart=(0, 1)),
+        "same",
+        "one product page keys once per cart combination -- measured on "
+        "saucedemo as 10 of 21 states, all /inventory.html",
+    ),
+    (
+        "an empty collection IS identity",
+        _catalogue(),
+        _catalogue(in_cart=(0,)),
+        "different",
+        "the consequence goes with the cause: an empty cart renders no badge, "
+        "and losing that boundary is what would make the collapse unsafe",
+    ),
+    (
+        "a row holding a control its neighbours lack keeps its name",
+        _catalogue(in_cart=(0,)),
+        _catalogue(in_cart=(0,), sale_on=1),
+        "different",
+        "shape-identity is the only thing standing between anonymising rows "
+        "and hiding a real control; without it this collapse swallows the page",
     ),
     (
         "a grown sibling list is not identity",
