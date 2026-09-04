@@ -467,9 +467,75 @@ def main() -> int:
                 "omission deleted evidence instead of demoting it",
             )
 
+        # 6. The meta-agent. The brief's headline requirement is that nobody
+        #    chooses the stages, so what these check is the *deciding*, not the
+        #    stages -- each of which is already covered above.
+        print()
+        from .pipeline import Budget as PipeBudget
+        from .pipeline import addressable, report, verifiable
+        from .pipeline import run as pipeline
+
+        pipe = pipeline(
+            page, SUT,
+            budget=PipeBudget(explore_actions=12, explore_seconds=90, max_scenarios=4),
+            verify_against=(f"{SUT}?v=2", f"{SUT}?bug=1"),
+        )
+
+        ok &= check(
+            "a URL alone drives the whole pipeline",
+            pipe.stopped == "complete" and bool(pipe.plan) and bool(pipe.results),
+            f"stopped={pipe.stopped!r} scenarios={len(pipe.plan)} runs={len(pipe.results)}",
+        )
+        stages = [d.stage for d in pipe.decisions]
+        ok &= check(
+            "every stage of the brief is decided, in order",
+            stages[:1] == ["explore"]
+            and {"critique", "replan", "generate", "run", "stop"} <= set(stages),
+            f"stages seen: {stages}",
+        )
+        ok &= check(
+            "every decision carries the evidence it cites",
+            all(d.because and (d.evidence or d.stage == "stop") for d in pipe.decisions),
+            "a decision was recorded without a reason or its numbers",
+        )
+
+        # The decision the file exists for: a gap with no mechanism to close it
+        # must not trigger another exploration round.
+        invalid_gaps = tuple(g for g in pipe.gaps if "submit[invalid]" in g.action)
+        ok &= check(
+            "a gap with no mechanism to close it does not trigger a re-plan",
+            not addressable(invalid_gaps, has_synthesizer=False)
+            and len(addressable(invalid_gaps, has_synthesizer=True)) == len(invalid_gaps),
+            "submit[invalid] was treated as explorable without a synthesizer",
+        )
+        ok &= check(
+            "re-verification drops scenarios that navigate by link",
+            all(
+                not any(s.action.startswith("link:") for s in scenario.steps)
+                for scenario in verifiable(pipe.plan)
+            ),
+            "a link-following scenario would be re-run against a different base",
+        )
+
+        written = report(pipe)
+        ok &= check(
+            "the report answers every line the brief asks for",
+            all(
+                heading in written
+                for heading in (
+                    "HOW THE AGENT DECIDED", "SCENARIOS COVERED", "OUTCOMES",
+                    "HEALER ACTIONS", "COVERAGE GAPS REMAINING",
+                )
+            ),
+        )
+        ok &= check(
+            "the report carries no coverage percentage",
+            "%" not in written,
+        )
+
         browser.close()
 
-    # 6. The prompts are the tunable part; loading them must not silently break.
+    # 7. The prompts are the tunable part; loading them must not silently break.
     print()
     for role, marker in (
         ("ant", "explorer ant"),

@@ -278,3 +278,52 @@ that crawl had no API key, so the synthesizer was unavailable and no form's
 invalid path was ever walked.
 
 **Who:** shivam + Claude.
+
+---
+
+## 2026-09-04 19:30 — The meta-agent routes on computed evidence, and the policy is code
+
+`agents/pipeline.py` is the meta-agent the brief names. It runs
+explore → critique → (re-plan only if that would help) → generate → run →
+re-verify → report, and records a `Decision(stage, choice, because, evidence)`
+at every branch.
+
+**Why the policy is not a prompt.** Almost nothing it decides is a judgement,
+because the evidence it decides on was computed by something else: `runner.py`
+already classified each failure from two orthogonal observations, and
+`critic.py` already ranked the gaps and structurally could not invent one. What
+is left is *routing*, and routing on computed evidence is a policy. The model
+seams are real and named — `critic.prioritise` orders gaps, the colony chooses
+where ants go — they are simply not here. The rubric also pays 15% for
+presenting the agent's decisions, and a printed chain of stage/choice/reason/
+numbers is more auditable than model prose describing the same routing.
+
+**The decision that earns the file is `addressable()`.** When exploration ends
+with gaps open, the naive move is to explore again. Often that cannot help: an
+unexercised `submit[invalid]` partition needs an input synthesizer, and without
+an API key there is not one — so another thousand actions close none of them.
+Measured on the SUT: 6 gaps, **0 addressable**, and the pipeline says so and
+proceeds instead of burning a second round. An agent that knows which of its own
+gaps it cannot close is the difference between orchestration and a loop.
+
+**`verifiable()` — re-running a suite against a different base URL.** A scenario
+that navigates by link is dropped, because a link's destination is absolute:
+`link:v2` against a base that is already `?v=2` correctly stays put, and the
+classifier then correctly reports a defect — a true answer to a meaningless
+question. Before this filter the demo produced 3 false defects on `?v=2`. On a
+real deploy the filter keeps nearly everything, because links then point at the
+new deploy too.
+
+**Known limit:** re-exploration re-crawls from the entry rather than resuming
+the frontier, because `crawl()` builds a fresh `WorldMap` per call. Cheap on a
+small app, wasteful on a large one.
+
+**Evidence:** `make pipeline` on the SUT — 9 states, 33 transitions, 6 gaps
+none addressable, 8 scenarios (3 unhappy), baseline 8 passed, `?v=2` 2 healed
+via `structural`, `?bug=1` 1 defect + 1 passed. `make probe` 41/41.
+
+**Not done:** `app/CLAUDE.md` should gain `pipeline.py` in its layout table and
+a line on `make pipeline`. Left untouched because the console work has that file
+open; it is the one doc edit outstanding for this change.
+
+**Who:** shivam + Claude.
