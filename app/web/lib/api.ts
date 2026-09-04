@@ -75,6 +75,13 @@ export type MapState = {
   screenshot: string | null;
   /** Worst verdict among scenarios crossing this state; null if untested. */
   verdict: Verdict | null;
+  /**
+   * The ant that first reached this state, e.g. "w2a1" — wave 2, ant 1.
+   *
+   * Null is meaningful, not missing: the entry state is recorded before the
+   * first wave is dispatched, and a deterministic crawl has no ants at all.
+   */
+  found_by: string | null;
 };
 
 export type MapTransition = {
@@ -84,6 +91,8 @@ export type MapTransition = {
   /** A non-GET fired during this action. The signal the Runner classifies on. */
   mutating: boolean;
   observation_id: number | null;
+  /** The ant that took this action. Null for a run with no colony. */
+  found_by: string | null;
 };
 
 export type WorldMapPayload = {

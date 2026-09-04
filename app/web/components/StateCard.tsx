@@ -1,7 +1,7 @@
 "use client";
 import { Handle, Position, useStore, type NodeProps } from "@xyflow/react";
 import { artifactUrl, type MapState, type Verdict } from "@/lib/api";
-import { NODE_H, NODE_W } from "@/lib/map";
+import { antColour, NODE_H, NODE_W } from "@/lib/map";
 
 /**
  * Below this zoom a thumbnail is unreadable, so the card becomes a chip.
@@ -21,13 +21,17 @@ const VERDICT: Record<Verdict | "untested", { tone: string; dashed: boolean; gly
   untested: { tone: "text-muted", dashed: false, glyph: "·" },
 };
 
-export type StateNodeData = { state: MapState };
+/** `ants` is the run's ant order, which is what turns a tag into a hue. */
+export type StateNodeData = { state: MapState; ants: string[] };
 
 export default function StateCard({ data }: NodeProps) {
-  const { state } = data as unknown as StateNodeData;
+  const { state, ants } = data as unknown as StateNodeData;
   const compact = useStore((s) => s.transform[2] < COMPACT_BELOW);
   const mark = VERDICT[state.verdict ?? "untested"] ?? VERDICT.untested;
   const name = state.label ?? state.title ?? state.url;
+  // Null when no ant found this -- true of the entry state and of every state
+  // in a model-free crawl -- and that reads as "no chip", not as a grey one.
+  const tint = antColour(state.found_by, ants ?? []);
 
   const frame = `rounded-md border bg-paper ${
     mark.dashed ? "border-dashed" : "border-solid"
@@ -39,6 +43,14 @@ export default function StateCard({ data }: NodeProps) {
         <Handle type="target" position={Position.Left} />
         <span className="text-ink text-sm">{name}</span>
         <span className="ml-2">{mark.glyph}</span>
+        {tint && (
+          <span
+            aria-hidden
+            title={`Found by ant ${state.found_by}`}
+            className="ml-1 inline-block size-1.5 rounded-full align-middle"
+            style={{ background: tint }}
+          />
+        )}
         <Handle type="source" position={Position.Right} />
       </div>
     );
@@ -69,9 +81,19 @@ export default function StateCard({ data }: NodeProps) {
           <span className="truncate text-sm text-ink">{name}</span>
           <span className="ml-auto text-sm">{mark.glyph}</span>
         </div>
-        <div className="mt-0.5 text-[11px] text-muted">
-          {state.fields.length} input{state.fields.length === 1 ? "" : "s"} ·{" "}
-          {state.actions.length} action{state.actions.length === 1 ? "" : "s"}
+        <div className="mt-0.5 flex items-center gap-1.5 text-[11px] text-muted">
+          <span>
+            {state.fields.length} input{state.fields.length === 1 ? "" : "s"} ·{" "}
+            {state.actions.length} action{state.actions.length === 1 ? "" : "s"}
+          </span>
+          {/* Colour and the emoji together, not colour alone: six hues are not
+              six things anyone can name, and the tag is what the timeline and
+              the detail panel also say. */}
+          {tint && (
+            <span className="ml-auto shrink-0" style={{ color: tint }}>
+              🐜 {state.found_by}
+            </span>
+          )}
         </div>
         {state.fields.length > 0 && (
           <div className="mt-1 truncate text-[11px] text-muted">

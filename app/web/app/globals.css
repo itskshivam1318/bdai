@@ -12,6 +12,19 @@
   --rule: #e6e4df;
   --live: #1f6f4a;
   --fault: #a4382a;
+
+  /* Ant attribution. The rule above reserves colour for verdicts, and this is
+     the one exception to it: the colony runs up to twelve ants and "which one
+     went there" cannot be said in greyscale. Confined to edges and a card
+     chip -- never a node border, which is where the verdict lives -- and every
+     hue is chosen away from --live and --fault so a coloured edge is never
+     read as a passed or failed one. */
+  --ant-0: #1f6f8b; /* teal */
+  --ant-1: #7a4fa3; /* violet */
+  --ant-2: #b0741f; /* amber */
+  --ant-3: #2f5fa8; /* blue */
+  --ant-4: #a3417f; /* magenta */
+  --ant-5: #6b5a3e; /* umber */
 }
 
 @media (prefers-color-scheme: dark) {
@@ -23,6 +36,13 @@
     --rule: #2a2a2e;
     --live: #4ea87a;
     --fault: #d1725f;
+
+    --ant-0: #56b6d0;
+    --ant-1: #b18ad6;
+    --ant-2: #d9a75f;
+    --ant-3: #7aa6e8;
+    --ant-4: #d98ac0;
+    --ant-5: #b2a07f;
   }
 }
 
