@@ -544,3 +544,40 @@ is when the crawler observes a rejected or non-navigating submit.
 
 **Who:** shivam + Claude on `work/agent-forensics`; snapshot path found by
 bdai-68, URL path by bdai-16, network path and the fix by this session.
+
+## 2026-09-05 09:50 — Redaction covers credentials only, and the model is the reason it can
+
+`cac872e` redacts password-class fields in `observe()`. Emails and usernames are
+deliberately left intact. Ratified rather than assumed, after a fourth exposure
+path turned up that changes what the scope decides.
+
+**The path.** An ant reads the page and writes free text into `report()`.
+Anything it can see, it can repeat into prose that no name-keyed rule will ever
+catch, because prose has no field name to key on. Observed on the canary run:
+the email appears in an orchestrator transcript as *"Submitting with valid
+credentials (email: canary@example.com) leads to a new authenticated state"* —
+written by the model, not by any observation.
+
+**Which is why `observe()` is the only correct position.** The password is
+absent from every transcript precisely because it was redacted *before*
+`tools.describe` rendered the state for the model, so the model never held it to
+repeat. Upstream of the model is the one place where that property holds; there
+is no second line of defence behind it. Anything left unredacted there can be
+laundered into free text, and a later redactor cannot recover it.
+
+**The decision:** credentials only. An email address is frequently the
+behaviourally interesting part of a state — *logged in as alice@* is what
+distinguishes an authenticated state from an anonymous one — and redacting it
+would remove evidence the record exists to hold, on an auth flow, which is the
+flow this system is most often pointed at. The acute exposure was the password,
+and that is closed.
+
+**What this decision costs, stated so nobody rediscovers it as a bug:** an email
+typed into a form reaches `app.db`, `artifacts/runs/*.json` and the transcripts,
+and can be repeated by a model into prose. Point this at a production system with
+real user data and that is real PII on local disk. `_SECRET_NAME` in
+`observer.py` is the one line to widen; the value backstop in
+`_configured_secrets` is bounded at four characters and would need the same care,
+since a short common value redacts everything.
+
+**Who:** shivam decided the scope; Claude on `work/agent-forensics`.
