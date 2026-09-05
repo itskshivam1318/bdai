@@ -387,11 +387,33 @@ class Observer:
     there is no reconstructing it afterwards.
     """
 
+    # What can still change the page: the document itself, the calls the app
+    # makes, and the code and styles that shape it. Not images, fonts, media,
+    # beacons or streams -- a slow CDN or an open event source would otherwise
+    # hold every observation to `inflight_ms` for a page that is already, in
+    # every way an explorer can see, itself.
+    _WAITED = frozenset({"document", "xhr", "fetch", "script", "stylesheet"})
+
     def __init__(self, page: Page) -> None:
         self.page = page
         self._buffer: list[NetworkEvent] = []
         self._recording = False
+        # Requests the current action fired that have no answer yet. Only
+        # those started inside the window count: a poll that was already in
+        # flight before the click is not the action's doing, and a long poll
+        # from before it would otherwise hold every later observation.
+        self._inflight: set = set()
+        page.on("request", self._on_request)
+        page.on("requestfinished", self._on_settled)
+        page.on("requestfailed", self._on_settled)
         page.on("response", self._on_response)
+
+    def _on_request(self, request) -> None:
+        if self._recording and request.resource_type in self._WAITED:
+            self._inflight.add(request)
+
+    def _on_settled(self, request) -> None:
+        self._inflight.discard(request)
 
     def _on_response(self, response) -> None:
         if not self._recording:
@@ -409,9 +431,12 @@ class Observer:
     def start_window(self) -> None:
         """Begin attributing network traffic to the action about to be taken."""
         self._buffer.clear()
+        self._inflight.clear()
         self._recording = True
 
-    def observe(self, settle_ms: int = 400, patience_ms: int = 5000) -> Observation:
+    def observe(
+        self, settle_ms: int = 400, patience_ms: int = 5000, inflight_ms: int = 15000
+    ) -> Observation:
         """Snapshot the page once it has stopped changing, and close the window.
 
         Deliberately not `networkidle`: Playwright's own docs discourage it, and
@@ -439,8 +464,23 @@ class Observer:
         feed) never stabilises, and refusing to observe it would be worse than
         observing it unstably. The instability then shows up where it should --
         as a nondeterministic edge in the map.
+
+        **Two agreeing reads are not evidence while a request the action fired
+        is still unanswered.** Measured 2026-09-05 on a Velogent login: the
+        auth round trip outlasted two reads, both saw the form with its button
+        disabled and reading "Signing in...", and that shell was recorded as
+        where a valid login lands. Every test routed through it then failed at
+        step one, when the replay saw the dashboard instead. So a read taken
+        with something in flight does not count, and agreement has to be
+        between two reads taken with nothing in flight -- the answer may
+        arrive and the redirect it triggers still be a beat away. A request
+        that never answers (a long poll, a stuck backend) is given up on at
+        `inflight_ms`, the same way an unstable page is at `patience_ms`, and
+        the page is reported as it is.
         """
-        deadline = time.monotonic() + (patience_ms / 1000)
+        started = time.monotonic()
+        deadline = started + (patience_ms / 1000)
+        busy_deadline = started + (inflight_ms / 1000)
 
         self.page.wait_for_timeout(settle_ms)
         snapshot = self._snapshot()
@@ -475,14 +515,25 @@ class Observer:
         # empty, and the crawl ended three seconds in. So a snapshot with
         # nothing to act on keeps waiting, on the same patience budget; a page
         # that genuinely has no controls costs one `patience_ms`, once.
-        while time.monotonic() < deadline:
+        # The last read taken with nothing in flight, or None if the latest
+        # read was taken while something was.
+        settled = None if self._inflight else snapshot
+        while time.monotonic() < (busy_deadline if self._inflight else deadline):
             self.page.wait_for_timeout(settle_ms)
             again = self._snapshot()
             if again is None:
                 break
-            if state_key(again) == state_key(snapshot) and _has_controls(snapshot):
+            if self._inflight:
+                settled, snapshot = None, again
+                continue
+            if (
+                settled is not None
+                and state_key(again) == state_key(settled)
+                and _has_controls(again)
+            ):
+                snapshot = again
                 break
-            snapshot = again
+            settled = snapshot = again
 
         self._recording = False
 

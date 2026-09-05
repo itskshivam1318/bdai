@@ -472,6 +472,128 @@ def late_mount(page) -> bool:
     return passed
 
 
+_SLOW_LOGIN = """<main><h1>Welcome back</h1>
+<form onsubmit="return false">
+  <label>Username <input name="u"></label>
+  <label>Password <input name="p" type="password"></label>
+  <button id="go" onclick="signIn()">Sign in</button>
+</form>
+<script>
+async function signIn() {
+  const b = document.getElementById('go');
+  b.disabled = true; b.textContent = 'Signing in\u2026';
+  await fetch('/api/login', {method: 'POST'});
+  location.assign('/dashboard');
+}
+</script></main>"""
+
+_DASHBOARD = """<nav aria-label="sidebar"><a href="/datasets">Datasets</a>
+<a href="/executions">Executions</a></nav><main><h1>Dashboard</h1>
+<button>New agentflow</button></main>"""
+
+
+def _slow_server(delay_s: float):
+    """A server whose login takes `delay_s` to answer, on a free local port.
+
+    In a thread rather than a Playwright route handler: a sync route handler
+    runs on the dispatcher, so a sleep inside it stalls the very
+    `wait_for_timeout` the observer is pacing itself with, and the request is
+    answered by the time the next read happens -- the race disappears from
+    the fixture instead of being reproduced by it.
+    """
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import time as _time
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def _send(self, body: str, status: int = 200) -> None:
+            data = body.encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            if self.path.startswith("/dashboard"):
+                self._send(_DASHBOARD)
+            elif self.path.startswith("/login"):
+                self._send(_SLOW_LOGIN)
+            else:
+                self._send("<main><h1>gone</h1></main>", 404)
+
+        def do_POST(self):
+            _time.sleep(delay_s)
+            self._send("{}")
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_address[1]}"
+
+
+def redirect_wait(page) -> bool:
+    """Section 0e: a submit whose answer is still on the wire is not settled.
+
+    Measured 2026-09-05 on a Velogent login: the observer's two reads 400ms
+    apart agreed on the form with its button reading "Signing in..." and
+    disabled, because the auth round trip took longer than that. The crawl
+    recorded that shell as where a valid login lands; every test routed
+    through it failed at step one when the replay, a little later, saw the
+    dashboard instead.
+    """
+    from agents.explorer.observer import parse_snapshot
+
+    print("REDIRECT    a page is not settled while a request it fired is unanswered")
+    passed = True
+
+    server, base = _slow_server(delay_s=1.5)
+    try:
+        observer = Observer(page)
+        observer.start_window()
+        page.goto(f"{base}/login")
+        observer.observe()
+        observer.start_window()
+        page.get_by_role("button", name="Sign in").click()
+        landed = observer.observe()
+        names = {e.name for e in parse_snapshot(landed.snapshot)}
+        ok = "Dashboard" in names and landed.url.endswith("/dashboard")
+        passed &= ok
+        print(f"  {'PASS' if ok else 'FAIL'}  a login is observed where it lands, not mid-flight")
+        if not ok:
+            print(f"        url={landed.url} names={sorted(n for n in names if n)[:8]}")
+    finally:
+        server.shutdown()
+
+    # The cap. A request that never answers -- a long poll, a stuck backend --
+    # must not stall the crawl: the observer gives up on it and reports the
+    # page as it is, exactly as it already does for a page that never agrees.
+    import time as _time
+
+    server, base = _slow_server(delay_s=8.0)
+    try:
+        observer = Observer(page)
+        observer.start_window()
+        page.goto(f"{base}/login")
+        observer.observe()
+        observer.start_window()
+        page.get_by_role("button", name="Sign in").click()
+        t0 = _time.monotonic()
+        shell = observer.observe(settle_ms=100, patience_ms=500, inflight_ms=1200)
+        took = _time.monotonic() - t0
+        ok = took < 3.0 and "Signing in\u2026" in shell.snapshot
+        passed &= ok
+        print(f"  {'PASS' if ok else 'FAIL'}  and a request that never answers is given up on, not waited for")
+        if not ok:
+            print(f"        took {took:.1f}s; snapshot had Signing in: {'Signing in' in shell.snapshot}")
+    finally:
+        server.shutdown()
+    print()
+    return passed
+
+
 def projection_grid(page) -> bool:
     """Section 0: does `normalize` keep the right differences? Needs no server.
 
@@ -668,6 +790,7 @@ def main(base_url: str) -> int:
         projection_ok &= frontier_noise(page)
         projection_ok &= content_names(page)
         projection_ok &= late_mount(page)
+        projection_ok &= redirect_wait(page)
         projection_ok &= form_scope(page)
         projection_ok &= form_fill(page)
 

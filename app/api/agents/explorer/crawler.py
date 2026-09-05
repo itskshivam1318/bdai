@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import urlparse
 
+from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page, sync_playwright
 
 from . import forms
@@ -136,6 +137,38 @@ def _same_origin(entry: str, url: str) -> bool:
     return urlparse(entry).netloc == urlparse(url).netloc
 
 
+def _form_order(action: str) -> int:
+    if action.startswith(("submit[empty]", "submit[invalid]")):
+        return 0
+    return 1 if action.startswith("submit[valid]") else 2
+
+
+def priority(
+    edge: tuple[str, str],
+    here_key: str | None,
+    routes: dict[str, tuple[str, ...]],
+    taken: set[str],
+) -> tuple[int, int, int, int]:
+    """Which untaken action to take next; lower is sooner.
+
+    Four keys, most significant first -- the reasoning for each is beside the
+    call in `crawl`: novelty (the action string has never been taken anywhere
+    on the map), locality (it is offered where the browser is standing), depth
+    (its state's distance from the entry), and form order (a form's rejected
+    partitions before the one that succeeds, and any form before navigation).
+
+    A pure function of the map's current shape so the order can be checked
+    without a browser -- `agents.probe` does.
+    """
+    state, action = edge
+    return (
+        0 if action not in taken else 1,
+        0 if state == here_key else 1,
+        len(routes.get(state, ("",) * 99)),
+        _form_order(action),
+    )
+
+
 def crawl(
     page: Page,
     entry_url: str,
@@ -173,7 +206,18 @@ def crawl(
 
     def visit(url: str) -> Observation:
         observer.start_window()
-        page.goto(url)
+        try:
+            page.goto(url)
+        except PlaywrightError as error:
+            # `net::ERR_ABORTED`: the app replaced our navigation with its own
+            # before the load finished. Measured 2026-09-05 on a Velogent
+            # target -- an authenticated context asked for `/sso/login` is
+            # redirected client-side, and one replay in several died here,
+            # taking the whole crawl with it. The document that won the race
+            # is the page we are standing on, so observe it; `_replay` then
+            # checks whether it is where we meant to be, as it always did.
+            if "ERR_ABORTED" not in str(error):
+                raise
         return observer.observe()
 
     # Where the browser is standing right now, and what it saw there. Tracking
@@ -235,7 +279,22 @@ def crawl(
             )
             break
 
-        # Three ordering rules, most significant first.
+        # Four ordering rules, most significant first. `priority` holds them;
+        # the reasoning is here.
+        #
+        # 0. Novelty: an action *string* never taken anywhere on the map beats
+        #    one already taken from another state. Measured 2026-09-05 on a
+        #    Velogent target: the crawl reached the dashboard, executions and
+        #    human-tasks pages, each offering 25 actions, and took one to six
+        #    on each, because rules 1 and 2 below spent ~30 of 58 actions on
+        #    the login form -- every error state re-submitted the same form for
+        #    one click (rule 1), and breadth-first kept returning to the
+        #    depth-1 login variants (rule 2), each submit minting another.
+        #    Ties then fell to list order, and on every page behind the login
+        #    the first untaken action was the logo link. A repeat is still
+        #    taken -- `frontier()` keeps it -- but only once nothing novel is
+        #    left, so a 40-action budget buys the app's breadth before its
+        #    ninth login variant.
         #
         # 1. Exhaust where we are standing. Replay is the dominant cost of the
         #    whole crawl -- a page load plus a settle for every step of a path --
@@ -273,20 +332,10 @@ def crawl(
         #    Form actions as a group still outrank plain navigation, so the
         #    original argument for this rule is untouched.
 
-        def _form_order(act: str) -> int:
-            if act.startswith(("submit[empty]", "submit[invalid]")):
-                return 0
-            return 1 if act.startswith("submit[valid]") else 2
-
-        def _priority(edge: tuple[str, str]) -> tuple[int, int, int]:
-            state, act = edge
-            return (
-                0 if state == here_key else 1,
-                len(routes.get(state, ("",) * 99)),
-                _form_order(act),
-            )
-
-        from_key, action = min(pending, key=_priority)
+        taken = {act for _, act in world.transitions}
+        from_key, action = min(
+            pending, key=lambda edge: priority(edge, here_key, routes, taken)
+        )
 
         if from_key != here_key or here is None:
             here = _replay(from_key)
