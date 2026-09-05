@@ -58,6 +58,41 @@ class Chatty:
         return Turn(text="Let me consider which action is best here...")
 
 
+class Payloads:
+    """Answers the synthesizer's tool call with the fields it is given.
+
+    Constructed with names that exist on the form, or with one that does not:
+    the synthesizer applies the same extractive rule the critic does, and a
+    value for a field the form has not got cannot be typed into anything.
+    """
+
+    name, model = "scripted:payloads", "none"
+
+    def __init__(self, *names: str, prose: bool = False) -> None:
+        self.names, self.prose, self.calls = names, prose, 0
+
+    def turn(self, system, transcript, tool_defs):
+        self.calls += 1
+        if self.prose:
+            return Turn(text="I would suggest trying an invalid email address.")
+        return Turn(
+            text="",
+            calls=(
+                ToolCall(
+                    id="payload-1",
+                    name="payload",
+                    arguments={
+                        "fields": [
+                            {"name": n, "value": "@@@", "why": "malformed"}
+                            for n in self.names
+                        ],
+                        "expect": "the form should show a validation error",
+                    },
+                ),
+            ),
+        )
+
+
 class Ranker:
     """Ranks two real candidates, invents a third, and omits the rest.
 
@@ -223,6 +258,216 @@ def render_verdicts(result) -> str:
         f"{step.verdict}({step.resolution.rung}): {step.detail[:90]}"
         for step in result.steps
     ) or "no steps ran"
+
+
+def _map_of(edges: list[tuple[str, str, str, bool]], network=()) -> WorldMap:
+    """A world map with exactly these edges, and one observation behind them.
+
+    `edges` are `(from_key, action, to_key, mutating)`. Every edge points at
+    evidence 0, which is the single observation carrying `network` -- enough for
+    the rules under test and nothing more, so a check that fails is failing
+    about the rule rather than about the fixture.
+    """
+    from .explorer.observer import Observation
+    from .explorer.worldmap import StateNode, Transition
+
+    world = WorldMap()
+    world.evidence = [
+        Observation(url="http://sut/", title="sut", snapshot="", network=tuple(network))
+    ]
+    for from_key, action, to_key, mutating in edges:
+        for key in (from_key, to_key):
+            world.states.setdefault(
+                key, StateNode(key=key, url="http://sut/", title="sut", actions=())
+            )
+        world.transitions.setdefault((from_key, action), []).append(
+            Transition(
+                from_key=from_key,
+                action=action,
+                to_key=to_key,
+                mutating=mutating,
+                evidence=0,
+            )
+        )
+    return world
+
+
+def _invariant_checks() -> bool:
+    """Every rule in `invariants.py`, and the ambiguity each one refuses."""
+    from .explorer.observer import NetworkEvent
+    from .invariants import check as invariants_of
+
+    ok = True
+    valid, invalid, empty = (
+        "submit[valid]:button:Sign in",
+        "submit[invalid]:button:Sign in",
+        "submit[empty]:button:Sign in",
+    )
+
+    # The form let bad input through: valid input moved the app forward, and
+    # input chosen to be rejected arrived in the same place.
+    accepted = invariants_of(
+        _map_of([("a", valid, "b", True), ("a", invalid, "b", True)])
+    )
+    ok &= check(
+        "input the form should reject reaching the success state is a defect",
+        [v.rule for v in accepted] == ["invalid-accepted"],
+        f"rules={[v.rule for v in accepted]}",
+    )
+
+    # The same map with the invalid path landing somewhere else -- a validation
+    # error state -- is a *correct* form, and must be silent.
+    rejecting = invariants_of(
+        _map_of([("a", valid, "b", True), ("a", invalid, "c", False)])
+    )
+    ok &= check(
+        "a form that rejects bad input reports nothing",
+        rejecting == (),
+        f"rules={[v.rule for v in rejecting]}",
+    )
+
+    # Neither path moves and nothing fires: the form does not discriminate, and
+    # which way it fails is not decidable from one crawl. Refusing to guess is
+    # the same policy as ESCALATE.
+    undecidable = invariants_of(
+        _map_of([("a", valid, "a", False), ("a", invalid, "a", False)])
+    )
+    ok &= check(
+        "valid and invalid behaving identically is reported as undecidable",
+        [v.rule for v in undecidable] == ["no-validation"],
+        f"rules={[v.rule for v in undecidable]}",
+    )
+    ok &= check(
+        "an undecidable form is not upgraded to 'invalid-accepted'",
+        all(v.rule != "invalid-accepted" for v in undecidable),
+    )
+
+    # An empty submission that reaches the success state means the fields were
+    # never required. That it also fired a POST is deliberately not a second
+    # violation -- see the `empty-mutates` paragraph in `invariants.py`.
+    empties = invariants_of(
+        _map_of([("a", valid, "b", True), ("a", empty, "b", True)])
+    )
+    ok &= check(
+        "an empty submission reaching the success state is a defect",
+        [v.rule for v in empties] == ["empty-accepted"],
+        f"rules={[v.rule for v in empties]}",
+    )
+    # The rule that was removed for being unprovable must stay removed: a form
+    # that POSTs on empty submit but lands somewhere else has not been shown to
+    # be wrong, and four such forms on one real site is what a false alarm at
+    # scale looks like.
+    posts_on_empty = invariants_of(
+        _map_of([("a", valid, "b", True), ("a", empty, "c", True)])
+    )
+    ok &= check(
+        "an empty submission that fires a write but lands elsewhere is not a defect",
+        posts_on_empty == (),
+        f"rules={[v.rule for v in posts_on_empty]}",
+    )
+
+    # A valid submit that neither moves nor fires anything is a broken happy
+    # path -- but with no invalid edge beside it there is nothing to compare,
+    # and inventing a verdict from one edge is what these rules must not do.
+    lonely = invariants_of(_map_of([("a", valid, "a", False)]))
+    ok &= check(
+        "one submit edge alone proves nothing",
+        lonely == (),
+        f"rules={[v.rule for v in lonely]}",
+    )
+
+    # A rule may only cite an edge that was walked. An action a state merely
+    # offers is a coverage gap and belongs to `critic.candidates`.
+    unwalked = invariants_of(_map_of([("a", valid, "b", True)]))
+    ok &= check(
+        "an action nobody took is a gap, never a violation",
+        unwalked == (),
+        f"rules={[v.rule for v in unwalked]}",
+    )
+
+    # The server saying it failed is a defect in any application, and a 4xx is
+    # not: a 401 on a login wall is the app working.
+    failed = invariants_of(
+        _map_of(
+            [("a", "link:Reports", "b", False)],
+            network=[NetworkEvent("GET", "http://sut/api/reports", "fetch", 503)],
+        )
+    )
+    ok &= check(
+        "a 5xx anywhere in an edge's evidence is a defect",
+        [v.rule for v in failed] == ["server-error"] and "503" in failed[0].because,
+        f"rules={[v.rule for v in failed]}",
+    )
+    unauthorised = invariants_of(
+        _map_of(
+            [("a", "link:Reports", "b", False)],
+            network=[NetworkEvent("GET", "http://sut/api/reports", "fetch", 401)],
+        )
+    )
+    ok &= check(
+        "a 4xx is the application working, not a violation",
+        unauthorised == (),
+        f"rules={[v.rule for v in unauthorised]}",
+    )
+
+    # Every violation has to be printable and has to point at real evidence,
+    # or the report cites something a human cannot open.
+    ok &= check(
+        "every violation cites evidence that exists",
+        all(v.evidence == 0 and v.because and v.state for v in accepted + empties),
+    )
+
+    # --- what the invalid case actually carried ---------------------------
+    #
+    # The rule above reads "we called it invalid and the app took it" as a
+    # defect, so it inherits whatever the synthesizer chose. These checks are
+    # the guard on that: an all-empty payload is an empty submission wearing an
+    # `invalid` label, and the assumption behind a real payload has to reach
+    # the report rather than being laundered into a verdict.
+    same = _map_of([("a", valid, "b", True), ("a", invalid, "b", True)])
+    hollow = {
+        "button:Sign in": {"values": {"Project name": ""}, "why": {}, "source": "fallback"}
+    }
+    undecidable_input = invariants_of(same, hollow)
+    ok &= check(
+        "an all-empty invalid payload is not reported as a defect",
+        [v.rule for v in undecidable_input] == ["invalid-not-rejectable"],
+        f"rules={[v.rule for v in undecidable_input]}",
+    )
+    ok &= check(
+        "and it says why it could not decide",
+        "every value it carried was empty" in undecidable_input[0].because,
+        undecidable_input[0].because if undecidable_input else "nothing reported",
+    )
+
+    real = {
+        "button:Sign in": {
+            "values": {"Password": "short"},
+            "why": {"Password": "below any length minimum"},
+            "source": "model",
+        }
+    }
+    grounded = invariants_of(same, real)
+    ok &= check(
+        "a real payload still reports the defect",
+        [v.rule for v in grounded] == ["invalid-accepted"],
+        f"rules={[v.rule for v in grounded]}",
+    )
+    ok &= check(
+        "the defect discloses whose assumption it rests on",
+        "chosen by model" in grounded[0].because
+        and "below any length minimum" in grounded[0].because,
+        grounded[0].because if grounded else "nothing reported",
+    )
+
+    # A caller with no synthesizer must get a superset, never a different set:
+    # the payload map only ever suppresses and annotates.
+    ok &= check(
+        "no payload information leaves the verdict unchanged",
+        [v.rule for v in invariants_of(same)] == ["invalid-accepted"],
+    )
+
+    return ok
 
 
 def check(label: str, condition: bool, detail: str = "") -> bool:
@@ -823,6 +1068,125 @@ def main() -> int:
                 "omission deleted evidence instead of demoting it",
             )
 
+            # The one call that decides the order of the final report, and the
+            # only one of the five model calls in this system that used to
+            # leave no durable record. `emit("critic ranked N of M")` is a
+            # count, not evidence -- it cannot say what was asked or what came
+            # back, which is the question anyone asks a day later.
+            import shutil
+
+            from .tracing import TRANSCRIPTS
+
+            probe_run = 999_000
+            shutil.rmtree(TRANSCRIPTS / f"run-{probe_run}", ignore_errors=True)
+            prioritise(mapped, Ranker(), run_id=probe_run)
+            written_files = sorted(
+                (TRANSCRIPTS / f"run-{probe_run}").glob("*-critic.json")
+            )
+            ok &= check(
+                "the critic's ranking leaves a transcript, filed under its run",
+                len(written_files) == 1,
+                f"{len(written_files)} critic transcripts under run-{probe_run}",
+            )
+            if written_files:
+                import json as _json
+
+                record = _json.loads(written_files[0].read_text())
+                ok &= check(
+                    "the transcript carries the prompt, the system and the answer",
+                    bool(record["system"])
+                    and bool(record["prompt"])
+                    and record["exchanges"]
+                    and record["exchanges"][0]["calls"][0]["name"] == "prioritise",
+                    "a transcript was written that cannot reconstruct the call",
+                )
+            shutil.rmtree(TRANSCRIPTS / f"run-{probe_run}", ignore_errors=True)
+
+        # 5b. The synthesizer: the model seam `explorer/__init__` calls the one
+        #     place a model is worth its cost. It held its own Anthropic client
+        #     and checked ANTHROPIC_API_KEY by hand, so on an OPENROUTER key it
+        #     returned None on every call and every cached payload read
+        #     "source": "fallback". Nothing failed; the seam was simply never
+        #     open, and the only trace was a word in a summary line.
+        print()
+        from .explorer.synth import Synthesizer
+
+        form = (("textbox", "Email"), ("textbox", "Password"))
+
+        asked = Synthesizer(provider=Payloads("Email"))
+        payload = asked.invalid_payload("s", "button:Sign in", "Sign in", form)
+        ok &= check(
+            "the synthesizer asks whatever provider llm.load would return",
+            payload.source == "model" and payload.values == {"Email": "@@@"},
+            f"source={payload.source} values={payload.values}",
+        )
+
+        # The extractive rule, same as the critic's. A payload naming a field
+        # this form has not got is not a payload, it is a typo waiting to be
+        # typed into `.first`.
+        wrong = Synthesizer(provider=Payloads("Coupon code"))
+        payload = wrong.invalid_payload("s", "button:Sign in", "Sign in", form)
+        ok &= check(
+            "a payload for a field the form has not got falls back and says why",
+            payload.source == "fallback" and "no field" in wrong.unavailable,
+            f"source={payload.source} unavailable={wrong.unavailable!r}",
+        )
+
+        # Real forms decorate their labels. Matching verbatim meant the seam
+        # did not fire on `practicesoftwaretesting.com/auth/login`, whose
+        # accessible names are `Email address *` and `Password *`.
+        decorated = (("textbox", "Email address *"), ("textbox", "Password *"))
+        loose = Synthesizer(provider=Payloads("Email address"))
+        payload = loose.invalid_payload("s", "button:Login", "Login", decorated)
+        ok &= check(
+            "a decorated field label still matches the model's plain name",
+            payload.source == "model" and payload.values == {"Email address *": "@@@"},
+            f"source={payload.source} values={payload.values}",
+        )
+
+        # Still extractive, and still refuses a guess: two fields that reduce to
+        # the same key are ambiguous, and typing into the wrong one is worse
+        # than falling back.
+        twins = (("textbox", "Email"), ("textbox", "e-mail"))
+        ambiguous = Synthesizer(provider=Payloads("Email"))
+        payload = ambiguous.invalid_payload("s", "button:Go", "Go", twins)
+        ok &= check(
+            "two fields that reduce to one key are refused, not guessed between",
+            payload.source == "fallback",
+            f"source={payload.source} values={payload.values}",
+        )
+
+        prose = Synthesizer(provider=Payloads(prose=True))
+        payload = prose.invalid_payload("s", "button:Sign in", "Sign in", form)
+        ok &= check(
+            "a model that answers in prose degrades instead of raising",
+            payload.source == "fallback"
+            and "without calling payload" in prose.unavailable,
+            f"source={payload.source} unavailable={prose.unavailable!r}",
+        )
+
+        class Broken:
+            name, model = "scripted:broken", "none"
+
+            def turn(self, system, transcript, tool_defs):
+                raise RuntimeError("429 daily quota exhausted")
+
+        dead = Synthesizer(provider=Broken())
+        payload = dead.invalid_payload("s", "button:Sign in", "Sign in", form)
+        ok &= check(
+            "a provider that raises degrades the crawl and names the reason",
+            payload.source == "fallback" and "429" in dead.unavailable,
+            f"source={payload.source} unavailable={dead.unavailable!r}",
+        )
+
+        # The cache is the replay log, and it must not learn a shape twice.
+        cached = asked.invalid_payload("s", "button:Sign in", "Sign in", form)
+        ok &= check(
+            "a form shape already answered is served from the cache",
+            cached.source == "cache" and asked._provider.calls == 1,
+            f"source={cached.source} model calls={asked._provider.calls}",
+        )
+
         # 6. The meta-agent. The brief's headline requirement is that nobody
         #    chooses the stages, so what these check is the *deciding*, not the
         #    stages -- each of which is already covered above.
@@ -911,7 +1275,17 @@ def main() -> int:
 
         browser.close()
 
-    # 7. The prompts are the tunable part; loading them must not silently break.
+    # 7. Invariants: the defects that need no recording of past behaviour.
+    #
+    #    Pure functions over a map, so these build the map by hand rather than
+    #    crawling for one. That is deliberate and not a shortcut -- the shapes
+    #    below are the ones a real crawl produces rarely and a demo needs to
+    #    survive, and waiting for an application to exhibit them is how a rule
+    #    ships untested. Every map here is one a `?bug=` variant could produce.
+    print()
+    ok &= _invariant_checks()
+
+    # 8. The prompts are the tunable part; loading them must not silently break.
     print()
     for role, marker in (
         ("ant", "explorer ant"),
