@@ -901,6 +901,198 @@ def _behaviour_rule_enum():
     return items["properties"]["rule"]["enum"]
 
 
+def _mission_checks() -> bool:
+    """An orchestrator must not hand an ant a mission the ant cannot perform.
+
+    Found by a peer session running the pipeline against saucedemo: the
+    orchestrator instructed three separate ants to "submit standard_user /
+    secret_sauce". An ant has no way to do that. `forms.value_for` fills every
+    field from the `Credentials` the run was constructed with, which come from
+    `AIVAR_USERNAME` / `AIVAR_PASSWORD` -- so with those unset each ant typed
+    `aivar-explorer` / `Test-Password-1`, failed to log in, and returned "3
+    actions, 0 new states". The orchestrator read three identical dead ends as
+    evidence about the application rather than about its own plan, and spent a
+    quarter of the colony's budget doing it.
+
+    A citation guard catches a false *claim* after the fact. This catches a
+    false *plan* before the ants are spent, which is the only point at which
+    the budget is still recoverable.
+    """
+    print("MISSION     an ant is not sent to do what an ant cannot do")
+    ok = True
+
+    from . import tools
+    from .explorer.forms import Credentials
+
+    world = _behaviour_world()
+    none_held = Credentials()
+    held = Credentials("standard_user", "secret_sauce")
+
+    def refuse(instruction, credentials):
+        return tools.refuse_assignment(
+            world,
+            {"state": "aaaaaaaa", "agent": "ant", "instruction": instruction},
+            credentials=credentials,
+        )
+
+    spelled = refuse("Submit standard_user / secret_sauce on the login form", none_held)
+    ok &= check(
+        "an instruction naming literal credentials is refused when none are held",
+        spelled is not None,
+        "the ant would have typed the configured default and reported a dead end",
+    )
+    ok &= check(
+        "the refusal says where credentials actually come from",
+        spelled is not None and "AIVAR_USERNAME" in spelled,
+        f"refusal={spelled!r}",
+    )
+    ok &= check(
+        "a slash-free credential pair is caught too",
+        refuse("log in as admin:hunter2", none_held) is not None,
+    )
+
+    ok &= check(
+        "the same instruction is allowed when the run does hold credentials",
+        refuse("Submit standard_user / secret_sauce on the login form", held) is None,
+        "refusing here would forbid the one mission that can actually succeed",
+    )
+
+    # False positives are the whole risk: this gate reads free text, and an
+    # over-eager rule silently forbids ordinary exploration.
+    for benign in (
+        "Get through the login form and report what is behind it",
+        "Explore the cart and check whether items persist after a reload",
+        "Try submitting the form with nothing filled in",
+        "Follow the v2 link and report the destination",
+        "Check whether this state traps the user or allows return to the form",
+    ):
+        ok &= check(
+            f"not refused: {benign[:44]}...",
+            refuse(benign, none_held) is None,
+        )
+
+    ok &= check(
+        "with no credentials argument the gate is inert, not guessing",
+        tools.refuse_assignment(
+            world,
+            {"state": "aaaaaaaa", "agent": "ant",
+             "instruction": "submit standard_user / secret_sauce"},
+        ) is None,
+    )
+
+    return ok
+
+
+def _standing_checks() -> bool:
+    """An unanswered question is a coverage gap, and reaches the report as one.
+
+    The prompt half of this was built and then removed, and the removal is the
+    interesting part. Restating unanswered doubts to the orchestrator every
+    wave looked like the `perished` fix and is not: a peer session's saucedemo
+    run showed the decisive doubt was already in the wave-3 context (the
+    transcript only ever appends) and was ignored anyway, and that all 12 ants
+    raised `uncertain` -- mostly about their own limits, nine of twelve citing
+    a state key, so citation does not separate them. See `standing_doubts`.
+
+    What is checked here is the half the evidence supports.
+    """
+    print("STANDING    an unanswered question survives into the report")
+    ok = True
+
+    from . import tools
+    from .ant import Report
+    from .orchestrator import standing_doubts
+
+    world = _behaviour_world()
+    doubt = (
+        "Whether cb977164 is genuinely the inventory page, or is still the "
+        "login page"
+    )
+
+    collected = standing_doubts(
+        [Report(start_key="a" * 16, uncertain=doubt),
+         Report(start_key="b" * 16, uncertain="")],
+        wave=1,
+    )
+    ok &= check(
+        "only an ant that actually raised a doubt contributes one",
+        len(collected) == 1,
+        f"{len(collected)} collected from two reports, one of them silent",
+    )
+    ok &= check(
+        "a collected doubt carries the ant and the state it was raised at",
+        bool(collected) and collected[0][0].startswith("w1")
+        and collected[0][1] == "a" * 16,
+        f"collected={collected}",
+    )
+    ok &= check(
+        "the doubt itself is carried verbatim, not summarised",
+        bool(collected) and collected[0][2] == doubt,
+    )
+    ok &= check(
+        "no reports means nothing to carry",
+        standing_doubts([], wave=1) == (),
+    )
+
+    # The volume rule, measured rather than guessed. `Exploration.gaps` renders
+    # as "WHAT WE DID NOT REACH", which in a real run is ONE line. Folding in
+    # every ant's `uncertain` makes it thirteen, twelve of them reporting the
+    # ant's own limits -- the same dilution just removed from the prompt, moved
+    # into the section whose whole job is the run's honest account of its blind
+    # spots, and read by a judge rather than by a model.
+    #
+    # So a doubt is carried only when it is the ant's ONLY output. Computed,
+    # not semantic: an ant that acted and still doubted has told us something
+    # either way, while an ant that produced nothing but a doubt is saying the
+    # assignment was impossible, which is exactly a gap. Measured against 12
+    # real ants, all of which acted: this carries none of them.
+    busy = Report(start_key="a" * 16, uncertain=doubt, summary="had a look")
+    busy.actions_taken = 3
+    ok &= check(
+        "an ant that acted contributes no gap, however uncertain it was",
+        standing_doubts([busy], wave=1) == (),
+        "measured on 12 real ants: all took 1-4 actions and all raised a "
+        "doubt, so carrying these turns a one-line section into thirteen",
+    )
+
+    blocked = Report(start_key="a" * 16, uncertain=doubt)
+    blocked.actions_taken = 0
+    ok &= check(
+        "an ant that produced nothing but a doubt contributes it",
+        len(standing_doubts([blocked], wave=1)) == 1,
+    )
+
+    many = []
+    for _ in range(9):
+        stuck = Report(start_key="a" * 16, uncertain=doubt)
+        stuck.actions_taken = 0
+        many.append(stuck)
+    ok &= check(
+        "and the list is capped, so a bad run cannot bury the report",
+        len(standing_doubts(many, wave=1)) <= 5,
+        f"{len(standing_doubts(many, wave=1))} carried from 9 blocked ants",
+    )
+
+    # The removal, pinned. A doubt must NOT be restated into the orchestrator's
+    # prompt: measured, that adds a dozen self-reported limitations to the one
+    # context window whose signal-to-noise had already lost to a fabrication.
+    rendered = tools.brief(
+        world, reports=[Report(start_key="a" * 16, uncertain=doubt)],
+        waves_left=1, ants_left=1,
+    )
+    ok &= check(
+        "a doubt reaches the wave it was raised in, through the report",
+        doubt[:30] in rendered,
+    )
+    ok &= check(
+        "but the brief carries no standing-doubt section",
+        "unsettled" not in rendered.lower(),
+        "restating every ant's uncertainty was measured as noise, not signal",
+    )
+
+    return ok
+
+
 def check(label: str, condition: bool, detail: str = "") -> bool:
     print(f"  {'PASS' if condition else 'FAIL'}  {label}")
     if not condition and detail:
@@ -2112,6 +2304,16 @@ def main() -> int:
     print()
     ok &= _verdict_checks()
 
+    # 9g. A plan an ant structurally cannot carry out, refused before the ants
+    # are spent rather than disbelieved after.
+    print()
+    ok &= _mission_checks()
+
+    # 9h. A doubt raised in wave 1 must still be in front of the orchestrator in
+    # wave 3, while the belief it contradicts is still being acted on.
+    print()
+    ok &= _standing_checks()
+
     # 10. Bring-your-own-key. The console's Advanced panel is only a form until
     # the key it holds reaches `load()`; these checks are the wire between them.
     print()
@@ -2141,8 +2343,784 @@ def main() -> int:
     print()
     ok &= _fallback_checks()
 
+    # 15. The suite kept between runs. `runner` could always tell a moved
+    # locator from moved behaviour; nothing wrote the answer back to a file, so
+    # every suite was recompiled from the crawl that had just happened and no
+    # test could ever be older than the change it was meant to catch.
+    print()
+    ok &= _suite_checks()
+
+    # 16. Which world model the plan came from, and the suite that keeps its
+    # past. A recompiled suite agrees with the current app by construction, so
+    # a suite with no versions cannot catch a regression however good its
+    # scenarios are.
+    print()
+    ok &= _planner_checks()
+    print()
+    ok &= _versioning_checks()
+    ok &= _rescue_checks()
+    ok &= _reverify_checks()
+
     print()
     return 0 if ok else 1
+
+
+def _planner_world():
+    """A map with one mutating edge and one navigation edge, both walkable.
+
+    Hand-built rather than crawled because these checks are about which world
+    model the Planner *reads*, and a live crawl would make a failure ambiguous
+    between the planner and the app it was pointed at.
+    """
+    from .explorer.observer import Observation
+    from .explorer.worldmap import StateNode, Transition, WorldMap
+
+    a, b, c = "a" * 16, "b" * 16, "c" * 16
+    world = WorldMap()
+    world.evidence = [Observation(url="http://sut/", title="sut", snapshot="")]
+    for key in (a, b, c):
+        world.states[key] = StateNode(
+            key=key, url="http://sut/", title="sut",
+            actions=("submit[valid]:button:Sign in", "link:Home"),
+            evidence=(0,),
+        )
+    world.entry_key = a
+    for from_key, action, to_key, mutating in (
+        (a, "submit[valid]:button:Sign in", b, True),
+        (b, "link:Home", c, False),
+    ):
+        world.transitions[(from_key, action)] = [
+            Transition(from_key=from_key, action=action, to_key=to_key,
+                       mutating=mutating, evidence=0)
+        ]
+    return world, a, b, c
+
+
+def _planner_checks() -> bool:
+    """Which world model the plan was drawn from, and that the knob is real.
+
+    The claim under test is not "the behavioural model is better" -- that is
+    measured by running both suites. It is the weaker and more important one:
+    the two sources are actually *different*, and `source="map"` cannot leak a
+    scenario the model proposed. A knob that quietly plans the same way either
+    way makes the comparison it exists for meaningless, and would do so
+    silently.
+    """
+    from .behavior import BehaviorModel, Hypothesis
+    from .planner import DEFAULT_SOURCE, compare, plan, source_from_env
+
+    print("PLANNER     one seam, two world models, and a knob that really moves")
+    ok = True
+
+    world, a, b, c = _planner_world()
+    # A flow the map can back: both consecutive pairs are recorded edges.
+    believed = BehaviorModel(
+        summary="a sign-in that leads home",
+        hypotheses=(
+            Hypothesis(
+                claim="signing in leads to the home page",
+                kind="flow",
+                cites=(a, b, c),
+            ),
+        ),
+    )
+
+    rich = plan(world, believed, source="behaviour", limit=8)
+    plain = plan(world, believed, source="map", limit=8)
+
+    ok &= check(
+        "the behavioural planner compiles a believed flow the map can back",
+        rich.from_behaviour == 1
+        and any(s.origin == "behaviour:flow" for s in rich.scenarios),
+        f"origins were {[s.origin for s in rich.scenarios]}",
+    )
+    ok &= check(
+        "the deterministic planner returns nothing the model proposed",
+        plain.from_behaviour == 0
+        and all(s.origin == "map" for s in plain.scenarios),
+        f"origins were {[s.origin for s in plain.scenarios]}",
+        )
+    ok &= check(
+        "and it still plans -- a map-only plan is smaller, not empty",
+        len(plain) > 0,
+        "the deterministic half is the floor every no-key run stands on",
+    )
+    ok &= check(
+        "the behavioural plan contains a scenario the deterministic one cannot",
+        bool({s.name for s in rich.scenarios} - {s.name for s in plain.scenarios}),
+        "if the two sources produce the same suite the knob measures nothing; "
+        "a believed flow is named for the claim it checks, and ranking single "
+        "edges can never propose one",
+    )
+    ok &= check(
+        "and it does not lose the computed scenarios by adding them",
+        {s.name for s in plain.scenarios} - {s.name for s in rich.scenarios} == set()
+        or len(rich) == rich.from_behaviour + rich.from_map,
+        "the semantic layer only ever adds; the map half fills what is left",
+    )
+
+    # The node filter, which is what per-node dispatch and per-node coverage
+    # both stand on.
+    at_b = plan(world, believed, source="map", limit=8, node=b)
+    ok &= check(
+        "a plan narrowed to a node contains only scenarios that cross it",
+        all(any(step.from_key == b for step in s.steps) for s in at_b.scenarios),
+        f"got {[s.node for s in at_b.scenarios]}",
+    )
+    ok &= check(
+        "a scenario names the state its terminal action is taken from",
+        all(s.node == s.steps[-1].from_key for s in rich.scenarios),
+        "the node is what the map colours; deriving it from anything else "
+        "lets a label and its steps disagree after a heal",
+    )
+
+    # No provider at all. This is the whole no-key path, and it must say so.
+    silent = plan(world, None, source="behaviour", limit=8)
+    ok &= check(
+        "with no behavioural model the plan degrades to the map and says so",
+        len(silent) > 0 and silent.from_behaviour == 0 and bool(silent.degraded),
+        f"degraded={silent.degraded!r}",
+    )
+
+    # The knob is read from the environment by both entry points, so a typo
+    # must not silently remove the semantic layer.
+    import os
+
+    before = os.environ.get("PLAN_FROM")
+    try:
+        os.environ["PLAN_FROM"] = "map"
+        ok &= check("PLAN_FROM=map selects the deterministic planner",
+                    source_from_env() == "map")
+        os.environ["PLAN_FROM"] = "behavioural"  # a plausible misspelling
+        ok &= check(
+            "an unrecognised PLAN_FROM keeps the richer source rather than dropping it",
+            source_from_env() == DEFAULT_SOURCE,
+            "a typo that silently removed the semantic layer would corrupt "
+            "exactly the comparison the knob was set to make",
+        )
+    finally:
+        os.environ.pop("PLAN_FROM", None)
+        if before is not None:
+            os.environ["PLAN_FROM"] = before
+
+    ok &= check(
+        "the comparison is computed from the two plans, not asserted",
+        "scenarios" in compare(rich, plain) and "nodes covered" in compare(rich, plain),
+    )
+    return ok
+
+
+def _rescue_checks() -> bool:
+    """Recovering a lost control, and refusing to when the map is ambiguous.
+
+    Every check here is on a hand-built `WorldMap`, so the *policy* is testable
+    without a browser, a key or a live app -- which is the point, because the
+    policy is the part that can quietly start manufacturing green.
+
+    The one that matters most is the tie. Two edges that both behave as the
+    recorded step did is not a repair with a tie to break; it is the map saying
+    the step is now ambiguous, and inventing an answer there is exactly the
+    coin-flip `runner.resolve` declines to make one rung lower.
+    """
+    from . import rescue, runner
+    from .explorer.worldmap import Transition, WorldMap
+    from .generator import Expectation, Scenario, Step
+
+    print("RESCUE      a lost control is looked for, and ties still refuse")
+    ok = True
+
+    here, dest, other = "a" * 16, "b" * 16, "c" * 16
+
+    def step(action: str, moved: bool = True, mutating: bool = False) -> Step:
+        return Step(
+            intent="press the button", action=action, from_key=here, fields=(),
+            expect=Expectation(
+                moved=moved, mutating=mutating, added=(), removed=(), to_key=dest
+            ),
+        )
+
+    def world_with(*edges: tuple[str, str, bool]) -> WorldMap:
+        world = WorldMap()
+        for action, to_key, mutating in edges:
+            world.transitions.setdefault((here, action), []).append(
+                Transition(
+                    from_key=here, action=action, to_key=to_key,
+                    mutating=mutating, evidence=0,
+                )
+            )
+        return world
+
+    # --- which edge replaced the lost one --------------------------------
+    found, why = rescue.replacement(
+        world_with(("button:Log in", dest, False)), here, step("button:Sign in"),
+        "button:Sign in",
+    )
+    ok &= check(
+        "a renamed control landing where the step landed is the replacement",
+        found == "button:Log in",
+        f"got {found!r}: {why}",
+    )
+
+    found, why = rescue.replacement(
+        world_with(("button:Log in", dest, False), ("button:Register", dest, False)),
+        here, step("button:Sign in"), "button:Sign in",
+    )
+    ok &= check(
+        "two controls landing there is an ambiguity, not a repair",
+        found is None and "ambiguous" in why,
+        f"got {found!r}: {why}",
+    )
+
+    # No edge lands on the recorded destination, so the weaker filter runs: the
+    # same kind of control, moving and mutating the same way.
+    found, why = rescue.replacement(
+        world_with(("button:Log in", other, False)), here, step("button:Sign in"),
+        "button:Sign in",
+    )
+    ok &= check(
+        "failing that, the only control of the same kind behaving the same way",
+        found == "button:Log in",
+        f"got {found!r}: {why}",
+    )
+    found, why = rescue.replacement(
+        world_with(("link:Log in", other, False)), here, step("button:Sign in"),
+        "button:Sign in",
+    )
+    ok &= check(
+        "a link does not replace a button",
+        found is None,
+        f"got {found!r}: {why}",
+    )
+    found, why = rescue.replacement(
+        world_with(("button:Log in", other, True)), here,
+        step("button:Sign in", mutating=False), "button:Sign in",
+    )
+    ok &= check(
+        "a control that now mutates where the old one did not is not the same step",
+        found is None,
+        f"got {found!r}: {why}",
+    )
+    found, why = rescue.replacement(
+        world_with(("button:Log in", here, False)), here,
+        step("button:Sign in", moved=True), "button:Sign in",
+    )
+    ok &= check(
+        "a control that stays put where the old one moved is not the same step",
+        found is None,
+        f"got {found!r}: {why}",
+    )
+    found, why = rescue.replacement(
+        world_with(("button:Sign in", dest, False)), here, step("button:Sign in"),
+        "button:Sign in",
+    )
+    ok &= check(
+        "the action that broke is never proposed as its own replacement",
+        found is None,
+        f"got {found!r}: {why}",
+    )
+    found, why = rescue.replacement(world_with(), here, step("button:Sign in"), "x")
+    ok &= check(
+        "an empty region says so rather than raising",
+        found is None and "nothing leaves" in why,
+        f"got {found!r}: {why}",
+    )
+
+    # --- which escalations are even candidates ---------------------------
+    scenario = Scenario(
+        name="sign in", target_url=SUT, steps=(step("button:Sign in"),),
+    )
+    absent = runner.Resolution(action=None, rung="unresolved", detail="gone")
+    present = runner.Resolution(action="button:Sign in", rung="exact", detail="here")
+
+    ok &= check(
+        "a step nothing can play is a candidate for rescue",
+        rescue.unattemptable(
+            runner.Result(scenario, SUT, [
+                runner.StepResult(scenario.steps[0], runner.ESCALATE, absent, "")
+            ])
+        ) == 0,
+    )
+    ok &= check(
+        "a control that resolved but would not fire is not",
+        rescue.unattemptable(
+            runner.Result(scenario, SUT, [
+                runner.StepResult(scenario.steps[0], runner.ESCALATE, present, "inert")
+            ])
+        ) is None,
+        "the app was observed there, so exploring is shopping for a second opinion",
+    )
+    ok &= check(
+        "and neither is a defect",
+        rescue.unattemptable(
+            runner.Result(scenario, SUT, [
+                runner.StepResult(scenario.steps[0], runner.DEFECT, present, "")
+            ])
+        ) is None,
+    )
+
+    # --- the recovered action reaches the scenario as a Repair -----------
+    recovered = rescue.Rescue(
+        scenario="sign in", step=1, intent="press the button",
+        was="button:Sign in", node=here, now="button:Log in", to_key=other,
+        why="the only button here that behaves as recorded", explored=3,
+        source="colony",
+    )
+    patched, repair = rescue.apply(scenario, recovered)
+    ok &= check(
+        "a recovered step is substituted into the scenario",
+        patched.steps[0].action == "button:Log in",
+        f"got {patched.steps[0].action!r}",
+    )
+    ok &= check(
+        "and its evidence is refreshed with where it actually landed",
+        patched.steps[0].expect.to_key == other,
+    )
+    ok &= check(
+        "the repair says it came from an exploration, not from the ladder",
+        repair is not None and repair.rung == "rescue" and "colony" in repair.detail,
+        f"got {repair and (repair.rung, repair.detail)}",
+    )
+    unrecovered = rescue.Rescue(
+        scenario="sign in", step=1, intent="", was="button:Sign in", node=here,
+        why="nothing here behaves as recorded",
+    )
+    patched, repair = rescue.apply(scenario, unrecovered)
+    ok &= check(
+        "a rescue that found nothing changes nothing",
+        repair is None and patched.steps[0].action == "button:Sign in",
+    )
+    return ok
+
+
+def _reverify_checks() -> bool:
+    """A repair is a hypothesis until the repaired scenario has been replayed.
+
+    `verify` used to write a version the moment repairs existed. The claim on
+    the tin was "the healer repaired three locators"; what had actually been
+    established was that three locators *resolved*, which is a different and
+    weaker thing -- the resolution ladder can pick a control that exists, is of
+    the right kind, and does something else entirely.
+
+    Checked against the source rather than by driving a browser, because what
+    is being guarded is an ordering: replay, then decide, then emit. The
+    browser-driven proof is in the e2e run; this is what fails if someone
+    reorders it.
+    """
+    from . import regression
+
+    print("REVERIFY    a repair is not a repair until it has been replayed")
+    ok = True
+
+    body = _function_source(regression, "verify")
+
+    ok &= check(
+        "the repaired scenarios are replayed before anything is emitted",
+        body.index("if reverify:") < body.index("report.emitted = emit("),
+        "emitting first would make the re-verification a postscript",
+    )
+    ok &= check(
+        "a repair the replay contradicts is withdrawn, not written",
+        "report.rejected.extend(repairs)" in body
+        and "confirmed.append(originals[index])" in body,
+    )
+    ok &= check(
+        "and the original scenario is kept when that happens",
+        "confirmed.append(originals[index])" in body,
+        "rewriting to a control that does not work is worse than escalating",
+    )
+    ok &= check(
+        "a version with nothing surviving emits nothing at all",
+        "if not report.applied:\n            return report" in body,
+    )
+    ok &= check(
+        "only the changed scenarios are replayed",
+        "if not repairs:\n                confirmed.append(next_suite[index])" in body,
+        "replaying the whole suite would double every run for no new evidence",
+    )
+    ok &= check(
+        "the emitted version records what the re-verification found",
+        "reverified=report.reverify_counts" in body,
+        "a claim that cannot be read off the manifest is a claim in a log",
+    )
+
+    # The escalation policy: an absence a rescue answered may be repaired; an
+    # escalation nobody answered may not, and a defect never may.
+    ok &= check(
+        "a defect is still never repaired",
+        "blocked = result.verdict == runner.DEFECT or (" in body,
+    )
+    ok &= check(
+        "an escalation nobody could answer is still left exactly as recorded",
+        "and not (rescued is not None and rescued.recovered)" in body,
+    )
+
+    # And the two records reach a reader.
+    version = regression.Version(root=Path("."), number=2, parent=1)
+    ok &= check(
+        "a version carries both records, defaulting to empty rather than absent",
+        version.reverified == {} and version.rescues == (),
+    )
+    ok &= check(
+        "an old version.json without them still loads",
+        "reverified" in regression.Version(root=Path("."), number=1).as_dict(),
+    )
+    return ok
+
+
+def _versioning_checks() -> bool:
+    """A version is immutable, and the healer corrects the map without rewriting it.
+
+    Two separate disciplines, and both are about not destroying evidence:
+
+      * **An emitted version is never edited.** The first draft of `regression`
+        healed the suite in place, which left the claim "the healer repaired
+        three locators" checkable only against a log the healer wrote itself.
+        Emitting v002 beside an untouched v001 makes it checkable with `diff`.
+      * **The healer does not rewrite the crawl.** `store.py` scopes a map to a
+        run so two runs can be compared; a healer that edited the old map to
+        say "the button was always called Log in" would delete the before half
+        of the before/after that proves the app changed at all.
+    """
+    import tempfile
+
+    from . import regression
+    from .explorer.forms import Credentials
+    from .generator import Expectation, Scenario, Step
+
+    print("VERSIONS    an emitted suite is immutable, and the map keeps its past")
+    ok = True
+
+    def scenario(name: str, action: str, from_key: str) -> Scenario:
+        return Scenario(
+            name=name,
+            target_url="http://localhost:3000/sut",
+            steps=(Step(
+                intent="press the button", action=action, from_key=from_key,
+                fields=(),
+                expect=Expectation(moved=True, mutating=True, added=(), removed=(),
+                                   to_key="b" * 16),
+            ),),
+            origin="behaviour:flow",
+        )
+
+    a = "a" * 16
+    first_plan = scenario("sign in", "button:Sign in", a)
+    healed_plan = scenario("sign in", "button:Log in", a)
+    credentials = Credentials(username="u", password="p")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "suite"
+        one = regression.emit(
+            (first_plan,), root, because="recorded from the behaviour world model",
+            credentials=credentials, target_url=first_plan.target_url,
+            mark="mark-one", source="behaviour", outcomes=("passed",),
+        )
+        before = {p.name: p.read_text() for p in one.root.glob("*")}
+
+        two = regression.emit(
+            (healed_plan,), root, because="healed 1 locator(s)",
+            credentials=credentials, target_url=first_plan.target_url,
+            mark="mark-two", source="behaviour", parent=one.number,
+        )
+
+        ok &= check(
+            "a second emit writes a new version rather than overwriting the first",
+            one.label == "v001" and two.label == "v002" and one.root != two.root,
+            f"{one.label} -> {two.label}",
+        )
+        ok &= check(
+            "and every file of the first version is byte-identical afterwards",
+            {p.name: p.read_text() for p in one.root.glob("*")} == before,
+            "a version edited after the fact cannot be diffed against its child, "
+            "which is the only evidence a heal actually happened",
+        )
+        ok &= check(
+            "the child records which version it came from",
+            two.parent == one.number,
+            f"parent was {two.parent}",
+        )
+        ok &= check(
+            "a replay loads the newest version, not the first one written",
+            regression.load(root) == (healed_plan,)
+            and regression.current(root).label == "v002",
+        )
+        ok &= check(
+            "the version records the node each scenario covers, for the map to colour",
+            two.scenarios[0]["node"] == a and a in two.scenarios[0]["covers"],
+            f"got {two.scenarios[0]}",
+        )
+        ok &= check(
+            "and which planner proposed it, so two versions stay comparable",
+            two.from_behaviour == 1 and two.source == "behaviour",
+        )
+        ok &= check(
+            "the baseline keeps the verdict each scenario reported when recorded",
+            one.scenarios[0].get("verdict") == "passed",
+            "a suite that hid what it could not reproduce would report a clean "
+            "baseline and bury the flakiest part of the app",
+            )
+        ok &= check(
+            "the lineage names the current version and every version before it",
+            regression.lineage(root)["current"] == "v002"
+            and len(regression.lineage(root)["versions"]) == 2,
+        )
+
+        # The export: one version's worth of specs, and nothing left over from
+        # a longer previous one.
+        into = Path(tmp) / "generated"
+        (into).mkdir()
+        (into / "99-stale.spec.ts").write_text("// from a longer suite", encoding="utf-8")
+        written = regression.export(two, into)
+        ok &= check(
+            "the export is exactly one version and drops what a longer suite left",
+            len(written) == 1 and not (into / "99-stale.spec.ts").exists(),
+            f"wrote {[p.name for p in written]}",
+        )
+
+    # The map half. A repair is a correction to the world model too, and
+    # applying it must not touch the map it was computed from.
+    repairs = (
+        regression.Repair(scenario="sign in", step=1, intent="press", 
+                          was="button:Sign in", now="button:Log in",
+                          rung="structural", detail="", node=a, to_key="b" * 16),
+        regression.Repair(scenario="sign in again", step=1, intent="press",
+                          was="button:Sign in", now="button:Log in",
+                          rung="structural", detail="", node=a, to_key="b" * 16),
+        regression.Repair(scenario="unplaced", step=1, intent="press",
+                          was="button:Sign in", now="button:Log in",
+                          rung="name", detail="", node="", to_key=""),
+    )
+    updates = regression.map_updates_for(repairs)
+    ok &= check(
+        "two scenarios crossing one state correct the map once, not twice",
+        len(updates) == 1 and updates[0]["state"] == a,
+        f"got {updates}",
+    )
+    ok &= check(
+        "a repair with no state on the map is dropped rather than guessed at",
+        all(u["state"] for u in updates),
+        "patching an unnamed state means patching every state",
+    )
+
+    world, entry, _, _ = _planner_world()
+    rename = ({"state": entry, "was": "submit[valid]:button:Sign in",
+               "now": "submit[valid]:button:Log in", "rung": "structural"},)
+    patched = regression.apply_to_map(world, rename)
+    ok &= check(
+        "the healed action replaces the old one on the state and on its edge",
+        "submit[valid]:button:Log in" in patched.states[entry].actions
+        and (entry, "submit[valid]:button:Log in") in patched.transitions
+        and (entry, "submit[valid]:button:Sign in") not in patched.transitions,
+        f"actions={patched.states[entry].actions}",
+    )
+    ok &= check(
+        "the edge keeps where it went and whether it mutated",
+        patched.transitions[(entry, "submit[valid]:button:Log in")][0].mutating is True,
+        "a locator match is evidence about markup and about nothing else",
+    )
+    ok &= check(
+        "the crawl the repair was computed from is left exactly as it was",
+        "submit[valid]:button:Sign in" in world.states[entry].actions
+        and (entry, "submit[valid]:button:Sign in") in world.transitions,
+        "editing the old map deletes the before half of the before/after",
+    )
+    return ok
+
+
+def _suite_checks() -> bool:
+    """A suite that heals itself must not also heal away a defect.
+
+    The whole value of keeping tests on disk is that the file is a record of
+    what the app did. Two ways to destroy that, and one of them is attractive:
+
+      * heal a step the Runner *classified as a defect*, which turns a red
+        suite green by editing out the evidence. `regression.verify` refuses
+        the whole scenario, not just the offending step.
+      * rewrite a scenario when nothing healed, which churns the file on every
+        run and makes `git diff` on the suite say nothing.
+
+    Both are checked here against constructed Results rather than a live app,
+    because the classification they depend on is `runner`'s job and is already
+    pinned by the drift checks above. What is new here is only what happens to
+    the *file* afterwards.
+    """
+    import tempfile
+
+    from . import regression, runner
+    from .explorer.forms import Credentials
+    from .generator import Expectation, Scenario, Step
+
+    print("SUITE       tests kept between runs, repaired on evidence, never healed green")
+    ok = True
+
+    def scenario(name: str, action: str) -> Scenario:
+        return Scenario(
+            name=name,
+            target_url="http://localhost:3000/sut",
+            steps=(
+                Step(
+                    intent="press the button",
+                    action=action,
+                    from_key="a" * 16,
+                    fields=(),
+                    expect=Expectation(
+                        moved=True, mutating=False,
+                        added=("- heading \"Signed in\"",), removed=(),
+                        to_key="b" * 16,
+                    ),
+                ),
+            ),
+        )
+
+    def outcome(scenario_: Scenario, verdict: str, rung: str, action: str | None):
+        result = runner.Result(scenario=scenario_, target_url=scenario_.target_url)
+        result.steps.append(runner.StepResult(
+            step=scenario_.steps[0],
+            verdict=verdict,
+            resolution=runner.Resolution(action, rung, "constructed for the probe"),
+            detail="",
+            actual_key="c" * 16,
+        ))
+        return result
+
+    plan = scenario("sign in", "button:Sign in")
+
+    # 1. The pure substitution. This is what "heal the Playwright test" means:
+    #    the same scenario, one locator different, everything else identical.
+    healed, repairs = regression.repaired(
+        plan, outcome(plan, runner.HEALED, "structural", "button:Log in")
+    )
+    ok &= check(
+        "a healed step rewrites the locator it was healed onto",
+        healed.steps[0].action == "button:Log in",
+        f"got {healed.steps[0].action!r}",
+    )
+    ok &= check(
+        "healing a locator does not touch what the step expects",
+        healed.steps[0].expect.added == plan.steps[0].expect.added
+        and healed.steps[0].intent == plan.steps[0].intent,
+        "an assertion edited by the healer is an assertion nobody wrote",
+    )
+    ok &= check(
+        "the repair records the rung, not just the outcome",
+        len(repairs) == 1 and repairs[0].rung == "structural"
+        and repairs[0].was == "button:Sign in",
+        f"got {repairs}",
+    )
+
+    # 2. `Resolution.healed` is false on the exact rung, so a passing step is
+    #    not a no-op rewrite -- it produces no repair at all.
+    _, none = regression.repaired(
+        plan, outcome(plan, runner.PASSED, "exact", "button:Sign in")
+    )
+    ok &= check(
+        "a step that resolved exactly produces no repair",
+        none == (),
+        f"got {none}",
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "suite"
+        credentials = Credentials(username="u", password="p")
+
+        # 3. The round trip. A suite that cannot be loaded back is a suite that
+        #    only ever tests the crawl that just produced it.
+        first = regression.emit(
+            (plan,), root, because="recorded from a crawl",
+            credentials=credentials, target_url=plan.target_url,
+            mark="fingerprint-one",
+        )
+        back = regression.load(root)
+        ok &= check(
+            "a saved scenario loads back identical",
+            back == (plan,),
+            "the .json is what a re-run reads; a lossy write loses the past",
+        )
+        ok &= check(
+            "the export lands beside it and is runnable TypeScript",
+            len(list(first.root.glob("*.spec.ts"))) == 1
+            and "@playwright/test" in next(first.root.glob("*.spec.ts")).read_text(),
+        )
+
+        # 4. The trigger. A fingerprint that has not moved must not start a run,
+        #    and a suite with no recorded fingerprint must not report calm.
+        ok &= check(
+            "the suite records the fingerprint it was saved against",
+            regression.current(root).fingerprint == "fingerprint-one",
+            f"got {regression.current(root).fingerprint!r}",
+        )
+        ok &= check(
+            "an unchanged fingerprint is not a change",
+            not regression.Drift(False, "fingerprint-one", "fingerprint-one").changed,
+        )
+        ok &= check(
+            "a suite with no past reports drift rather than calm",
+            regression.Drift(True, "", "anything").changed,
+            "otherwise the first run after adopting a suite checks nothing",
+        )
+
+        # 5. The discipline. A defect leaves the recorded version exactly as it
+        #    was, even though the same run also resolved a locator by healing.
+        version = regression.current(root)
+        before = {p.name: p.read_text() for p in version.root.glob("*.json")}
+        defect = outcome(plan, runner.DEFECT, "structural", "button:Log in")
+        _, would = regression.repaired(plan, defect)
+        ok &= check(
+            "a defect step still computes a repair, so the report can show it",
+            len(would) == 1,
+        )
+        ok &= check(
+            "but the file is left alone: DEFECT is not in the rewrite set",
+            defect.verdict in (runner.DEFECT, runner.ESCALATE),
+            f"verdict was {defect.verdict}",
+        )
+        ok &= check(
+            "the scenario on disk is byte-identical after a defect",
+            {p.name: p.read_text() for p in version.root.glob("*.json")} == before
+            and regression.current(root).number == version.number,
+            "healing a defect turns a red suite green by editing the evidence; "
+            "a version emitted for a defect does the same thing one directory over",
+        )
+
+        # 6. Found by running it: a scenario that heals one step and reports a
+        #    defect on another produced a repair the report listed under HEAL
+        #    and wrote into the manifest's heal log -- for a file it had
+        #    correctly refused to rewrite. The suite stayed honest; the record
+        #    of what had been done to it did not.
+        report = regression.Report(directory=root, target_url=plan.target_url)
+        report.results.append(defect)
+        report.repairs.extend(would)
+        ok &= check(
+            "a repair the scenario's defect withheld is not reported as applied",
+            report.applied == [] and report.withheld == would,
+            f"applied={report.applied} withheld={report.withheld}",
+        )
+        ok &= check(
+            "and the summary says so rather than counting it as published",
+            "withheld" in report.summary() and report.emitted is None,
+            report.summary(),
+        )
+
+    # 7. Also found by running it. The first version gated the replay on the
+    #    fingerprint, and against the SUT's `?bug=1` -- markup identical,
+    #    behaviour broken, which is the orthogonality the fixture is built for
+    #    -- the gate saw an unchanged landing key, skipped the suite and printed
+    #    calm. Three defects were sitting in it. A fingerprint can answer "the
+    #    markup moved"; it can never answer "nothing changed".
+    calm = regression.Drift(False, "same", "same")
+    moved = regression.Drift(True, "before", "after")
+    ok &= check(
+        "an unchanged fingerprint still replays, because it cannot see behaviour",
+        regression.should_replay(calm),
+        "gating on markup drift skips exactly the regressions worth catching",
+    )
+    ok &= check(
+        "the cheap gate is available, but only when asked for by name",
+        not regression.should_replay(calm, if_drifted=True)
+        and regression.should_replay(moved, if_drifted=True),
+    )
+
+    return ok
 
 
 def _fallback_checks() -> bool:

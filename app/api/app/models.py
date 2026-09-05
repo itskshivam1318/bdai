@@ -96,6 +96,15 @@ class TestCase(SQLModel, table=True):
     # colours a node by the worst verdict among the scenarios naming it, so
     # this is the join between a test result and a place on the graph.
     path: str = "[]"
+    # The state whose behaviour this case is about -- the terminal step's
+    # `from_key`, and the one entry of `path` the map colours for it. Nullable
+    # because a case written before suites were versioned has a path and no
+    # node, and re-deriving one would mean re-reading a scenario that may no
+    # longer exist on disk.
+    node: Optional[str] = None
+    # Which emitted suite version ran this case, e.g. `v002`. The join between
+    # a row in this table and a directory of `.spec.ts` a human can read.
+    suite_version: Optional[str] = None
     status: str = "pending"  # pending | passed | failed | healed | defect | escalate
     detail: Optional[str] = None
     created_at: datetime = Field(default_factory=utcnow)

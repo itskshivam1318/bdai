@@ -160,6 +160,12 @@ class Colony:
     compiled: dict = field(default_factory=dict)
     # Every `runner.Result` a healer dispatch produced. The colony's evidence.
     verdicts: list = field(default_factory=list)
+    # The semantic layer, once it exists. A generator dispatch reads it so that
+    # "compile tests for checkout" can compile a *sequence* the colony believes
+    # in, and not only the ranked single edges the map offers. None until
+    # `synthesise` has run, and None for the whole run when no provider is
+    # configured -- which `planner.plan` handles by planning from the map.
+    behaviour: object = None
 
 
 def _send_ant(colony: Colony, state: str, instruction: str, tag: str):
@@ -187,26 +193,38 @@ def _send_generator(colony: Colony, state: str, instruction: str, tag: str) -> s
     tests. A generator sent at a state no scenario reaches says so rather than
     reporting the whole suite -- an agent that answers a narrow question with a
     broad answer is worse than one that answers nothing.
-    """
-    from .generator import scenarios
 
-    every = scenarios(colony.world, limit=colony.budget.ant_actions * 4)
-    here = tuple(
-        scenario
-        for scenario in every
-        if any(step.from_key == state for step in scenario.steps)
+    It plans through `planner.plan`, with the colony's own behavioural model as
+    an input. Before that it called `generator.scenarios` directly, which meant
+    the colony could believe "log in, add an item, reload, check it survived"
+    and then compile only the ranked single edges -- the one agent that had a
+    semantic model of the app was the one agent that never used it.
+    """
+    from .planner import plan
+
+    every = plan(
+        colony.world,
+        colony.behaviour,
+        limit=colony.budget.ant_actions * 4,
     )
-    colony.compiled[state] = here
-    if not here:
+    here = plan(
+        colony.world,
+        colony.behaviour,
+        limit=colony.budget.ant_actions * 4,
+        node=state,
+    )
+    colony.compiled[state] = here.scenarios
+    if not here.scenarios:
         return (
             f"generator {tag}: no scenario passes through [{state[:8]}]. "
             f"{len(every)} exist elsewhere in the map; this region has no "
             "recorded transition worth compiling yet -- send an ant first."
         )
-    names = "; ".join(scenario.name for scenario in here[:4])
+    names = "; ".join(scenario.name for scenario in here.scenarios[:4])
     return (
         f"generator {tag}: compiled {len(here)} scenario(s) through "
-        f"[{state[:8]}] -- {names}"
+        f"[{state[:8]}] ({here.from_behaviour} from the behavioural model) "
+        f"-- {names}"
     )
 
 
@@ -473,6 +491,10 @@ def run(
             world, provider, run_id=run_id,
             on_event=lambda level, message: emit(level, message),
         )
+        # The generator dispatch plans from it. Set here rather than passed to
+        # `Colony(...)` above because it does not exist until this call returns,
+        # and a colony built without it would have to be rebuilt.
+        colony.behaviour = result.behaviour
 
     system = instructions("orchestrator")
     if intent:

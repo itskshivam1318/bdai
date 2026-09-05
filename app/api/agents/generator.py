@@ -102,13 +102,54 @@ class Step:
 
 @dataclass(frozen=True)
 class Scenario:
+    """One runnable path, and where the decision to test it came from.
+
+    `origin` is the only field here a reader cannot derive from the steps, and
+    it exists to make one question answerable with a count instead of an
+    opinion: *does the behavioural model produce better tests than the map
+    alone?* A suite recorded from `planner.plan(source="map")` carries only
+    `map` origins; the default carries both, and the two suites are comparable
+    because every scenario says which half of the planner proposed it.
+    """
+
     name: str
     target_url: str
     steps: tuple[Step, ...]
+    # "map" -- a recorded edge `scenarios()` ranked highly enough to compile.
+    # "behaviour:<kind>" -- a hypothesis the colony believed and the map backed.
+    origin: str = "map"
 
     @property
     def terminal(self) -> Step:
         return self.steps[-1]
+
+    @property
+    def node(self) -> str:
+        """The state whose behaviour this scenario is about.
+
+        Derived, never stored: the terminal step's `from_key` is where the
+        action under test is taken, and a scenario's earlier steps are setup
+        that happens to cross other states. Storing it would let a file's label
+        and its steps disagree after a heal, and the label is what the map
+        colours a node from.
+        """
+        return self.steps[-1].from_key if self.steps else ""
+
+    @property
+    def covers(self) -> tuple[str, ...]:
+        """Every state key the scenario plans to cross, in order.
+
+        The *planned* path, unlike `suite.path_of`, which reports the states a
+        run actually reached. Both exist: this one says what the suite claims to
+        cover, that one says what a particular run proved.
+        """
+        if not self.steps:
+            return ()
+        keys = [step.from_key for step in self.steps]
+        landed = self.steps[-1].expect.to_key
+        if landed and landed != keys[-1]:
+            keys.append(landed)
+        return tuple(keys)
 
 
 def intent_of(action: str, title: str = "", destination: str = "") -> str:
@@ -398,6 +439,7 @@ def from_flow(world: WorldMap, hypothesis) -> Scenario | None:
         name=hypothesis.claim,
         target_url=(entry.url if entry else world.states[path[0]].url),
         steps=tuple(steps),
+        origin=f"behaviour:{hypothesis.kind}",
     )
 
 
@@ -483,6 +525,10 @@ def from_json(text: str) -> Scenario:
     return Scenario(
         name=raw["name"],
         target_url=raw["target_url"],
+        # Absent in every suite written before `origin` existed. Defaulting to
+        # "map" rather than "" keeps an old suite comparable instead of putting
+        # it in a third category no consumer knows how to count.
+        origin=raw.get("origin", "map"),
         steps=tuple(
             Step(
                 intent=step["intent"],

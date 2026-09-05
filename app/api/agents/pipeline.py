@@ -64,7 +64,9 @@ from .explorer.crawler import Budget as CrawlBudget
 from .explorer.crawler import crawl
 from .explorer.forms import Credentials
 from .explorer.worldmap import WorldMap
-from .generator import Scenario, from_flow, scenarios
+from .generator import Scenario
+from .planner import plan as make_plan
+from .planner import source_from_env
 from .runner import DEFECT, ESCALATE, HEALED, PASSED, Result
 from .runner import run as replay
 
@@ -130,6 +132,14 @@ class Pipeline:
     behaviour: BehaviorModel = field(default_factory=BehaviorModel)
     experiments: list = field(default_factory=list)
     waves: int = 0
+    # Which world model the Planner read: `behaviour` (map + semantic layer) or
+    # `map` (the deterministic crawl alone). Recorded rather than assumed,
+    # because it is the independent variable of the comparison the suite
+    # versions exist to support.
+    plan_source: str = ""
+    # The suite version this run emitted, if any. None when the run recorded
+    # nothing -- no scenarios, or a replay that found nothing to repair.
+    version: object = None
 
     def decide(self, stage: str, choice: str, because: str, **evidence) -> Decision:
         decision = Decision(stage, choice, because, evidence)
@@ -234,13 +244,26 @@ def run(
     credentials: Credentials | None = None,
     verify_against: tuple[str, ...] = (),
     on_event=None,
+    plan_source: str = "",
+    keep_suite: bool = True,
+    suite_root=None,
 ) -> Pipeline:
-    """Explore, critique, re-plan if it would help, generate, run, report.
+    """Explore, critique, re-plan if it would help, generate, run, keep, report.
 
     `verify_against` re-runs the generated suite against further URLs after the
     baseline passes. It is how the demo shows healing and defect detection on
     one command: the agent wrote the suite against `?v=1` and nobody told it
     what changed in `?v=2` or `?bug=1`.
+
+    `plan_source` chooses which world model the Planner reads -- `behaviour`
+    (default) or `map`, the deterministic crawl alone. Unset, `PLAN_FROM` in the
+    environment decides. It changes the Planner only: the crawl and the colony
+    run either way, because a plan drawn from an app nobody finished exploring
+    is a worse plan, not a more deterministic one.
+
+    `keep_suite` is what makes a run comparable to the last one. With no suite
+    on disk for this target the plan is emitted as v001; with one, that suite is
+    replayed and anything the Healer repaired is emitted as the next version.
     """
     budget = budget or Budget()
     credentials = credentials or Credentials.from_env()
@@ -447,43 +470,35 @@ def run(
     # recorded transitions -- `from_flow` returns None the moment a consecutive
     # pair has no edge the crawler walked -- so nothing here asserts an
     # expectation that was never observed.
-    believed: list[Scenario] = []
-    unwalked = 0
-    for hypothesis in pipe.behaviour.of_kind("flow"):
-        scenario = from_flow(world, hypothesis)
-        if scenario is None:
-            unwalked += 1
-            continue
-        believed.append(scenario)
-
-    computed = scenarios(world, limit=budget.max_scenarios)
-    # Deduplicated on the action sequence, not the name: a believed flow and a
-    # computed scenario can walk the same edges under different names, and
-    # running both would double-count the coverage they prove.
-    seen = {tuple(step.action for step in s.steps) for s in believed}
-    pipe.plan = tuple(
-        believed
-        + [s for s in computed if tuple(step.action for step in s.steps) not in seen]
-    )[: budget.max_scenarios]
+    planned = make_plan(
+        world,
+        pipe.behaviour,
+        source=plan_source or source_from_env(),
+        limit=budget.max_scenarios,
+    )
+    pipe.plan = planned.scenarios
+    pipe.plan_source = planned.source
 
     announce(
         pipe.decide(
             "generate", f"compiled {len(pipe.plan)} scenarios",
             "each is a path the crawler actually walked, and each assertion is "
             "an effect the application actually produced when it walked it. "
-            f"{len(believed)} came from a flow the colony believed in and the "
-            "rest from ranking the recorded edges"
+            f"{planned.from_behaviour} came from a flow the colony believed in "
+            "and the rest from ranking the recorded edges"
             + (
-                f"; {unwalked} believed flow(s) named an ordering nobody walked "
-                "and were not compiled"
-                if unwalked
+                f"; {planned.uncompilable} believed flow(s) named an ordering "
+                "nobody walked and were not compiled"
+                if planned.uncompilable
                 else ""
-            ),
+            )
+            + (f"; {planned.degraded}" if planned.degraded else ""),
+            source=planned.source,
             scenarios=len(pipe.plan),
-            from_behaviour=len(believed),
-            uncompilable=unwalked,
-            unhappy=sum(1 for s in pipe.plan if "nothing filled" in s.name
-                        or "should reject" in s.name),
+            from_behaviour=planned.from_behaviour,
+            uncompilable=planned.uncompilable,
+            nodes=len(planned.nodes),
+            unhappy=planned.unhappy,
         ),
         surface="suite",
     )
@@ -601,6 +616,16 @@ def run(
             checked=len(pipe.world.states) if pipe.world else 0,
         )
 
+    # --- keep -------------------------------------------------------------
+    #
+    # Everything above this line is one run's opinion of the app. This is where
+    # a run acquires a past: the suite is written to disk under a version, so
+    # the next run has something to replay rather than something to recompile.
+    # A recompiled suite cannot regress -- it is rebuilt from whatever the app
+    # looks like now, so it agrees with the app by construction.
+    if keep_suite:
+        _keep(pipe, page, credentials, announce, emit, suite_root, provider)
+
     pipe.stopped = "complete"
     announce(
         pipe.decide(
@@ -615,6 +640,121 @@ def run(
         surface="report",
     )
     return pipe
+
+
+def _keep(pipe: Pipeline, page, credentials, announce, emit, suite_root=None, provider=None) -> None:
+    """Persist the suite as a version, or replay the saved one and heal it.
+
+    Which of the two happens is decided by the filesystem and not by a flag,
+    for the same reason `regression.main` decides it that way: "is there a
+    suite for this target yet" is a fact about the world.
+
+    **A later run never authors new tests into the kept suite.** The pipeline
+    above has just compiled a fresh plan and that plan is this run's report; it
+    is not the suite. Replacing the saved scenarios with newly compiled ones
+    would rebuild the suite from the app as it is now, which is precisely how a
+    regression suite stops being able to catch a regression.
+    """
+    from . import regression
+
+    directory = suite_root or regression.directory_for(pipe.target_url)
+    existing = regression.current(directory)
+
+    if existing is None:
+        if not pipe.plan:
+            return
+        # The verdicts from the baseline pass, aligned by position. Nothing is
+        # re-run: these scenarios were executed minutes ago against this URL.
+        outcomes = tuple(r.verdict for r in pipe.results[: len(pipe.plan)])
+        counts: dict[str, int] = {}
+        for verdict in outcomes:
+            counts[verdict] = counts.get(verdict, 0) + 1
+        pipe.version = regression.emit(
+            pipe.plan,
+            directory,
+            because=f"recorded from the {pipe.plan_source} world model",
+            credentials=credentials,
+            target_url=pipe.target_url,
+            mark=regression.fingerprint(page, pipe.target_url),
+            source=pipe.plan_source,
+            verdicts=counts,
+            outcomes=outcomes,
+        )
+        regression.export(pipe.version)
+        announce(
+            pipe.decide(
+                "suite", f"recorded {pipe.version.label}",
+                "there was no suite for this target, so this run's plan becomes "
+                "the baseline the next one is measured against; it is kept as "
+                "files rather than recompiled, because a suite rebuilt from the "
+                "current app agrees with the current app by construction",
+                version=pipe.version.label,
+                scenarios=len(pipe.version.scenarios),
+                nodes=len(pipe.version.nodes),
+                from_behaviour=pipe.version.from_behaviour,
+                source=pipe.plan_source,
+            ),
+            surface="suite",
+        )
+        return
+
+    report = regression.verify(
+        page, directory, target_url=pipe.target_url, credentials=credentials,
+        # The run's own provider, so a control nothing on the page can play is
+        # looked for by ants at the region that lost it rather than only by a
+        # breadth-first crawl. `verify` also re-verifies every repair before
+        # emitting -- see its docstring.
+        provider=provider,
+        on_event=lambda level, message: emit(level, message, _surface_for(level, message)),
+    )
+    pipe.version = report.emitted
+
+    if report.emitted is None:
+        announce(
+            pipe.decide(
+                "suite", f"{existing.label} still describes this app",
+                "the saved suite was replayed and nothing needed repair, so no "
+                "new version was emitted -- "
+                + (
+                    f"{len(report.defects)} defect(s) were left on disk exactly "
+                    "as recorded, because rewriting a test that failed is how a "
+                    "suite turns green by deleting the reason it was red"
+                    if report.defects or report.escalations
+                    else "every locator still resolved as written"
+                ),
+                version=existing.label,
+                **report.counts,
+            ),
+            surface="defect" if report.defects else "suite",
+        )
+        return
+
+    announce(
+        pipe.decide(
+            "suite", f"healed {existing.label} into {report.emitted.label}",
+            f"{len(report.applied)} locator(s) were re-resolved against the "
+            "changed markup and written as a new version; the old one is left "
+            "on disk unedited, so what the Healer changed is a diff a human can "
+            "read rather than a claim in a log"
+            + (
+                f". {len(report.emitted.map_updates)} correction(s) were also "
+                "recorded against the world model, so the next plan is not "
+                "drawn from a map naming controls nobody serves any more"
+                if report.emitted.map_updates
+                else ""
+            ),
+            parent=existing.label,
+            version=report.emitted.label,
+            repairs=len(report.applied),
+            rescued=len(report.recovered),
+            withdrawn=len(report.rejected),
+            reverified=len(report.reverified),
+            withheld=len(report.withheld),
+            map_updates=len(report.emitted.map_updates),
+            **report.counts,
+        ),
+        surface="heal",
+    )
 
 
 def verifiable(plan: tuple[Scenario, ...]) -> tuple[Scenario, ...]:
@@ -730,6 +870,34 @@ def report(pipe: Pipeline) -> str:
     if pipe.experiments:
         lines += ["", "WHAT THE COLONY DISPATCHED"]
         lines += [f"  {line}" for line in pipe.experiments]
+
+    # The kept suite, and its history. This is the only section that describes
+    # something outliving the run: everything else is what this run saw, and
+    # this is what the next run will be measured against.
+    if pipe.version is not None:
+        from . import regression
+
+        history = regression.versions(pipe.version.root.parent)
+        lines += [
+            "",
+            f"SUITE ON DISK   {pipe.version.root.parent}",
+            f"  planner: {pipe.plan_source or 'unrecorded'}  "
+            f"({pipe.version.from_behaviour} of {len(pipe.version.scenarios)} "
+            "scenarios came from the behavioural model)",
+        ]
+        for version in history:
+            marker = "->" if version.number == pipe.version.number else "  "
+            lines.append(f"  {marker} {version.render()}")
+        for heal in pipe.version.heals:
+            lines.append(
+                f"     heal: {heal['scenario']} step {heal['step']}: "
+                f"{heal['was']} -> {heal['now']} [{heal['rung']}]"
+            )
+        for update in pipe.version.map_updates:
+            lines.append(
+                f"     map:  [{str(update['state'])[:8]}] "
+                f"{update['was']} -> {update['now']}"
+            )
 
     lines += ["", "SCENARIOS COVERED"]
     if not pipe.plan:

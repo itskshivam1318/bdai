@@ -35,6 +35,7 @@ def init_db() -> None:
 _ADDED_COLUMNS: dict[str, list[tuple[str, str]]] = {
     "chatmessage": [("thread_id", "INTEGER")],
     "testsession": [("context", "TEXT")],
+    "testcase": [("node", "TEXT"), ("suite_version", "TEXT")],
 }
 
 

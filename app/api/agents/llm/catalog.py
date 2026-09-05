@@ -124,9 +124,20 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         label="Sarvam AI",
         key_env="SARVAM_API_KEY",
         key_hint="sk_…",
-        default_model="sarvam-m",
+        # `sarvam-m` was the default until 2026-09-05, when the API began
+        # refusing it: "Model 'sarvam-m' has been deprecated." A deprecated
+        # default is worse than a missing provider, because the key is valid,
+        # the request is well-formed, and the run dies on the first call with
+        # an error that reads like a code fault.
+        default_model="sarvam-105b",
         base_url="https://api.sarvam.ai/v1",
-        models=(ModelChoice("sarvam-m", "Sarvam-M", max_output=8192),),
+        models=(
+            ModelChoice("sarvam-105b", "Sarvam 105B", "cheapest", max_output=8192),
+            ModelChoice(
+                "sarvam-105b-conversations", "Sarvam 105B Conversations",
+                max_output=8192,
+            ),
+        ),
     ),
 )
 

@@ -50,8 +50,18 @@ def path_of(result: Result) -> list[str]:
     return keys
 
 
-def save_results(results: list[Result], run_id: int, session: Session) -> int:
-    """Write one `TestCase` row per result. Returns rows written."""
+def save_results(
+    results: list[Result], run_id: int, session: Session, version: str = ""
+) -> int:
+    """Write one `TestCase` row per result. Returns rows written.
+
+    `version` is the emitted suite label (`v002`) when the results came from
+    replaying a kept suite, and empty when they came from a plan compiled in
+    memory. Stored rather than inferred, because the two are genuinely
+    different claims -- "this is what the saved suite did" and "this is what
+    this run's fresh plan did" -- and a reader who cannot tell them apart
+    cannot tell a regression from a first sighting.
+    """
     written = 0
     for result in results:
         terminal = result.steps[-1] if result.steps else None
@@ -66,6 +76,11 @@ def save_results(results: list[Result], run_id: int, session: Session) -> int:
                 healed_selector=healed.resolution.action if healed else None,
                 status=result.verdict,
                 path=json.dumps(path_of(result)),
+                # The planned node, not the last state reached: a defect is
+                # interesting exactly where the action was taken, and on a
+                # defect those two differ by definition.
+                node=result.scenario.node or None,
+                suite_version=version or None,
                 detail=json.dumps(
                     [
                         {

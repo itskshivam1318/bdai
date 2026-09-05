@@ -25,7 +25,7 @@ export API_PORT
 endif
 
 .DEFAULT_GOAL := help
-.PHONY: help setup hooks dev api web smoke probe pipeline loop generate specs gaps explore crawl trace diff runs mcp mcp-probe worktree list rm check scrub reset stop
+.PHONY: help setup hooks dev api web smoke probe pipeline loop generate specs suite plan gaps explore crawl trace diff runs mcp mcp-probe worktree list rm check scrub reset stop
 
 PY_VERSION := 3.12
 
@@ -71,6 +71,12 @@ gaps: ## Crawl an app and rank what the crawl did not cover. URL=...
 
 generate: ## Crawl an app and print the test plan it compiles to. URL=...
 	cd api && uv run python -m agents.generator "$${URL:-http://localhost:$${WEB_PORT:-3000}/sut}"
+
+suite: ## Record a versioned suite, or replay it and heal into a new version. URL=... PLAN_FROM=map|behaviour
+	cd api && uv run python -m agents.regression "$${URL:-http://localhost:$${WEB_PORT:-3000}/sut}" $${SUITE}
+
+plan: ## Crawl once, plan with and without the behavioural model, compare. URL=...
+	cd api && uv run python -m agents.planner "$${URL:-http://localhost:$${WEB_PORT:-3000}/sut}"
 
 specs: ## Write generated .spec.ts to web/generated, then run them with Playwright
 	cd api && uv run python -c "$$WRITE_SPECS"
