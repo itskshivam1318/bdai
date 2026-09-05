@@ -19,8 +19,10 @@ Needs `make dev` for the SUT at :3000.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
+from pathlib import Path
 
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
@@ -644,25 +646,29 @@ def main() -> int:
             ]
             return world, a
 
-        # Distinct *words* per line, not distinct numbers: `explain` normalises
-        # digits to `#`, so 469 numbered lines collapse to one and the fixture
-        # passes without the fix. The real handbook's lines differ by prose.
-        def _word(n: int) -> str:
-            out = ""
-            while True:
-                out, n = "abcdefghijklmnopqrstuvwxyz"[n % 26] + out, n // 26
-                if n == 0:
-                    return out
-
-        chrome = "\n".join(f'- button "b{_word(i)}"' for i in range(3))
-        handbook = "\n".join(
-            f"- paragraph: chapter {_word(i)} body text" for i in range(469)
+        # Real snapshots, not a generated stand-in. The target is
+        # nondeterministic -- 11, 5, 6 and 2 state maps across four runs of the
+        # same URL on 2026-09-05 -- so re-running it cannot attribute a change
+        # to this code: the variance is larger than the effect. Pinning the
+        # captured pair is what makes the failure repeatable.
+        #
+        # `fixtures/capture.py` refreshes it and records where it came
+        # from. A generated fixture was tried first and was worse than useless:
+        # 469 lines reading `chapter {i}` collapse to one under `explain`'s
+        # digit normalisation, so the check passed before the fix existed.
+        _fixture = json.loads(
+            (Path(__file__).resolve().parent / "fixtures"
+             / "testing-guide-modal.json").read_text(encoding="utf-8")
         )
-        big, big_from = _mapped(chrome, chrome + "\n" + handbook)
+        big, big_from = _mapped(_fixture["before"], _fixture["after"])
         huge = _expectation(big, big_from, "button:Testing Guide")
         ok &= check(
-            "a 469-line document does not become a 469-line assertion",
-            huge is not None and len(huge.added) <= ASSERTION_CAP,
+            "a captured modal does not become a 410-line assertion",
+            # A literal, deliberately not `ASSERTION_CAP`. Written against the
+            # constant, the check compares the cap to itself and passes for any
+            # value of it -- verified 2026-09-05 by setting the cap to 10**9 and
+            # watching this still pass. A check that cannot fail is not evidence.
+            huge is not None and len(huge.added) <= 20,
             f"asserting on {len(huge.added) if huge else 0} lines -- a modal that "
             f"opens correctly will be reported as a defect",
         )
@@ -671,7 +677,10 @@ def main() -> int:
         # filter: "Invalid credentials" is a `paragraph`, it is the single most
         # valuable unhappy-path assertion we generate, and a rule that dropped
         # body text to solve the handbook would drop it too.
-        small, small_from = _mapped(chrome, chrome + '\n- paragraph: Invalid credentials')
+        small, small_from = _mapped(
+            _fixture["before"],
+            _fixture["before"] + '\n- paragraph: Invalid credentials',
+        )
         tiny = _expectation(small, small_from, "button:Testing Guide")
         ok &= check(
             "a small delta is still asserted in full",
