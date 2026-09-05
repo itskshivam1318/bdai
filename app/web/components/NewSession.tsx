@@ -1,7 +1,7 @@
 "use client";
 import { useRouter } from "next/navigation";
-import { useState } from "react";
-import { api } from "@/lib/api";
+import { useRef, useState } from "react";
+import { api, type TestSession } from "@/lib/api";
 
 /** Typing "shop.example" means https://shop.example, not a relative path. */
 function normalise(raw: string): string {
@@ -20,6 +20,15 @@ export default function NewSession() {
   const [showContext, setShowContext] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /*
+   * A session created by a Start that then failed to launch its run.
+   *
+   * Kept so that pressing Start again starts the run on *that* session rather
+   * than leaving a second, empty one in the sidebar every time the API blinks.
+   * Reused only while the typed URL and context still match what was sent --
+   * edit either and it is a different session being asked for.
+   */
+  const started = useRef<TestSession | null>(null);
 
   async function start(e: React.FormEvent) {
     e.preventDefault();
@@ -28,7 +37,23 @@ export default function NewSession() {
     setBusy(true);
     setError(null);
     try {
-      const session = await api.createSession(target, context.trim());
+      const note = context.trim();
+      const kept = started.current;
+      const session =
+        kept && kept.target_url === target && (kept.context ?? "") === note
+          ? kept
+          : await api.createSession(target, note);
+      started.current = session;
+      /*
+       * Start starts it. The session used to be all this button made, and the
+       * run waited on a second click on "Start run" in the console -- so the
+       * one input the product claims to need was a form that submitted to
+       * another form. Creating the run here is what makes the claim true.
+       */
+      const run = await api.createRun(session.target_url, session.id);
+      // Explicitly not awaited: the colony runs for minutes and this button
+      // has a page to go to. Progress arrives on the session's timeline.
+      void api.explore(run.id).catch(() => {});
       router.push(`/s/${session.id}`);
     } catch {
       setError("Couldn't reach the API. Is it running on port 8000?");
