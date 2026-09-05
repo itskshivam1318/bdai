@@ -378,3 +378,45 @@ Measured on existing runs: run 1 30.4%, run 3 8.0%, run 6 26.9% — every one of
 them reporting `passed`.
 
 **Who:** shivam + Claude.
+
+---
+
+## 2026-09-05 02:15 — Intent is derived over the map; no agent declares it at action time
+
+Actor, Action, Context, Intent and Outcome are five different things, and the
+code currently models three. `Transition` carries Actor weakly (`found_by`,
+recorded on discovery rather than on action), Action and Context first-class,
+and Outcome first-class in two orthogonal observations. Intent is not modelled:
+`generator.intent_of` is a pure function of the action string, so `button:Sign
+in` becomes "click Sign in" and nothing else can ever come out.
+
+**Why:** a field that cannot disagree with its input cannot be evidence.
+Verified rather than asserted — the same action with opposite outcomes produces
+identical intent, and the signature takes no map, no state and no outcome
+(`falsify.py`, 2026-09-05). The report joins these sentences and calls the
+result a test plan; what is honoured is the "readable", not the "plan".
+
+**The decision:** intent is **derived data computed over the accumulated map**,
+from more information about the application than the per-page action list, and
+an LLM's job is to organise that information — not to assert intent at the
+moment an action is taken.
+
+**Alternatives rejected:**
+
+*The ant declares its intent before acting.* Rejected on collision: an ant
+declares at the moment it knows least, and two ants working the same region
+produce contradictory claims with no rule for reconciling them. It also moves
+intent to the one place in the system with the least context by design —
+`orchestrator.py`'s whole argument is that an ant sees one state in full and
+the map as two numbers.
+
+*Computed from the outcome alone* (mutating + reachability, as `is_flow`
+already does). Not rejected so much as insufficient: it is free and
+falsifiable, but it can only ever say coarse things like "this accomplished
+something". Kept as the structural floor; the derived layer sits above it.
+
+**Still open:** what extra information the derivation is allowed to read — page
+text, network payloads, form semantics, cross-state structure. That choice
+decides what intent can say, and is the next thing to settle.
+
+**Who:** shivam + Claude, on `work/agent-forensics`.
