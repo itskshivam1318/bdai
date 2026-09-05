@@ -25,16 +25,135 @@ Playwright API note: in Python `aria_snapshot` lives on **Locator**, not Page --
 
 from __future__ import annotations
 
+import os
 import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from playwright.sync_api import Page
 
 from .noise import is_foreign
 from .statekey import state_key
+
+# --- redaction ---------------------------------------------------------------
+#
+# An Observation is persisted verbatim -- snapshot, url and network all reach
+# `StateObservation`, and the url reaches `AppState` and `artifacts/runs/*.json`
+# as well. So whatever a form was filled with is on disk, and measured on this
+# workspace's own database on 2026-09-05, that included real configured
+# credentials:
+#
+#     snapshot : 108 rows carried a non-empty Password value
+#     url      :  48 rows carried a non-empty password= parameter,
+#                 two distinct values, neither producible by synth.py
+#     network  :  39 rows carried a password= in a request URL
+#
+# Nothing masked any of it, and no browser behaviour was protecting it. The
+# a11y tree *does* expose `<input type=password>` values while the field holds
+# one; an earlier reading that it did not came from observing after a submit had
+# navigated and cleared the input. The window that matters is mid-fill, which is
+# exactly when the crawler observes a rejected or non-navigating submit.
+#
+# **Why here.** `observe()` is the single point where all three fields are
+# constructed, so redacting on the way out means plaintext never enters an
+# Observation at all -- and every downstream consumer (store, autosave, the
+# transcripts, the console) is covered without knowing this exists. Masking at
+# render time would be too late: by then it is in `app.db`.
+#
+# **Why the placeholder is not empty.** `statekey.field_value` maps "" to "" and
+# anything else to "filled", so an empty redaction would collapse a filled field
+# into an unfilled one and genuinely merge two states -- the error state after a
+# rejected submit differs from the pristine form by exactly that. Any non-empty
+# placeholder is safe, and the url is not hashed at all (`state_key` takes the
+# snapshot alone), so that half cannot move identity either way.
+REDACTED = "[redacted]"
+
+# Matched against a field's accessible name and against a query parameter's
+# name. Deliberately not against *values*: a value-matching rule keyed on
+# synth.py's fallback password `x` would redact every letter x in the snapshot.
+_SECRET_NAME = re.compile(
+    r"pass(word|phrase|wd)?|secret|token|api[-_. ]?key|auth|otp|\bpin\b|cvv|cvc",
+    re.I,
+)
+
+# One node of an AI-mode aria snapshot carrying a trailing value:
+#   `  - textbox "Password" [active] [ref=e11]: hunter2`
+# Applied per line, so the `[^:]*` cannot run past the node it belongs to --
+# the bug that made a first count of these rows come out at 490 instead of 108.
+_NODE_VALUE = re.compile(
+    r'^(?P<head>\s*-\s+\S+\s+"(?P<name>[^"]*)"[^:]*):\s*(?P<value>.+)$'
+)
+
+
+def _configured_secrets() -> tuple[str, ...]:
+    """Credential values to redact wherever they appear, not just where named.
+
+    The name rules above cover a field called "Password" and a parameter called
+    `password`, which is nearly all of them. This is the backstop for the app
+    that calls it something else -- `Your key`, `q`, `t` -- where only the value
+    identifies it.
+
+    Bounded at four characters on purpose. `AIVAR_PASSWORD=x` would otherwise
+    redact every letter x in every snapshot, and a redaction that destroys the
+    evidence is worse than the exposure it prevents.
+    """
+    secret = os.environ.get("AIVAR_PASSWORD", "")
+    return (secret,) if len(secret) >= 4 else ()
+
+
+def redact_snapshot(snapshot: str) -> str:
+    """Replace the value of any node whose accessible name reads as a secret."""
+    lines = []
+    for line in snapshot.splitlines():
+        found = _NODE_VALUE.match(line)
+        if found and found.group("value").strip() and _SECRET_NAME.search(
+            found.group("name")
+        ):
+            line = f"{found.group('head')}: {REDACTED}"
+        lines.append(line)
+    redacted = "\n".join(lines)
+    for secret in _configured_secrets():
+        redacted = redacted.replace(secret, REDACTED)
+    return redacted
+
+
+def redact_url(url: str) -> str:
+    """Replace the value of any query parameter whose name reads as a secret.
+
+    Returns `url` untouched when there is nothing to do, so a URL that carries
+    no secret is never re-encoded -- `urlencode` would otherwise rewrite the
+    escaping of every other parameter for no reason, and the url is evidence.
+    """
+    if not url:
+        return url
+    split = urlsplit(url)
+    if split.query and any(
+        _SECRET_NAME.search(name) and value
+        for name, value in parse_qsl(split.query, keep_blank_values=True)
+    ):
+        url = urlunsplit(
+            split._replace(
+                query=urlencode(
+                    [
+                        (
+                            name,
+                            REDACTED
+                            if (value and _SECRET_NAME.search(name))
+                            else value,
+                        )
+                        for name, value in parse_qsl(
+                            split.query, keep_blank_values=True
+                        )
+                    ]
+                )
+            )
+        )
+    for secret in _configured_secrets():
+        url = url.replace(secret, REDACTED).replace(quote(secret), REDACTED)
+    return url
 
 # Roles a user can act on. Everything else is layout or prose. Taken from the
 # ARIA widget roles that Playwright actually emits; extend when a real app
@@ -285,10 +404,26 @@ class Observer:
 
         self._recording = False
 
+        # Redacted before the Observation exists, so no consumer has to know.
+        # `elements` is parsed from the redacted snapshot for the same reason --
+        # a parsed Element carries the node's value too.
+        snapshot = redact_snapshot(snapshot)
+
         return Observation(
-            url=self.page.url,
+            url=redact_url(self.page.url),
             title=self.page.title(),
             snapshot=snapshot,
             elements=parse_snapshot(snapshot),
-            network=tuple(self._buffer),
+            # A GET form puts the credential in the request URL, so the network
+            # buffer is a third copy of it -- 39 rows of this database carried
+            # one. Same rule, applied to every event.
+            network=tuple(
+                NetworkEvent(
+                    method=event.method,
+                    url=redact_url(event.url),
+                    resource_type=event.resource_type,
+                    status=event.status,
+                )
+                for event in self._buffer
+            ),
         )

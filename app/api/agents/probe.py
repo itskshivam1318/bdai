@@ -1187,6 +1187,66 @@ def main() -> int:
             f"source={cached.source} model calls={asked._provider.calls}",
         )
 
+        # 5c. Redaction. An Observation is persisted verbatim -- snapshot, url
+        #     and network all reach StateObservation, and the url reaches
+        #     AppState and artifacts/runs too. Measured on this workspace's own
+        #     database before this existed: 108 snapshot rows with a Password
+        #     value, 48 url rows with a password= (two distinct values, neither
+        #     producible by synth.py), 39 network rows. Nothing masked any of
+        #     it. These checks are the three paths plus the two ways a redaction
+        #     can be worse than the exposure.
+        print()
+        from .explorer.observer import REDACTED, redact_snapshot, redact_url
+        from .explorer.statekey import state_key
+
+        filled = (
+            '- form:\n'
+            '  - textbox "Email" [ref=e9]: alice@example.com\n'
+            '  - textbox "Password" [active] [ref=e11]: hunter2-real-password\n'
+            '  - button "Sign in" [ref=e13]'
+        )
+        blank = filled.replace(": hunter2-real-password", ":")
+        hidden = redact_snapshot(filled)
+
+        ok &= check(
+            "a password value is redacted out of the snapshot",
+            "hunter2-real-password" not in hidden and REDACTED in hidden,
+            hidden,
+        )
+        ok &= check(
+            "a non-secret field keeps its value",
+            "alice@example.com" in hidden,
+            "redaction was too broad -- the evidence is the point of the record",
+        )
+        ok &= check(
+            "redacting does not change the state key",
+            state_key(filled) == state_key(hidden),
+            f"{state_key(filled)} != {state_key(hidden)}",
+        )
+        # The failure bdai-16 flagged: field_value maps "" to "" and anything
+        # else to "filled", so an empty placeholder would collapse a filled
+        # field into an unfilled one -- and the error state after a rejected
+        # submit differs from the pristine form by exactly that.
+        ok &= check(
+            "a filled field and an empty one stay distinct after redaction",
+            state_key(hidden) != state_key(blank),
+            "redaction merged a filled form with an empty one",
+        )
+        ok &= check(
+            "a password in the query string is redacted",
+            "hunter2" not in redact_url("http://x/sut?email=a%40b.com&password=hunter2"),
+            redact_url("http://x/sut?email=a%40b.com&password=hunter2"),
+        )
+        # The url is evidence, so a url with nothing to hide must come back
+        # byte-identical rather than re-encoded by a round trip through
+        # urlencode.
+        plain = "http://x/y?a=1&b=hello%20world"
+        ok &= check(
+            "a url with no secret is returned untouched",
+            redact_url(plain) == plain,
+            f"{plain} -> {redact_url(plain)}",
+        )
+
         # 6. The meta-agent. The brief's headline requirement is that nobody
         #    chooses the stages, so what these check is the *deciding*, not the
         #    stages -- each of which is already covered above.
