@@ -581,6 +581,137 @@ def _suites_are_per_session() -> bool:
     return ok
 
 
+def _console_plans_from_behaviour() -> bool:
+    """The console compiles its suite through the planner, not around it.
+
+    `planner.DEFAULT_SOURCE` is `behaviour` and `pipeline.py` honours it, but
+    this router used to call `generator.scenarios(world)` directly. The colony
+    still synthesised a behavioural model, still examined it, still emitted
+    `believes [...]` for every hypothesis -- and then compiled none of them.
+    Every console spec carried `origin="map"`, which made the one comparison
+    `Scenario.origin` exists for return 0 by construction from the entry point
+    most people use.
+
+    The failure was invisible in exactly the way that matters: nothing errored,
+    the suite was the right size, and the only symptom was a badge
+    (`SuitePane.tsx`) that never appeared. So the check is on the wiring rather
+    than on the planner, which was always correct.
+
+    `_compile` is a plain function over two in-memory objects, so this needs no
+    browser, no key and no live app. The map fixture is `agents.probe`'s -- real
+    `Observation`s behind every state, because `expectation()` reads their
+    snapshots and a fixture without them would let a broken consumer pass.
+    """
+    import inspect
+
+    from agents.behavior import BehaviorModel, Hypothesis
+    from agents.probe import _behaviour_world
+
+    from .routers import explore as explore_router
+    from .routers.explore import _compile
+
+    print("\nPLAN        the console compiles through planner.plan")
+    ok = True
+
+    # The checks below exercise `_compile`, which would keep passing if the
+    # router went back to calling `generator.scenarios` around it. So the
+    # regression is guarded where it actually lived: in the call sites.
+    source = inspect.getsource(explore_router)
+    ok &= check(
+        "the router compiles through the planner, not around it",
+        "scenarios(result.world" not in source,
+        "a call site still bypasses `_compile`",
+    )
+    ok &= check(
+        "and does not import the generator's compiler to do it",
+        not hasattr(explore_router, "scenarios"),
+        "`generator.scenarios` is back in the router's namespace",
+    )
+
+    world = _behaviour_world()
+    believed = BehaviorModel(
+        summary="a login form and what is behind it",
+        hypotheses=(
+            Hypothesis(
+                claim="signing in reaches the dashboard",
+                kind="flow",
+                cites=("a" * 16, "b" * 16),
+            ),
+        ),
+    )
+
+    planned = _compile(world, believed)
+    origins = [s.origin for s in planned.scenarios]
+
+    # The check that fails without the fix. Before it, this router never handed
+    # the behavioural model to anything, so no origin could ever say otherwise.
+    ok &= check(
+        "a flow the colony believed in reaches the console's suite",
+        any(o.startswith("behaviour") for o in origins),
+        f"origins were {origins}",
+    )
+    ok &= check(
+        "and the plan says so, so the A/B is a count rather than an opinion",
+        planned.from_behaviour >= 1 and planned.source == "behaviour",
+        f"from_behaviour={planned.from_behaviour}, source={planned.source!r}",
+    )
+    ok &= check(
+        "the believed flow is named for the claim, not for its last click",
+        any(s.name == "signing in reaches the dashboard" for s in planned.scenarios),
+        f"names were {[s.name for s in planned.scenarios]}",
+    )
+
+    # The wider set attribution runs against has to come from the same place.
+    # A claim answered only by a believed flow would otherwise be unmatchable,
+    # and would report as uncovered on a suite that covers it.
+    widened = _compile(world, believed, limit=40)
+    ok &= check(
+        "the set claims are matched against carries the believed flows too",
+        any(s.origin.startswith("behaviour") for s in widened.scenarios),
+        f"origins were {[s.origin for s in widened.scenarios]}",
+    )
+
+    # `PLAN_FROM=map` is the A/B's other arm, and it has to reach the console
+    # too or the measurement can only be taken from the CLI. Read at call time
+    # by `source_from_env`, so setting it here is the same switch a run sees.
+    import os
+
+    was = os.environ.get("PLAN_FROM")
+    os.environ["PLAN_FROM"] = "map"
+    try:
+        deterministic = _compile(world, believed)
+    finally:
+        if was is None:
+            os.environ.pop("PLAN_FROM", None)
+        else:
+            os.environ["PLAN_FROM"] = was
+
+    ok &= check(
+        "PLAN_FROM=map removes the semantic layer from the console as well",
+        deterministic.source == "map"
+        and all(not s.origin.startswith("behaviour")
+                for s in deterministic.scenarios),
+        f"source={deterministic.source!r}, "
+        f"origins={[s.origin for s in deterministic.scenarios]}",
+    )
+
+    # No provider is the demo machine's normal state, and it must still produce
+    # a suite -- demoted to what actually happened, and saying which.
+    bare = _compile(world, BehaviorModel())
+    ok &= check(
+        "with no behavioural model the plan is the map alone",
+        bare.source == "map" and len(bare.scenarios) > 0,
+        f"source={bare.source!r}, {len(bare.scenarios)} scenario(s)",
+    )
+    ok &= check(
+        "and it says why it is smaller rather than reporting a fair comparison",
+        bool(bare.degraded),
+        f"degraded={bare.degraded!r}",
+    )
+
+    return ok
+
+
 def main() -> int:
     print("API         TestClient, throwaway database, no browser\n")
     ok = True
@@ -725,6 +856,7 @@ def main() -> int:
     ok &= _status_policy()
     ok &= _suite_download()
     ok &= _suites_are_per_session()
+    ok &= _console_plans_from_behaviour()
 
     print()
     return 0 if ok else 1

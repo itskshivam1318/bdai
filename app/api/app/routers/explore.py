@@ -38,8 +38,8 @@ from agents.explorer import crawler, forms, store
 from agents.explorer.synth import Synthesizer
 from agents.context import Context, credentials_for, parse as parse_context
 from agents.claims import attribute, claimed_by, gaps_for, steer, with_claimed
-from agents.generator import scenarios
 from agents.llm import load
+from agents.planner import plan as make_plan, source_from_env
 from agents.shots import shooter
 from agents.tracing import start as start_tracing
 from ..byok import Choice, byok
@@ -229,6 +229,23 @@ def _landings(world) -> dict[str, str]:
     not have to know what a WorldMap is to read it, so it is reduced here.
     """
     return {key: node.url for key, node in world.states.items()}
+
+
+def _compile(world, behaviour, *, limit: int = 8):
+    """This run's plan: believed flows first, then the computed suite.
+
+    The console's route to `planner.plan` -- the same one `pipeline.py` takes
+    from the CLI. It used to call `generator.scenarios` directly, which meant
+    the behavioural model was synthesised, examined, emitted as `believes [...]`
+    events, and then contributed *nothing*: every console spec carried
+    `origin="map"`, so the A/B `Scenario.origin` exists to make answerable was
+    structurally 0 from the one entry point most people use.
+
+    A plain function over two in-memory objects on purpose -- `app.probe` calls
+    it with a hand-built map and one hypothesis, so the wiring is checkable
+    without a browser, a key or a live app.
+    """
+    return make_plan(world, behaviour, source=source_from_env(), limit=limit)
 
 
 def _session_context(run: Run, db: Session) -> str | None:
@@ -619,19 +636,26 @@ def _explore(
                     "recorded state(s)",
                     surface="suite",
                 )
-                plan = scenarios(result.world)
+                planned = _compile(result.world, result.behaviour)
+                plan = planned.scenarios
 
                 # The claims the user typed, matched against tests that already
                 # exist -- never against tests a model wrote for them. See
                 # `agents/claims.py` for why that distinction is the product.
                 #
                 # Attribution runs against a *wider* plan than the one that will
-                # be executed: `scenarios()` caps and interleaves for fairness,
+                # be executed: the planner caps and interleaves for fairness,
                 # which is right for a suite nobody asked anything specific of,
                 # and wrong for the one scenario answering a question somebody
                 # typed out. Anything a claim needs is added back below.
+                #
+                # Widened through `_compile` rather than `generator.scenarios`
+                # for the same reason the plan is: a claim answered by a flow
+                # the colony believed in would otherwise never be matchable,
+                # which is this bug one layer down.
                 considered = (
-                    scenarios(result.world, limit=40) if context.claims else plan
+                    _compile(result.world, result.behaviour, limit=40).scenarios
+                    if context.claims else plan
                 )
                 if context.claims and provider:
                     emit(
@@ -698,9 +722,13 @@ def _explore(
                     store.save(result.world, run_id, db)
                     # Re-compiled, not amended: the map grew, so the ranking and
                     # the interleave both change, and patching the old plan would
-                    # produce a suite `generator.scenarios` would never emit.
-                    plan = scenarios(result.world)
-                    considered = scenarios(result.world, limit=40)
+                    # produce a suite the planner would never emit. The colony
+                    # ran again, so `result.behaviour` is this wave's model.
+                    planned = _compile(result.world, result.behaviour)
+                    plan = planned.scenarios
+                    considered = _compile(
+                        result.world, result.behaviour, limit=40
+                    ).scenarios
                     matched = attribute(
                         context.claims,
                         considered,
@@ -727,9 +755,23 @@ def _explore(
                         f"{scenario.name} ({len(scenario.steps)} steps)",
                         surface="suite",
                     )
+                # What the planner decided, not just how much of it there was.
+                # `degraded` is what keeps a no-provider run honest: the source
+                # is demoted to what actually happened rather than left at what
+                # was asked for, so a smaller suite never reads as the semantic
+                # layer having been given its chance and added nothing.
                 emit(
                     "warn" if not plan else "decision",
-                    f"suite: {len(plan)} scenarios compiled from recorded paths",
+                    f"suite: {len(plan)} scenarios compiled from recorded paths "
+                    f"({planned.from_behaviour} from a flow the colony "
+                    "believed in)"
+                    + (
+                        f"; {planned.uncompilable} believed flow(s) named an "
+                        "ordering nobody walked and were not compiled"
+                        if planned.uncompilable
+                        else ""
+                    )
+                    + (f"; {planned.degraded}" if planned.degraded else ""),
                     surface="suite",
                 )
 
@@ -797,7 +839,11 @@ def _explore(
                         target_url=target_url,
                         outcomes=tuple(r.verdict for r in results[: len(plan)]),
                         credentials=credentials,
-                        source="map",
+                        # The source the planner actually used, from the final
+                        # compilation -- not a literal. Hardcoded "map" here
+                        # made the manifest disagree with the origins of the
+                        # very scenarios it was listing.
+                        source=planned.source,
                         # This session's suite, not this URL's. Without the
                         # scope a second session on the same app replays the
                         # first one's baseline and reports tests it never

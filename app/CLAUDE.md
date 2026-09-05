@@ -647,6 +647,17 @@ scenarios, replayed them, showed six verdicts and then threw the tests away**.
 There was nothing to download and nothing to fail next week, which makes "a URL
 in, a meaningful test suite out" a claim about a process rather than an artifact.
 
+**Both entry points compile through `planner.plan`.** `routers/explore.py`
+called `generator.scenarios(world)` directly until 2026-09-05, which meant the
+console synthesised a behavioural model, examined it, emitted `believes [...]`
+for every hypothesis and then compiled none of them -- every console spec
+carried `origin="map"`, so the A/B `Scenario.origin` exists to make answerable
+returned 0 by construction from the entry point most people use. The colony's
+own planner-routed output did not close it either: `_send_generator` writes to
+`colony.compiled`, which lives on `Colony` and never reaches `Exploration`. So
+`PLAN_FROM=map` now applies to the console as well as the CLI, and
+`app/probe.py`'s PLAN section fails if a call site goes back around `_compile`.
+
 **In the console the suite belongs to a session; on the CLI it belongs to the
 target.** `regression.directory_for(url, session_uid=...)` is the difference, and
 it exists because "is there a suite for this target yet" is the right question
