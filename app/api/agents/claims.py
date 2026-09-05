@@ -88,6 +88,7 @@ def attribute(
     scenarios: tuple,
     provider=None,
     on_event=None,
+    where: dict[str, str] | None = None,
 ) -> dict[str, tuple[int, ...]]:
     """Match each claim to the scenarios that exercise it. Indices, verbatim.
 
@@ -108,7 +109,9 @@ def attribute(
     if provider is None or not scenarios:
         return {claim: () for claim in claims}
 
-    turn = provider.turn(SYSTEM, Transcript(prompt=brief(claims, scenarios)), [ATTRIBUTE])
+    turn = provider.turn(
+        SYSTEM, Transcript(prompt=brief(claims, scenarios, where)), [ATTRIBUTE]
+    )
     call = next((c for c in turn.calls if c.name == ATTRIBUTE.name), None)
     if call is None:
         emit("warn", "nothing was attributed to the claims; treating them as uncovered")
@@ -147,8 +150,32 @@ def attribute(
     return matched
 
 
-def brief(claims: tuple[str, ...], scenarios: tuple) -> str:
-    """Both numbered lists. The numbers are the only thing the model may return."""
+def brief(
+    claims: tuple[str, ...], scenarios: tuple, where: dict[str, str] | None = None
+) -> str:
+    """Both numbered lists. The numbers are the only thing the model may return.
+
+    `where` maps a state key to something a person would recognise -- the URL
+    the crawl saw it at. It is a plain dict rather than the WorldMap it comes
+    from so that this module stays about claims; the caller already holds the
+    map and reducing it to key -> url is one comprehension.
+
+    **Without it the brief cannot answer the question it asks.** A crawl of
+    practicetestautomation.com produced two scenarios both named "complete the
+    Submit form and submit it" -- one landing on `/logged-in-successfully/`,
+    one on `/contact/`. Asked which of them covers "a valid login should land
+    on the logged-in-successfully page", the model was shown two identical
+    lines and correctly declined to guess, so the claim came back *uncovered*
+    while the suite had in fact tested it and passed. A false "not tested" on
+    the one thing the user asked for by name is worse than not testing it.
+
+    Measured against a live model 2026-09-05: same claim, same scenarios, the
+    only difference being the line below -- no match, then the right one of the
+    two. A name is not an identity when the generator can emit it twice; where
+    a scenario *ends* is what tells them apart, and it is measured rather than
+    invented, which is what makes it citable at all.
+    """
+    where = where or {}
     lines = ["The tester asked for these to be checked:", ""]
     lines += [f"  [{i}] {claim}" for i, claim in enumerate(claims)]
     lines += ["", "The suite compiled from the crawl contains these scenarios:", ""]
@@ -156,6 +183,12 @@ def brief(claims: tuple[str, ...], scenarios: tuple) -> str:
         steps = " -> ".join(step.intent for step in scenario.steps)
         lines.append(f"  [{i}] {scenario.name}")
         lines.append(f"      {steps}")
+        # Absent for a scenario whose terminal state is not in the map handed
+        # in. Omitted rather than rendered as "unknown": a claim is matched on
+        # what the crawl saw, and a line saying nothing is not evidence.
+        landing = where.get(scenario.terminal.expect.to_key)
+        if landing:
+            lines.append(f"      ends on {landing}")
     lines += [
         "",
         "Call attribute once. Cite scenarios by number. An empty list for a "

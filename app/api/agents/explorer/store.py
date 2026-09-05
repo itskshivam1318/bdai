@@ -301,3 +301,138 @@ def _parse(snapshot: str) -> tuple[Element, ...]:
     from .observer import parse_snapshot
 
     return parse_snapshot(snapshot)
+
+
+# --- scrubbing what was recorded before redaction existed ---------------------
+
+
+def scrub(session: Session) -> dict[str, int]:
+    """Redact credentials already persisted, in place. Returns rows changed.
+
+    `observer.redact_*` stops new exposure; it cannot reach what is already on
+    disk. Measured on this workspace 2026-09-05, before redaction landed: 108
+    `StateObservation.snapshot` rows carrying a Password value, 48 rows with a
+    non-empty `password=` in a URL across two tables, 39 with one in the
+    recorded network traffic. Two of the URL values were real configured
+    credentials rather than anything `synth.py` generates.
+
+    **Rewrites rather than deletes.** `make reset` also removes the credentials,
+    by removing the runs -- which throws away the evidence a map is *for*, and
+    makes remediation and history loss the same button. This keeps every row and
+    changes only the secret, so a scrubbed database still answers every question
+    it could answer before except what the password was.
+
+    **Raw SQL, not the ORM, and that is the point.** The databases that need
+    scrubbing are the old ones, and an old database is precisely the one whose
+    schema has drifted -- this workspace's own `app.db` predates
+    `AppState.fields`, so `select(AppState)` raises `no such column` and the
+    remediation cannot run on the data that needs it most. Reading only the
+    columns it touches makes the tool independent of every column it does not.
+
+    **Safe to run twice.** Redaction is idempotent -- a row already reading
+    `[redacted]` re-renders identically -- so this can be re-run after any crawl
+    that predates the fix without compounding.
+
+    `state_key` is not recomputed and does not need to be: it hashes the
+    normalised snapshot, and `field_value` reduces a field's input to presence,
+    so a redacted value is still "filled" and still hashes to the row's existing
+    key. Verified by `agents.probe`, "redacting does not change the state key".
+    """
+    from .observer import redact_snapshot, redact_url
+
+    changed = {"snapshot": 0, "url": 0, "network": 0}
+    connection = session.connection()
+
+    def columns(table: str) -> set[str]:
+        try:
+            rows = connection.exec_driver_sql(f"PRAGMA table_info({table})").all()
+        except Exception:
+            return set()
+        return {row[1] for row in rows}
+
+    observation_columns = columns("stateobservation")
+    if {"id", "snapshot"} <= observation_columns:
+        wanted = [c for c in ("snapshot", "url", "network") if c in observation_columns]
+        rows = connection.exec_driver_sql(
+            f"SELECT id, {', '.join(wanted)} FROM stateobservation"
+        ).all()
+        for row in rows:
+            row_id, values = row[0], dict(zip(wanted, row[1:]))
+            updates = {}
+
+            if values.get("snapshot"):
+                cleaned = redact_snapshot(values["snapshot"])
+                if cleaned != values["snapshot"]:
+                    updates["snapshot"] = cleaned
+            if values.get("url"):
+                cleaned = redact_url(values["url"])
+                if cleaned != values["url"]:
+                    updates["url"] = cleaned
+            if values.get("network"):
+                # A JSON array of events; only `url` can carry a secret, so it
+                # is rebuilt field by field rather than pattern-matched over the
+                # serialisation.
+                try:
+                    events = json.loads(values["network"])
+                except (TypeError, ValueError):
+                    events = None
+                if isinstance(events, list):
+                    for event in events:
+                        if isinstance(event, dict) and event.get("url"):
+                            event["url"] = redact_url(event["url"])
+                    rebuilt = json.dumps(events)
+                    if rebuilt != values["network"]:
+                        updates["network"] = rebuilt
+
+            for column, value in updates.items():
+                connection.exec_driver_sql(
+                    f"UPDATE stateobservation SET {column} = ? WHERE id = ?",
+                    (value, row_id),
+                )
+                changed[column] += 1
+
+    if {"id", "url"} <= columns("appstate"):
+        for row_id, url in connection.exec_driver_sql(
+            "SELECT id, url FROM appstate"
+        ).all():
+            if not url:
+                continue
+            cleaned = redact_url(url)
+            if cleaned != url:
+                connection.exec_driver_sql(
+                    "UPDATE appstate SET url = ? WHERE id = ?", (cleaned, row_id)
+                )
+                changed["url"] += 1
+
+    session.commit()
+    return changed
+
+
+def main() -> int:
+    """Scrub this checkout's database. Prints what it changed and nothing else.
+
+        cd app/api && uv run python -m agents.explorer.store
+    """
+    from sqlmodel import Session as _Session
+
+    from app.config import settings
+    from app.db import engine
+
+    # Deliberately no `init_db()`: the database this is pointed at is usually an
+    # old one, and creating missing tables before scrubbing would be a schema
+    # change smuggled into a remediation.
+    with _Session(engine) as session:
+        changed = scrub(session)
+
+    print(f"SCRUBBED    {settings.database_url}")
+    for field, count in changed.items():
+        print(f"  {field:<9} {count} row(s) redacted")
+    if not any(changed.values()):
+        print("  nothing to do -- no credential survived in this database")
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(main())

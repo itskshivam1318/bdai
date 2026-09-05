@@ -58,6 +58,7 @@ from playwright.sync_api import Page
 
 from .critic import Gap, prioritise
 from .critic import render as render_gaps
+from .invariants import render as render_violations
 from .explorer.crawler import Budget as CrawlBudget
 from .explorer.crawler import crawl
 from .explorer.forms import Credentials
@@ -118,6 +119,10 @@ class Pipeline:
     results: list[Result] = field(default_factory=list)
     rounds: int = 0
     stopped: str = ""
+    # What each form's invalid-input case actually carried, by descriptor.
+    # Set from the synthesizer during `run`; empty when there was none, which
+    # costs only annotation, never a verdict. See `invariants.payloads_from`.
+    payloads: dict = field(default_factory=dict)
 
     def decide(self, stage: str, choice: str, because: str, **evidence) -> Decision:
         decision = Decision(stage, choice, because, evidence)
@@ -134,6 +139,35 @@ class Pipeline:
     @property
     def repairs(self) -> list:
         return [step for result in self.results for step in result.healed_steps]
+
+    @property
+    def violations(self) -> tuple:
+        """Invariants broken by what the crawl saw. Computed, never stored.
+
+        A field would have to be written at some point in the run and would
+        then be a second copy of something the map already determines -- the
+        stale-status-file failure in `../../CLAUDE.md`, at object scale. The
+        rules are pure dictionary work over a graph that is already in memory,
+        so recomputing costs nothing worth measuring.
+
+        `payloads` is the exception and is stored, because it is not derivable
+        from the map: what a `submit[invalid]` edge actually carried lives in
+        the synthesizer, and the synthesizer does not outlive `run`.
+        """
+        from .invariants import check
+
+        return check(self.world, self.payloads) if self.world else ()
+
+    @property
+    def proven(self) -> list:
+        """Violations that are defects. Excludes the rule that reports doubt.
+
+        `invalid-not-rejectable` says the invalid-input case never carried
+        rejectable input, so nothing was tested there. Counting it as a defect
+        would inflate the headline number with the one finding that explicitly
+        claims nothing.
+        """
+        return [v for v in self.violations if v.rule != "invalid-not-rejectable"]
 
 
 @dataclass
@@ -377,6 +411,40 @@ def run(
             surface="defect" if counts.get(DEFECT) else "heal",
         )
 
+    # Invariants are checked over the finished map rather than during the
+    # crawl, and reported as their own decision. They answer a question no
+    # replay can: `verifiable()` above compares this app against its recorded
+    # self, so on a target we cannot redeploy every verdict it can reach is
+    # PASSED. A broken invariant is the one defect available on first sight.
+    if synthesizer is not None:
+        from .invariants import payloads_from
+
+        pipe.payloads = payloads_from(synthesizer)
+
+    violations = pipe.proven
+    if violations:
+        rules = sorted({violation.rule for violation in violations})
+        announce(
+            pipe.decide(
+                "invariant",
+                f"{len(violations)} invariant(s) broken: " + ", ".join(rules),
+                "these hold for any correct web application, so they were "
+                "decided from this crawl alone and needed no recorded baseline "
+                "to compare against",
+                violations=len(violations),
+                rules=len(rules),
+            ),
+            surface="defect",
+        )
+    else:
+        pipe.decide(
+            "invariant", "no invariant broken",
+            "every rule that could be evaluated over this map held; this is "
+            "not a claim of correctness, only that these properties were "
+            "checked and found intact",
+            checked=len(pipe.world.states) if pipe.world else 0,
+        )
+
     pipe.stopped = "complete"
     announce(
         pipe.decide(
@@ -386,6 +454,7 @@ def run(
             scenarios=len(pipe.plan),
             executed=len(pipe.results),
             gaps_remaining=len(pipe.gaps),
+            invariants_broken=len(violations),
         ),
         surface="report",
     )
@@ -504,6 +573,13 @@ def report(pipe: Pipeline) -> str:
         for step in result.steps:
             if step.verdict != PASSED:
                 lines.append(f"      {step.verdict}: {step.detail}")
+
+    # Placed after OUTCOMES and before HEALER ACTIONS on purpose. OUTCOMES is
+    # what replaying a recording proved; this is what the application was
+    # caught doing on its own terms. Against a target we cannot redeploy the
+    # section above can only say PASSED, so on the organiser's app this is the
+    # only part of the report that can carry a defect at all.
+    lines += ["", render_violations(pipe.violations)]
 
     lines += ["", "HEALER ACTIONS"]
     if not pipe.repairs:

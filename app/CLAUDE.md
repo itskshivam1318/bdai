@@ -105,6 +105,54 @@ uv run python -m agents.explorer.probe     # is the state projection right? (no 
 uv run python -m agents.explorer.crawler <url>   # map an app, print states/transitions/gaps
 ```
 
+### Credentials are redacted at record time, and only there
+
+An `Observation` is persisted verbatim, and it has **three** fields that can
+carry what a form was filled with — `snapshot`, `url`, and `network` — all
+reaching `StateObservation`, with `url` reaching `AppState` and
+`artifacts/runs/*.json` as well. Measured on this workspace's own database on
+2026-09-05, before `observer.redact_snapshot` / `redact_url` existed:
+
+| Path | Rows | What was in them |
+|---|---|---|
+| `snapshot` | 108 | a `Password` node's value — the a11y tree *does* expose it while the field holds one |
+| `url` | 48 | a GET form's `password=`; two distinct values, **neither** producible by `synth.py` |
+| `network` | 39 | the same credential again, in a recorded request URL |
+
+Nothing masked any of it and no browser behaviour was protecting it. Redaction
+happens in `observe()`, before the `Observation` is constructed, so plaintext
+never enters one and no consumer has to know — masking at render time would be
+too late, because by then it is in `app.db`.
+
+Two properties hold it together, and `agents.probe` checks both. The placeholder
+must be **non-empty**: `statekey.field_value` maps `""` to `""` and anything
+else to `filled`, so an empty redaction would collapse a filled field into an
+unfilled one and merge the post-rejection error state with the pristine form.
+And a URL carrying no secret is returned **byte-identical** rather than
+re-encoded, because the URL is evidence.
+
+`make scrub` fixes what was recorded before this existed. It rewrites rather
+than deletes, so every run, state key and transition survives — `make reset`
+also removes the credentials, by removing the evidence. It reads through raw
+SQL on purpose: the databases that need scrubbing are old ones, and an old
+database is exactly the one whose schema has drifted, so the ORM cannot open it.
+
+### Every model call leaves a transcript
+
+`agents/tracing.py:save_transcript` is called by all five: the orchestrator, each
+ant, the critic, the synthesizer and the console's analyst. Files land in
+`api/artifacts/transcripts/run-<id>/` — or `adhoc/` when there is no run, which
+is every CLI entry point. Each holds the system prompt as it was at the time,
+because `prompts/*.md` changes hourly and a transcript that records only the
+conversation cannot say which instructions produced it.
+
+Three of the five were silent until 2026-09-05, and the shape of the omission is
+worth knowing: `save_transcript` takes a `Transcript`, and only the two agents
+running a multi-turn tool loop built one. A single-turn call had nowhere to put
+its exchange, so the critic's one ranking — the call that decides the order of
+the final report — left nothing behind but a count. Adding a role here is two
+lines; skipping it is invisible.
+
 ### The map is persisted, and it is watchable
 
 `agents/explorer/store.py` is the only place the explorer meets the database —
@@ -161,29 +209,52 @@ OPENROUTER_API_KEY                  # probed FIRST by llm.load(), on cost. One
                                     # 2026-09-04 at $0.089 on qwen3-coder-next
                                     # vs ~$3.42 on claude-opus-5 — 112 runs per
                                     # $10 against 3. Optional companions:
-                                    # OPENROUTER_MODEL (any model string) and
+                                    # OPENROUTER_MODEL (any model string),
                                     # OPENROUTER_BASE_URL, which repoints the
                                     # same OpenAICompat class at DeepSeek,
-                                    # Groq, Cerebras or a local Ollama
+                                    # Groq, Cerebras or a local Ollama, and
+                                    # LLM_MAX_TOKENS. That last one is named
+                                    # for the class rather than for OpenRouter
+                                    # because one OpenAICompat serves DeepSeek
+                                    # at 16384 and MiniMax at 32768; unset, the
+                                    # cap comes per-model from the catalogue.
+                                    # It exists because OpenRouter refuses a
+                                    # request it cannot afford *at the
+                                    # requested cap* rather than at the tokens
+                                    # produced: on a nearly-empty balance
+                                    # max_tokens=4096 is a 402 while the same
+                                    # call at 512 succeeds for a fraction of a
+                                    # cent — and the key still reports $9.81 of
+                                    # $10 left, so it reads as a broken key
+                                    # rather than an empty account. Lower it
+                                    # only when the alternative is not running
+                                    # at all
 SARVAM_API_KEY                      # Sarvam AI, which is OpenAI-compatible, so
                                     # it is the same OpenAICompat class at
                                     # https://api.sarvam.ai/v1. Default model
                                     # sarvam-m
 ANTHROPIC_API_KEY / GEMINI_API_KEY  # llm.load() picks a provider by whichever
-                                    # is present. With neither, a console run
-                                    # degrades to `explorer.crawler` — a real
-                                    # map, breadth-first, but no flows, no
-                                    # summary, no intent, and status `degraded`
-                                    # rather than `passed`. Also feeds synth.py:
-                                    # without it invalid payloads come from a
+                                    # is present. With none of the three, a
+                                    # console run degrades to
+                                    # `explorer.crawler` — a real map,
+                                    # breadth-first, but no flows, no summary,
+                                    # no intent, and status `degraded` rather
+                                    # than `passed`. Every model call in the
+                                    # system goes through `llm.load()`,
+                                    # synth.py included — it used to build its
+                                    # own Anthropic client and so stayed dark
+                                    # on an OpenRouter-only key while
+                                    # everything else worked. With no provider
+                                    # at all, invalid payloads come from a
                                     # static mutation table that knows nothing
                                     # about the app, and the crawl prints
-                                    # "PAYLOADS n from fallback" so a degraded
-                                    # run never looks like a good one. Claude's
-                                    # default model is `claude-haiku-4-5` and
-                                    # comes from the catalogue, not from
-                                    # claude.py — changed 2026-09-05, see
-                                    # decisions.md; Opus is one select away
+                                    # "PAYLOADS n from fallback (<reason>)" so
+                                    # a degraded run never looks like a good
+                                    # one. Claude's default model is
+                                    # `claude-haiku-4-5` and comes from the
+                                    # catalogue, not from claude.py — changed
+                                    # 2026-09-05, see decisions.md; Opus is one
+                                    # select away
 AIVAR_USERNAME / AIVAR_PASSWORD     # optional. forms.Credentials — without
                                     # these, any login wall stops the crawl at
                                     # one state
@@ -291,7 +362,12 @@ agent builds on sand:
 - The SUT's three variants are hand-written drift, not a real deploy.
 - `artifacts/invalid-payloads.json` is the replay log for `synth.py`: what the
   model chose to type, keyed by form shape. It makes a crawl reproducible and
-  re-runs free. Delete it to make the agent choose fresh payloads.
+  re-runs free. Delete it to make the agent choose fresh payloads. A
+  `"source": "fallback"` entry is a record of a degraded run rather than an
+  answer, so it is **not** served once a provider exists — otherwise an
+  afternoon with no key set silently pins every later run to the mutation
+  table. Model-sourced entries are still served unconditionally, which is where
+  the reproducibility comes from.
 
 If you add another, say so in a comment where it lives and add a line here.
 
@@ -409,10 +485,11 @@ From here or from the repo root; `make` with no arguments lists every target.
 make setup     # first run only: npm install, uv sync, playwright install
 make dev       # both servers — web :3000, api :8000
 make pipeline  # the whole claim: URL in, test quality report out
-make probe     # 176 observable checks. No API key, no quota
+make probe     # 266 observable checks. No API key, no quota
 make gaps      # crawl an app and rank what the crawl did not cover
 make specs     # write generated .spec.ts, then run them with Playwright
 make check     # typecheck + lint — run before handing work off
+make scrub     # redact credentials already recorded (keeps every run)
 make reset     # wipe the database and artifacts
 make stop      # kill the servers
 ```

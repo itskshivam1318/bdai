@@ -14,6 +14,9 @@ __pycache__/
 # local data & artifacts
 *.db
 *.db-journal
+# `make scrub` backups. Named app.db.pre-scrub-<time>, so `*.db` misses
+# them -- and they hold the plaintext credentials the scrub just removed.
+*.db.pre-scrub-*
 app/api/artifacts/*
 !app/api/artifacts/.gitkeep
 .playwright-mcp/

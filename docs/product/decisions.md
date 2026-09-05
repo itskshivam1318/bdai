@@ -533,6 +533,114 @@ recorded in one is not visible in the other.
 
 ---
 
+## 2026-09-05 02:15 — Intent is derived over the map; no agent declares it at action time
+
+Actor, Action, Context, Intent and Outcome are five different things, and the
+code currently models three. `Transition` carries Actor weakly (`found_by`,
+recorded on discovery rather than on action), Action and Context first-class,
+and Outcome first-class in two orthogonal observations. Intent is not modelled:
+`generator.intent_of` is a pure function of the action string, so `button:Sign
+in` becomes "click Sign in" and nothing else can ever come out.
+
+**Why:** a field that cannot disagree with its input cannot be evidence.
+Verified rather than asserted — the same action with opposite outcomes produces
+identical intent, and the signature takes no map, no state and no outcome
+(`falsify.py`, 2026-09-05). The report joins these sentences and calls the
+result a test plan; what is honoured is the "readable", not the "plan".
+
+**The decision:** intent is **derived data computed over the accumulated map**,
+from more information about the application than the per-page action list, and
+an LLM's job is to organise that information — not to assert intent at the
+moment an action is taken.
+
+**Alternatives rejected:**
+
+*The ant declares its intent before acting.* Rejected on collision: an ant
+declares at the moment it knows least, and two ants working the same region
+produce contradictory claims with no rule for reconciling them. It also moves
+intent to the one place in the system with the least context by design —
+`orchestrator.py`'s whole argument is that an ant sees one state in full and
+the map as two numbers.
+
+*Computed from the outcome alone* (mutating + reachability, as `is_flow`
+already does). Not rejected so much as insufficient: it is free and
+falsifiable, but it can only ever say coarse things like "this accomplished
+something". Kept as the structural floor; the derived layer sits above it.
+
+**Still open:** what extra information the derivation is allowed to read — page
+text, network payloads, form semantics, cross-state structure. That choice
+decides what intent can say, and is the next thing to settle.
+
+**Who:** shivam + Claude, on `work/agent-forensics`.
+
+## 2026-09-05 06:45 — One provider seam, and every model call leaves a transcript
+
+A forensic pass over the five model callers — orchestrator, ant, critic,
+synthesizer, analyst — found three of them wired around the shared plumbing
+rather than through it. All three failures were silent by construction.
+
+**`synth.py` built its own `anthropic.Anthropic()`** and gated on
+`ANTHROPIC_API_KEY`. This workspace runs on `OPENROUTER_API_KEY`, so `_ask`
+returned `None` on every call and all five entries in
+`artifacts/invalid-payloads.json` read `"source": "fallback"`. The seam
+`explorer/__init__.py` calls *"the one place a model is worth its cost"* had
+never once fired, while every other model call in the system worked.
+
+**The decision:** every model call goes through `llm.load()`. There is exactly
+one place that answers "which provider", and adding a second way to find one is
+adding a second way to not find one. The structural guarantee that made the
+synthesizer a `json_schema` response — a payload or nothing, never prose to
+parse — is preserved as a `Tool`, which every provider serialises.
+
+**Degradation must name itself.** `Synthesizer.unavailable` carries the reason
+and the crawl prints it (`PAYLOADS 5 from fallback (RuntimeError: ...)`). A
+fallback that cannot say why it fell back is indistinguishable from a design.
+
+**`critic.prioritise` wrote no transcript** — the single call that decides the
+order of the final report, recorded only as the count `critic ranked 9 of 14`.
+The analyst wrote none either. The cause was not a policy: `save_transcript`
+takes a `Transcript`, and only the two agents with a multi-turn tool loop built
+one, so a single-turn call had nowhere to put its exchange. A dataclass boundary
+had become a logging policy without anyone choosing it. All five now write.
+
+**The console ran no critic.** `routers/explore.py` emitted `Exploration.gaps` —
+free text the orchestrator wrote into its `finish` call — as `gap:` lines. That
+is uncited, unverifiable model output presented as coverage evidence, which is
+the exact class of output `critic.py` was built to make structurally impossible,
+sitting on the one path the demo actually shows.
+
+**The decision:** the console runs `critic.prioritise` on both paths, model or
+not, and the two kinds of statement are **kept apart rather than merged**.
+Computed candidates print as `gap [kind] action in state -- risk` and can be
+looked up in the map. The colony's prose prints as `noted:` and is kept, because
+it names things no cell of a state table can — *"we never got past the login
+wall"* is a real observation and not a citation. One is evidence, the other is a
+claim; a reader who cannot tell them apart has neither.
+
+`_crawl_only` also stopped formatting its own gap strings from the top three
+rows of `WorldMap.gaps()`. That was one of four gap kinds, truncated, and it
+made the no-model path's coverage claim mean something different from every
+other path's.
+
+**Not a bug, corrected here:** transcripts filed under `adhoc/` rather than
+`run-<id>/` looked like broken `run_id` plumbing. It is not — every console run
+in `app.db` had errored on "no model configured" or run `degraded` on the
+deterministic crawler, so no console run had ever had a model to transcribe.
+Same root cause as the synthesizer, one layer up.
+
+**Evidence:** `make probe` — 149 checks, 0 fail, exit 0, measured inside a window
+where `(git status --porcelain; git diff; git diff --cached) | shasum` was
+identical before and after. Two earlier numbers taken in this session are
+withdrawn: they were guarded by `git status --porcelain | shasum`, which hashes
+filenames and status letters rather than content and so cannot see a second
+session editing an already-modified file. Nine checks are new and each
+is one of the above: the synthesizer asking a passed provider, refusing a field
+the form has not got, degrading on prose, degrading on a raised exception,
+serving the second identical form shape from cache, and the critic filing a
+transcript under its run that can reconstruct the call.
+
+**Who:** shivam + Claude, on `work/agent-forensics`.
+
 ## 2026-09-05 09:15 — Bring your own key: a provider, a key, and a model that all mean the same thing on both sides
 
 The Advanced panel already existed and was a **prop**. It wrote two keys and a
@@ -654,6 +762,99 @@ topped up; `minimax/minimax-m3:free` is the working route.
 **Who:** shivam + Claude.
 
 ---
+
+## 2026-09-05 09:20 — Credentials are redacted at record time, in the observer
+
+`Observation` is persisted verbatim and has three fields that can carry what a
+form was filled with. All three were carrying credentials, and nothing masked
+any of them. Measured on this workspace's `app.db`:
+
+    snapshot   108 rows, a Password node's value, one distinct value, synthetic
+    url         48 rows, a GET form's password=, two distinct values, NEITHER
+                producible by synth.py -- both from a configured AIVAR_PASSWORD
+    network     39 rows, the same credential again in a request URL
+
+**The decision:** redact in `Observer.observe()`, before the `Observation` is
+constructed. It is the one point where all three fields are built, so plaintext
+never enters an `Observation` and every downstream consumer — `store`,
+`autosave`, the transcripts, the console — is covered without knowing redaction
+exists. Render-time masking was rejected: by then the plaintext is in `app.db`.
+
+**Keyed on names, not values.** A field's accessible name and a query
+parameter's name are matched against a secret-name pattern. Value-matching is
+the backstop only, and only for a configured `AIVAR_PASSWORD` of four
+characters or more — `synth.py`'s fallback password is `x`, and redacting every
+letter x would destroy the evidence the record exists for.
+
+**Two constraints, both checked:**
+
+- The placeholder must be non-empty. `statekey.field_value` maps `""` to `""`
+  and anything else to `filled`, so an empty redaction merges the post-rejection
+  error state with the pristine form. `state_key` hashes the snapshot alone, so
+  the URL half cannot move identity at all.
+- A URL with no secret comes back byte-identical. The URL is evidence, and a
+  round trip through `urlencode` would rewrite every other parameter's escaping
+  for nothing.
+
+**`make scrub` rewrites; it does not delete.** `make reset` also removes the
+credentials — by removing the runs, which makes remediation and history loss the
+same button. Scrubbing keeps every row and changes only the secret: verified at
+108/48/39 → 0/0/0 on a copy, with all 57 state keys and 258 transitions
+identical, and idempotent on a second run. It reads through raw SQL because the
+databases that need scrubbing are old ones, and this workspace's own `app.db`
+predates `AppState.fields` — `select(AppState)` raises `no such column` on
+exactly the data that most needs the fix.
+
+**How this was found, because the method matters more than the finding.** Three
+sessions converged on it from three directions and the first two answers were
+both wrong. Reasoning from `statekey.field_value` — which reduces input to
+presence — says values are not stored; that is the projection, and
+`StateObservation` is the record. Testing it *after* a submit shows no password;
+that is the navigation having cleared the input. The window is mid-fill, which
+is when the crawler observes a rejected or non-navigating submit.
+
+**Severity:** local disk only. `artifacts/` is gitignored bar `.gitkeep` and
+`app.db` is untracked, so nothing reached git.
+
+**Who:** shivam + Claude on `work/agent-forensics`; snapshot path found by
+bdai-68, URL path by bdai-16, network path and the fix by this session.
+
+## 2026-09-05 09:50 — Redaction covers credentials only, and the model is the reason it can
+
+`cac872e` redacts password-class fields in `observe()`. Emails and usernames are
+deliberately left intact. Ratified rather than assumed, after a fourth exposure
+path turned up that changes what the scope decides.
+
+**The path.** An ant reads the page and writes free text into `report()`.
+Anything it can see, it can repeat into prose that no name-keyed rule will ever
+catch, because prose has no field name to key on. Observed on the canary run:
+the email appears in an orchestrator transcript as *"Submitting with valid
+credentials (email: canary@example.com) leads to a new authenticated state"* —
+written by the model, not by any observation.
+
+**Which is why `observe()` is the only correct position.** The password is
+absent from every transcript precisely because it was redacted *before*
+`tools.describe` rendered the state for the model, so the model never held it to
+repeat. Upstream of the model is the one place where that property holds; there
+is no second line of defence behind it. Anything left unredacted there can be
+laundered into free text, and a later redactor cannot recover it.
+
+**The decision:** credentials only. An email address is frequently the
+behaviourally interesting part of a state — *logged in as alice@* is what
+distinguishes an authenticated state from an anonymous one — and redacting it
+would remove evidence the record exists to hold, on an auth flow, which is the
+flow this system is most often pointed at. The acute exposure was the password,
+and that is closed.
+
+**What this decision costs, stated so nobody rediscovers it as a bug:** an email
+typed into a form reaches `app.db`, `artifacts/runs/*.json` and the transcripts,
+and can be repeated by a model into prose. Point this at a production system with
+real user data and that is real PII on local disk. `_SECRET_NAME` in
+`observer.py` is the one line to widen; the value backstop in
+`_configured_secrets` is bounded at four characters and would need the same care,
+since a short common value redacts everything.
+
+**Who:** shivam decided the scope; Claude on `work/agent-forensics`.
 
 ## 2026-09-05 10:00 — A document between states is a normal thing to meet, not a reason to end a run
 

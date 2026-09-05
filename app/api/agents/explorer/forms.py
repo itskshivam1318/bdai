@@ -444,8 +444,14 @@ def fill_form(
     credentials: Credentials,
     scope=None,
     overrides: dict[str, str] | None = None,
+    clear: bool = False,
 ) -> int:
     """Type into the fields of one form. Returns how many were filled.
+
+    `clear` empties every field instead of filling it, and exists so that
+    `submit[empty]` can mean what it says. See `fill_and_submit`: not filling a
+    form is not the same as the form being empty, and the difference is a
+    defect the map will otherwise record as the application's.
 
     `scope` is the form to stay inside, from `form_of`. Without it every field
     on the page is fair game, which is wrong on any page carrying two forms --
@@ -483,8 +489,12 @@ def fill_form(
                 field = _next_unnamed(root, element.role, cursor)
                 if field is None:
                     continue
-            value = (overrides or {}).get(
-                element.name, value_for(element.role, element.name, credentials)
+            value = (
+                ""
+                if clear
+                else (overrides or {}).get(
+                    element.name, value_for(element.role, element.name, credentials)
+                )
             )
             field.fill(value, timeout=3000)
             filled += 1
@@ -537,6 +547,22 @@ def perform(
         overrides = synthesizer.invalid_payload(
             state_key, descriptor, observation.title, fields_of(observation)
         ).values
+
+    # **An unfilled form is not an empty one.** `submit[empty]` used to click
+    # the button without typing anything, which is only the same thing when the
+    # fields happen to already be blank -- and the crawler itself creates
+    # states where they are not. Measured on saucedemo: `submit[valid]:button`
+    # fills the login form and then clicks the error-dismiss X, so the state it
+    # lands in has valid credentials sitting in the inputs. `submit[empty]`
+    # from there logged in, the map recorded `empty -> inventory`, and
+    # `invariants.empty-accepted` reported saucedemo as failing to require its
+    # own login fields. The application was correct; the edge was a lie.
+    #
+    # Clearing is unconditional rather than conditional on the fields looking
+    # dirty, because "looks dirty" is another observation that can be wrong,
+    # and filling a blank field with "" costs nothing.
+    if mode == "empty":
+        fill_form(page, observation, credentials, scope, clear=True)
 
     if mode in {"valid", "invalid"} and not fill_form(
         page, observation, credentials, scope, overrides

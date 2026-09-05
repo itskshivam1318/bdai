@@ -10,6 +10,7 @@ the console cannot render without: `GET /api/runs/{id}/map`.
 from __future__ import annotations
 
 import json
+import pathlib
 import sys
 import tempfile
 
@@ -85,6 +86,169 @@ def seed(session: Session) -> int:
     )
     session.commit()
     return run.id
+
+
+
+def _invariant_reporting() -> bool:
+    """The console path must report invariants, not only the CLI pipeline.
+
+    `agents/invariants.py` is the only oracle that can fire on the first crawl
+    of an application we cannot redeploy -- every replay verdict against an
+    unchanged third-party target is PASSED by construction. It was wired into
+    `agents/pipeline.py` and not into this router, which meant the surface we
+    demo was the one surface that could not report a defect.
+
+    The map fixture comes from `agents.probe`, which already builds the exact
+    shapes each rule fires and stays silent on. A second copy here would drift
+    from the rules it is meant to exercise.
+    """
+    from agents.probe import _map_of
+    from .routers.explore import report_invariants
+
+    ok = True
+    valid, invalid = (
+        "submit[valid]:button:Sign in",
+        "submit[invalid]:button:Sign in",
+    )
+
+    # Valid input moved the app forward and input chosen to be rejected landed
+    # in the same place: the form took what it should have refused.
+    events: list[tuple[str, str, str | None]] = []
+    broken = report_invariants(
+        _map_of([("a", valid, "b", True), ("a", invalid, "b", True)]),
+        lambda level, message, surface=None: events.append((level, message, surface)),
+    )
+
+    ok &= check(
+        "a broken invariant is returned to the caller",
+        [v.rule for v in broken] == ["invalid-accepted"],
+        f"rules={[v.rule for v in broken]}",
+    )
+    ok &= check(
+        "a broken invariant reaches the defect surface, not just the timeline",
+        any(level == "error" and surface == "defect" for level, _, surface in events),
+        f"events={events}",
+    )
+    ok &= check(
+        "the report names the rule that broke",
+        any("invalid-accepted" in message for _, message, _ in events),
+        f"events={events}",
+    )
+
+    # A form that rejects bad input is correct, and silence about it is not the
+    # same as never having looked -- the run must still say the check ran.
+    clean: list[tuple[str, str, str | None]] = []
+    held = report_invariants(
+        _map_of([("a", valid, "b", True), ("a", invalid, "c", False)]),
+        lambda level, message, surface=None: clean.append((level, message, surface)),
+    )
+    ok &= check(
+        "a form that rejects bad input yields no violation",
+        held == (),
+        f"rules={[v.rule for v in held]}",
+    )
+    ok &= check(
+        "an intact run still records that the invariants were checked",
+        bool(clean) and not any(level == "error" for level, _, _ in clean),
+        f"events={clean}",
+    )
+    ok &= check(
+        "silence belongs to the report, not to the defect surface",
+        all(surface != "defect" for _, _, surface in clean),
+        f"events={clean}",
+    )
+    return ok
+
+
+def _status_policy() -> bool:
+    """A violation is a defect, so it must colour the badge like one.
+
+    Without this the wiring above is decorative: the console would print
+    `invalid-accepted` into the timeline and still stamp the run green, which
+    is the `green badge over an empty suite` failure this router already
+    refuses one paragraph further down.
+    """
+    from agents.invariants import Violation
+
+    from .routers.explore import status_for
+
+    ok = True
+    quiet = {"passed": 3, "healed": 0, "defect": 0, "escalate": 0}
+
+    def broke(rule: str) -> Violation:
+        return Violation(rule=rule, state="a", action="x", because="", evidence=0)
+
+    ok &= check(
+        "a clean run with a model passes",
+        status_for(quiet, (), incomplete=False, modelled=True) == "passed",
+    )
+    # An uncovered claim is the third kind of outcome and neither of the other
+    # two. Nothing about the application misbehaved, so `failed` would libel it;
+    # the user named a behaviour and the run did not test it, so `passed`
+    # answers a question nobody asked while burying the one they did.
+    ok &= check(
+        "a claim the suite never exercised leaves the run degraded, not green",
+        status_for(quiet, (), incomplete=False, modelled=True, unmatched=1)
+        == "degraded",
+    )
+    ok &= check(
+        "a real defect still outranks an uncovered claim",
+        status_for(
+            {"passed": 1, "healed": 0, "defect": 1, "escalate": 0},
+            (),
+            incomplete=False,
+            modelled=True,
+            unmatched=1,
+        )
+        == "failed",
+    )
+    ok &= check(
+        "a 5xx during the crawl fails the run even when every replay passed",
+        status_for(quiet, (broke("server-error"),), incomplete=False, modelled=True)
+        == "failed",
+    )
+    ok &= check(
+        "a form that accepted an empty submission fails the run",
+        status_for(quiet, (broke("empty-accepted"),), incomplete=False, modelled=True)
+        == "failed",
+    )
+    # The rule reads "we called this input invalid and the app took it", and
+    # what made it invalid was a policy the synthesizer guessed. Verified on our
+    # own SUT: the cached payload for `button:Continue` is `{Password: "short"}`
+    # and the app's only rule is `complete = Boolean(email && password)`, so it
+    # confirms the order and the rule calls that a defect. Worth reporting,
+    # never worth a red badge -- a suspicion that colours the run the same as a
+    # 5xx makes the badge mean nothing.
+    ok &= check(
+        "input the synthesizer merely believed was invalid does not redden the badge",
+        status_for(quiet, (broke("invalid-accepted"),), incomplete=False, modelled=True)
+        == "passed",
+    )
+    ok &= check(
+        "a form that cannot be shown to validate does not redden the badge",
+        status_for(quiet, (broke("no-validation"),), incomplete=False, modelled=True)
+        == "passed",
+    )
+    ok &= check(
+        "one proven violation among suspicions still fails the run",
+        status_for(
+            quiet,
+            (broke("invalid-accepted"), broke("server-error")),
+            incomplete=False,
+            modelled=True,
+        )
+        == "failed",
+    )
+    ok &= check(
+        "a clean model-free run is degraded, not green",
+        status_for(quiet, (), incomplete=False, modelled=False) == "degraded",
+    )
+    ok &= check(
+        "a proven violation outranks degraded",
+        status_for(quiet, (broke("server-error"),), incomplete=False, modelled=False)
+        == "failed",
+    )
+    return ok
 
 
 def main() -> int:
@@ -226,6 +390,9 @@ def main() -> int:
             surviving == [("http://old",)],
             f"got {surviving}",
         )
+
+    ok &= _invariant_reporting()
+    ok &= _status_policy()
 
     print()
     return 0 if ok else 1

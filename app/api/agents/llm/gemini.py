@@ -228,7 +228,7 @@ class Gemini:
                         f"{self.model}: daily quota exhausted on this key. "
                         "Free-tier Gemini keys allow ~20 requests per day per "
                         "model. Use a different GEMINI_MODEL, a billed key, or "
-                        "ANTHROPIC_API_KEY. The deterministic crawler needs no "
+                        "OPENROUTER_API_KEY. The deterministic crawler needs no "
                         "key at all: python -m agents.explorer.crawler <url>"
                     ) from exc
 

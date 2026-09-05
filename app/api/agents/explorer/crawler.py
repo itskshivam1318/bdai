@@ -229,17 +229,43 @@ def crawl(
         # 2. Then breadth-first, so the shallow structure of the app is mapped
         #    before any one branch is chased deep. QA Wolf's two-phase
         #    BFS-then-DFS; rules 1 and 2 together are roughly that shape.
-        # 3. At equal depth, submit a filled form before wandering off. A login
-        #    wall is the highest-value edge in any app -- everything behind it is
-        #    unreachable until it is crossed -- and without this a budget can
-        #    expire in the public shell of a site whose door was standing open.
+        # 3. At equal depth, submit a form before wandering off -- but take the
+        #    form's *rejected* partitions before the one that succeeds.
+        #
+        #    The second half of that is not a refinement, it is the difference
+        #    between having error-state coverage on a real app and having none.
+        #    `submit[valid]` on a login form authenticates the browser context,
+        #    and a context cannot be un-authenticated by navigating: replaying
+        #    to the logged-out login state afterwards lands on the account page
+        #    instead. So every other partition of the form we just crossed
+        #    becomes permanently unreachable the moment we cross it.
+        #
+        #    Measured on `practicesoftwaretesting.com/auth/login`, which is the
+        #    shape every serious target has: `submit[valid]` was taken, and
+        #    `submit[empty]` and `submit[invalid]` on that same button were both
+        #    refused with "could not get back to this state to try it", along
+        #    with 44 other actions. The crawl reported zero rejectable-input
+        #    edges, so `invariants.check` had nothing to evaluate and returned
+        #    a clean report for an app it had barely tested.
+        #
+        #    Ordering fixes it for free. We are already standing in the state
+        #    (rule 1), an empty or invalid submit costs one click and leaves us
+        #    in an error state the entry URL still reaches, and the wall still
+        #    gets crossed -- one action later, with the error states recorded.
+        #    Form actions as a group still outrank plain navigation, so the
+        #    original argument for this rule is untouched.
+
+        def _form_order(act: str) -> int:
+            if act.startswith(("submit[empty]", "submit[invalid]")):
+                return 0
+            return 1 if act.startswith("submit[valid]") else 2
 
         def _priority(edge: tuple[str, str]) -> tuple[int, int, int]:
             state, act = edge
             return (
                 0 if state == here_key else 1,
                 len(routes.get(state, ("",) * 99)),
-                0 if act.startswith("submit[valid]") else 1,
+                _form_order(act),
             )
 
         from_key, action = min(pending, key=_priority)
@@ -363,7 +389,12 @@ def main(entry_url: str) -> int:
             )
             or "no invalid payloads needed -- no forms found"
         )
+        # A run that fell back said so already; this says *why*, which is the
+        # half that was missing when every payload came from the table because
+        # the synthesizer was looking for a key nobody had set.
+        + (f"  ({synthesizer.unavailable})" if synthesizer.unavailable else "")
     )
+    print(f"SYNTH       {synthesizer.model}")
     print()
     print(world.summary())
     print()
