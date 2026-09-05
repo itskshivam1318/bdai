@@ -338,6 +338,13 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
                         credentials=Credentials.from_env(),
                         synthesizer=synthesizer,
                         checkpoint=checkpoint,
+                        # The seed crawl discovers nearly every state, and only
+                        # the few an ant later stands in get re-photographed --
+                        # so a crawl without a camera leaves most of the map
+                        # rendering "no capture". `_crawl_only` was handed one
+                        # and this call was not, which made the picture depend
+                        # on whether a model was configured. Found by bdai-cc.
+                        shot=shooter(page, run_id, settings.artifacts_dir),
                     )
                     emit(
                         "decision",

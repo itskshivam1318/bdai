@@ -10,6 +10,7 @@ the console cannot render without: `GET /api/runs/{id}/map`.
 from __future__ import annotations
 
 import json
+import pathlib
 import sys
 import tempfile
 
@@ -229,6 +230,43 @@ def _status_policy() -> bool:
     return ok
 
 
+def _every_crawl_has_a_camera() -> bool:
+    """No `crawler.crawl` the console starts may be missing `shot=`.
+
+    A thumbnail per state is not decoration: the map's cards are how a person
+    reads a crawl, and a state with no picture renders "no capture". The camera
+    is passed per call site, so forgetting it at one of them is invisible in
+    review and invisible in a diff -- `_crawl_only` was handed one and the seed
+    crawl in the colony path was not, which made the pictures depend on whether
+    a model happened to be configured. It survived a merge on this branch
+    because nothing looked.
+
+    Parsed rather than grepped, so a reformat, a line break or a renamed local
+    cannot fool it, and so the check fails when someone adds a *new* crawl
+    without a camera rather than only when this one regresses.
+    """
+    import ast
+
+    source = pathlib.Path(__file__).with_name("routers") / "explore.py"
+    tree = ast.parse(source.read_text())
+
+    naked = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "crawl"
+        and not any(word.arg == "shot" for word in node.keywords)
+    ]
+    # `_crawl_only` takes its camera as a positional parameter and forwards it,
+    # so the count is what it forwards to, not what it receives.
+    return check(
+        "every crawl the console starts is handed a camera",
+        not naked,
+        f"explore.py: crawler.crawl with no shot= at line(s) {naked}",
+    )
+
+
 def main() -> int:
     print("API         TestClient, throwaway database, no browser\n")
     ok = True
@@ -299,6 +337,7 @@ def main() -> int:
 
     ok &= _invariant_reporting()
     ok &= _status_policy()
+    ok &= _every_crawl_has_a_camera()
 
     print()
     return 0 if ok else 1
