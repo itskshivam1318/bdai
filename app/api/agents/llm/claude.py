@@ -29,7 +29,12 @@ DEFAULT_MODEL = BY_ID["claude"].default_model
 class Claude:
     name = "claude"
 
-    def __init__(self, model: str | None = None, api_key: str | None = None) -> None:
+    def __init__(
+        self,
+        model: str | None = None,
+        api_key: str | None = None,
+        notify=None,
+    ) -> None:
         import anthropic
 
         # A key passed in comes from the console's Advanced panel and belongs to
@@ -47,6 +52,12 @@ class Claude:
         override = os.environ.get("LLM_MAX_TOKENS")
         self.max_tokens = int(override) if override else max_output_for(self.model)
         self._client = anthropic.Anthropic(api_key=key)
+        # The OpenRouter path has warned about a truncated reply since the
+        # `finish_reason` guard went in; this one could not, because nothing
+        # here had anywhere to say it. A silent ceiling is the same bug on
+        # every provider -- the model stops mid-JSON and the caller consumes
+        # the stump as a finished answer.
+        self._notify = notify or (lambda level, message: None)
 
     def _messages(self, transcript: Transcript) -> list[dict]:
         """Neutral transcript -> Anthropic's message shape.
@@ -130,7 +141,16 @@ class Claude:
             if block.type == "tool_use"
         )
 
-        return Turn(text=text.strip(), calls=calls)
+        truncated = response.stop_reason == "max_tokens"
+        if truncated:
+            self._notify(
+                "warn",
+                f"{self.model}: the reply hit the {self.max_tokens}-token "
+                f"ceiling and was cut off -- raise it in catalog.py, or set "
+                f"LLM_MAX_TOKENS higher",
+            )
+
+        return Turn(text=text.strip(), calls=calls, truncated=truncated)
 
 
 __all__ = ["Claude", "DEFAULT_MODEL", "Exchange"]

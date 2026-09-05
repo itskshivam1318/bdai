@@ -713,6 +713,26 @@ because it lands on the state key the step recorded, the re-verification
 replayed it and passed, and v002's `.spec.ts` now says
 `getByRole('link', { name: 'v2' })`.
 
+**A repair reaches the map, and the direction is the finding.**
+`regression.map_updates_for` turns repairs into `{state, was, now, rung}`
+corrections and `apply_to_map` folds them into a world model -- but that
+function searches for the **old** name, and until 2026-09-05 its only caller was
+`agents/probe.py`. Measured that day: applying a correction to a freshly crawled
+map changes *nothing*, because within one run the crawl and the replay visit the
+same URL minutes apart, so the map already carries the new name and the old one
+survives only in the suite on disk. `apply_to_map` is correct for a map loaded
+back from the run the suite was recorded against, which is not the map the
+console holds.
+
+So the console writes the other direction. `store.annotate_heals` matches on the
+**new** name and writes `StateTransition.healed_from` / `.healed_rung` beside it
+-- two claims about one edge, never an overwrite, because `action` is what this
+run observed and rewriting it would leave nothing to compare run N against run
+N+1 on. `MapPane` shows both names on the edge and `StateDetail` spells it out.
+Both columns are nullable and in `db._ADDED_COLUMNS`, so an existing `app.db`
+gains them in place -- no `make reset`. `app/probe.py`'s HEALS section fails
+without the write *and* without the endpoint serving it.
+
 `artifacts/` is gitignored, so a kept suite survives the machine and not code
 review. That is the existing convention for `runs/`, and it is arguably wrong
 for this one -- a suite whose diff nobody reads cannot be argued with -- but

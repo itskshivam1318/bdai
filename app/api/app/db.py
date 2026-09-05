@@ -36,6 +36,9 @@ _ADDED_COLUMNS: dict[str, list[tuple[str, str]]] = {
     "chatmessage": [("thread_id", "INTEGER")],
     "testsession": [("context", "TEXT"), ("uid", "TEXT")],
     "testcase": [("node", "TEXT"), ("suite_version", "TEXT")],
+    # A row with neither is correct: it is an edge no kept suite has healed
+    # onto, which is every edge until a replay says otherwise.
+    "statetransition": [("healed_from", "TEXT"), ("healed_rung", "TEXT")],
 }
 
 

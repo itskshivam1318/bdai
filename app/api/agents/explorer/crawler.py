@@ -280,9 +280,10 @@ def crawl(
                 continue
 
         observer.start_window()
-        if not forms.perform(
+        performed = forms.perform(
             page, action, here, credentials, synthesizer, from_key
-        ):
+        )
+        if not performed:
             # The descriptor did not resolve, or a form had nothing fillable.
             # Not a crawler bug -- a fact about the app, and one the Generator
             # needs to know before it writes a test that assumes otherwise.
@@ -310,7 +311,7 @@ def crawl(
             here, here_key = None, None
             continue
 
-        here_key = world.connect(from_key, action, after).to_key
+        here_key = world.connect(from_key, action, after, performed.typed).to_key
         capture(here_key)
         here = after
 

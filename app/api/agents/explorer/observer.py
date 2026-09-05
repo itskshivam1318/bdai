@@ -201,6 +201,46 @@ _PROP = re.compile(r"^(?P<indent>\s*)-\s+/(?P<key>[\w-]+):\s*(?P<value>.*)$")
 _ATTR = re.compile(r"\[(?P<key>[\w-]+)=(?P<value>[^\]]*)\]")
 
 
+# A derived name longer than this is a paragraph, not a label. Playwright's
+# name match is exact, so a truncated name would never resolve, and a name this
+# long would not survive a copy edit anyway -- the element stays unnamed.
+_CONTENT_NAME_MAX = 80
+
+
+def _content_name(lines: list[str], start: int, indent: int) -> str:
+    """Name-from-content for a node the AI-mode snapshot left unnamed.
+
+    `aria_snapshot(mode="ai")` omits the accessible name when it is nothing but
+    the node's own text -- the default mode prints `link "Executions"`, the AI
+    mode prints `link` with a child `paragraph: Executions`. Measured
+    2026-09-05 on a MUI sidebar (an icon and a <p> per link): every link in the
+    application was recorded as a bare `link`, `generator.writable` refused to
+    export a path through any of them, and a 29-state map produced eight tests
+    of the login form and none of the app behind it.
+
+    This is the same computation the browser already did: the text of the
+    node's descendants, in order, joined by spaces. Property lines (`/url:`)
+    are not content. The result is what `get_by_role(role, name=..., exact=True)`
+    resolves, which `agents.explorer.probe` checks against a live page.
+    """
+    parts: list[str] = []
+    for line in lines[start + 1 :]:
+        if not line.strip():
+            continue
+        if len(line) - len(line.lstrip()) <= indent:
+            break
+        if _PROP.match(line):
+            continue
+        node = _NODE.match(line)
+        if node is None:
+            continue
+        text = (node.group("value") or "").strip()
+        if text:
+            parts.append(text)
+    name = " ".join(" ".join(parts).split())
+    return name if len(name) <= _CONTENT_NAME_MAX else ""
+
+
 @dataclass(frozen=True)
 class Element:
     """One thing on the page the explorer could act on.
@@ -277,7 +317,8 @@ def parse_snapshot(snapshot: str) -> tuple[Element, ...]:
     # indentation, so we track where the last node was opened.
     last_index: Optional[int] = None
 
-    for line in snapshot.splitlines():
+    lines = snapshot.splitlines()
+    for index, line in enumerate(lines):
         if not line.strip():
             continue
 
@@ -301,6 +342,8 @@ def parse_snapshot(snapshot: str) -> tuple[Element, ...]:
         attrs = dict(_ATTR.findall(node.group("attrs") or ""))
         ref = attrs.get("ref", "")
         name = (node.group("name") or "").replace('\\"', '"')
+        if not name and node.group("role") in INTERACTIVE_ROLES:
+            name = _content_name(lines, index, len(node.group("indent")))
 
         if is_foreign(name):
             # Injected chrome (dev overlays, cookie banners). Excluded here so
@@ -325,6 +368,11 @@ def parse_snapshot(snapshot: str) -> tuple[Element, ...]:
         last_index = len(elements) - 1
 
     return tuple(elements)
+
+
+def _has_controls(snapshot: str) -> bool:
+    """Is there anything on this page an explorer could act on?"""
+    return any(e.role in INTERACTIVE_ROLES for e in parse_snapshot(snapshot))
 
 
 class Observer:
@@ -419,10 +467,20 @@ class Observer:
             self._recording = False
             return self._observation("")
 
+        # Agreement between two reads is only evidence once there is something
+        # on the page to agree about. A SPA shell -- "Loading..." and a status
+        # node -- reads identically at 400ms and 800ms and is still not the
+        # page. Measured 2026-09-05 on a React login page from a cold browser:
+        # the entry state was recorded with zero actions, the frontier was
+        # empty, and the crawl ended three seconds in. So a snapshot with
+        # nothing to act on keeps waiting, on the same patience budget; a page
+        # that genuinely has no controls costs one `patience_ms`, once.
         while time.monotonic() < deadline:
             self.page.wait_for_timeout(settle_ms)
             again = self._snapshot()
-            if again is None or state_key(again) == state_key(snapshot):
+            if again is None:
+                break
+            if state_key(again) == state_key(snapshot) and _has_controls(snapshot):
                 break
             snapshot = again
 

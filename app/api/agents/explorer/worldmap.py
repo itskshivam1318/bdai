@@ -96,6 +96,17 @@ class Transition:
     # The ant that took this action. Unlike a state, an edge has exactly one
     # walker, so there is no first-wins question here.
     found_by: str | None = None
+    # `(role, name, value)` for every field typed to cross this edge, from
+    # `forms.Performed`. Empty for an action that types nothing, which is most
+    # of them.
+    #
+    # **The value has to live here and not be re-derived.** It is chosen at
+    # crawl time by the synthesizer (for `submit[invalid]`) or by
+    # `forms.value_for` (for `submit[valid]`), and only one of those two is
+    # reachable from an exported spec. When the Generator re-derived it, every
+    # `submit[invalid]` test typed the *valid* credentials and then asserted the
+    # rejection they cannot cause -- see `forms.Performed`.
+    typed: tuple[tuple[str, str, str], ...] = ()
 
     @property
     def self_loop(self) -> bool:
@@ -160,6 +171,35 @@ def _discovered(world: "WorldMap", transition: Transition) -> bool:
                 continue
             return (from_key, action) == (transition.from_key, transition.action)
     return False
+
+
+@dataclass(frozen=True)
+class Ground:
+    """What a citation may resolve against, frozen at a moment in time.
+
+    `behavior.admit` needs exactly two things from a map: the vocabulary, to
+    accept an action verbatim, and the state keys, to widen the 8-character id
+    a model is shown into the 16 the map is keyed on. Both are derived by
+    *iterating* `WorldMap.states`.
+
+    That is safe while the only reader is the code that finished the crawl. It
+    stops being safe the moment the behavioural model runs beside the crawl:
+    the crawler inserts into `states` on one thread while `vocabulary()`
+    iterates it on another, and CPython raises `RuntimeError: dictionary
+    changed size during iteration` from inside the reply handler, nowhere near
+    the cause.
+
+    So the guard is handed a value instead of a map. Taken on the crawl
+    thread, frozen, and safe to carry anywhere.
+
+    **Staleness is safe in the direction we are in.** A `Ground` taken before
+    the crawl found more states can only refuse a citation the newer map would
+    have allowed, because states are never removed. The guard can be too
+    strict; it cannot be too lax.
+    """
+
+    states: frozenset[str]
+    actions: frozenset[str]
 
 
 @dataclass
@@ -263,9 +303,17 @@ class WorldMap:
         return key
 
     def connect(
-        self, from_key: str, action: str, observation: Observation
+        self,
+        from_key: str,
+        action: str,
+        observation: Observation,
+        typed: tuple[tuple[str, str, str], ...] = (),
     ) -> Transition:
-        """Record where an action led. Files the destination observation too."""
+        """Record where an action led. Files the destination observation too.
+
+        `typed` is `forms.Performed.typed` -- what was actually filled in to
+        take this action. See `Transition.typed`.
+        """
         to_key = self.record(observation)
         transition = Transition(
             from_key=from_key,
@@ -274,6 +322,7 @@ class WorldMap:
             mutating=bool(observation.mutating_calls),
             evidence=len(self.evidence) - 1,
             found_by=self.attribution,
+            typed=tuple(typed),
         )
         self.transitions.setdefault((from_key, action), []).append(transition)
         return transition
@@ -301,6 +350,18 @@ class WorldMap:
             for key, node in self.states.items()
             for action in node.actions
             if (key, action) not in self.transitions
+        )
+
+    def ground(self) -> Ground:
+        """What a citation may resolve against right now, frozen.
+
+        Cheap: two set builds over the states already in memory. Called from
+        the crawl thread every time a batch is handed to the behavioural
+        model, which is once every few states rather than once per action.
+        """
+        return Ground(
+            states=frozenset(self.states),
+            actions=frozenset(self.vocabulary()),
         )
 
     def vocabulary(self) -> tuple[str, ...]:
@@ -374,8 +435,21 @@ class WorldMap:
 
         return routes
 
-    def summary(self) -> str:
-        """One screen of text. What the demo shows and what a reviewer reads."""
+    def scale(self) -> str:
+        """How big this map is, in four numbers. Constant length.
+
+        The head of `summary()`, split out because the two are read by
+        different consumers. `summary()` grows with the map -- it prints every
+        state and every action -- and that is right for a reviewer looking at
+        a finished crawl. It is wrong for anything sent repeatedly while the
+        crawl is still running: `behavior.delta_brief` is called once every
+        few states, and a running total that carries the whole state table
+        would put back exactly the growth the delta exists to remove.
+
+        Four numbers is enough to tell a claim about this application from a
+        claim about applications: a model shown four states needs to know
+        whether they are the app or a corner of it.
+        """
         edges = sum(len(taken) for taken in self.transitions.values())
         gaps = self.gaps()
         lines = [
@@ -384,9 +458,14 @@ class WorldMap:
             f"{len(self.frontier())} unexplored actions, "
             f"{sum(len(v) for v in gaps.values())} untried cells",
         ]
-
         if self.stopped:
             lines.append(f"stopped: {self.stopped}")
+        return "\n".join(lines)
+
+    def summary(self) -> str:
+        """One screen of text. What the demo shows and what a reviewer reads."""
+        lines = [self.scale()]
+
         if self.skipped:
             lines.append(
                 f"{len(self.skipped)} action(s) offered but refused -- these are "

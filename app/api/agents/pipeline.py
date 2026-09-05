@@ -56,7 +56,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from playwright.sync_api import Page
 
-from .behavior import BehaviorModel, examine
+from .behavior import BehaviorModel, BehaviourWorker, examine
 from .critic import Gap, prioritise
 from .critic import render as render_gaps
 from .invariants import render as render_violations
@@ -247,6 +247,7 @@ def run(
     plan_source: str = "",
     keep_suite: bool = True,
     suite_root=None,
+    checkpoint=None,
 ) -> Pipeline:
     """Explore, critique, re-plan if it would help, generate, run, keep, report.
 
@@ -278,12 +279,54 @@ def run(
         emit("decision", f"{decision.choice} -- {decision.because}", surface)
 
     # --- explore ---------------------------------------------------------
+    #
+    # The behavioural model runs *beside* this crawl rather than after it.
+    # `BehaviourWorker.tick` is a `checkpoint`, so the trigger is the one the
+    # crawler already fires after every edge, and the model call happens on a
+    # thread the crawl never waits for. What this buys is two things: a reply
+    # per few states instead of one reply whose size scales with the map --
+    # the shape that arrived truncated on 2026-09-05 -- and a semantic layer
+    # that already exists when the colony starts.
+    #
+    # With no provider the worker starts no thread and this is the crawl that
+    # was always here.
+    worker = BehaviourWorker(
+        provider, on_event=lambda level, message: emit(level, message, "plan")
+    )
+
+    def watch(world) -> None:
+        """The caller's checkpoint and the worker's, in that order.
+
+        The caller's persists the map so the console can watch it; ours may
+        make a model call's worth of decisions. Persisting first means a
+        crash in the second still leaves the map on disk.
+        """
+        if checkpoint is not None:
+            checkpoint(world)
+        worker.tick(world)
+
     explore_budget = CrawlBudget(
         max_actions=budget.explore_actions, max_seconds=budget.explore_seconds
     )
-    world = crawl(page, target_url, explore_budget, credentials=credentials,
-                  synthesizer=synthesizer,
-                  trace=lambda line: emit("info", line))
+    world = None
+    try:
+        world = crawl(page, target_url, explore_budget, credentials=credentials,
+                      synthesizer=synthesizer, checkpoint=watch,
+                      # Surfaced, not bare: `emit` defaults `surface` to None
+                      # and an event with no surface lights no stage in the
+                      # console. The crawl is the longest stage of the run and
+                      # it was the one reporting into nowhere.
+                      trace=lambda line: emit("info", line, "explore"))
+    finally:
+        # In a `finally` because `_run` blocks on its queue forever: a worker
+        # whose `close` is skipped is a thread parked for the life of the
+        # process, and this runs inside uvicorn. `close(None)` is the failure
+        # case -- there is no map to send a final batch from.
+        #
+        # Sends the states left below the batch threshold (the last ones a
+        # crawl reaches are its deepest), waits out the turn in flight, and
+        # gives back everything admitted.
+        behaviour = worker.close(world)
     pipe.world = world
     pipe.rounds = 1
     announce(
@@ -371,6 +414,10 @@ def run(
             credentials=credentials,
             synthesizer=synthesizer,
             world=world,
+            # Built while the crawl ran. `orchestrator.behaviour_for` uses it
+            # rather than calling `synthesise`, which would send the same map
+            # to the same model a second time and discard this one.
+            behaviour=behaviour,
             experiments=prior,
             on_event=lambda level, message: emit(level, message, "plan"),
         )
@@ -396,7 +443,9 @@ def run(
             ),
             surface="plan",
         )
-    elif provider is None:
+    else:
+        pipe.behaviour = behaviour
+    if provider is None:
         announce(
             pipe.decide(
                 "colony", "skipped the colony",
@@ -502,7 +551,11 @@ def run(
         )
         world = crawl(page, target_url, explore_budget, credentials=credentials,
                       synthesizer=synthesizer,
-                      trace=lambda line: emit("info", line))
+                      # Surfaced, not bare: `emit` defaults `surface` to None and
+                  # an event with no surface lights no stage in the console.
+                  # The crawl is the longest stage of the run and it was the
+                  # one reporting into nowhere.
+                  trace=lambda line: emit("info", line, "explore"))
         pipe.world = world
         pipe.rounds += 1
 

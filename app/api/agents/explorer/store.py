@@ -192,6 +192,98 @@ def save(world: WorldMap, run_id: int, session: Session) -> int:
     return written
 
 
+def admissible(
+    rows: list[StateTransition], was: str, rung: str
+) -> list[StateTransition]:
+    """Which of this run's edges may carry the annotation `was -> rung`.
+
+    `rows` is every edge in this run's map leaving the healed step's state
+    under the action the Healer resolved *to*. It can hold none, one, or
+    several -- `StateTransition` is deliberately not unique on
+    `(run_id, from_key, action)`, because one action landing in two places is
+    how a `normalize()` collision stays visible instead of being overwritten.
+
+    Return the rows to write. An empty list is a refusal and is counted, not
+    an error.
+
+    The policy, case by case:
+
+      * no rows          this run's crawl never walked the action the Healer
+                         resolved onto. Nothing here to annotate.
+      * one row          the ordinary case: write it.
+      * several rows     the same descriptor landing in two states. The claim
+                         is about the descriptor at this state -- "a step the
+                         suite recorded under `was` resolved onto this action"
+                         -- and every one of those edges is that action, so
+                         every one carries it. Choosing a single row would
+                         hide the very collision the duplicate exists to show.
+      * row already annotated, from a *different* `was`  -- two saved steps
+                         healed onto one edge and disagree about its old name.
+                         Refused: the first claim stands and is not rewritten.
+                         The same `was` again is the idempotent re-run and is
+                         written as before.
+
+    `action`, `to_key` and `observation_id` never move: this function only
+    decides *where the second claim is written*, never edits the first one.
+    """
+    return [
+        row
+        for row in rows
+        if row.healed_from is None or row.healed_from == was
+    ]
+
+
+def annotate_heals(
+    updates: tuple[dict, ...], run_id: int, session: Session
+) -> int:
+    """Record, on this run's map, what a kept suite calls each healed edge.
+
+    Returns rows annotated.
+
+    **This is not `regression.apply_to_map`, and the difference is direction.**
+    That function patches a map that still holds the *old* name -- one loaded
+    back from the run the suite was recorded against. Within a single run the
+    crawl and the replay visit the same URL minutes apart, so the map here
+    already holds the *new* name and the old one survives only in the suite on
+    disk. Measured 2026-09-05: applying a correction to a freshly crawled map
+    changes nothing, because there is nothing there under the old name.
+
+    So the match is on `now`, and what gets written is `healed_from`. The claim
+    is "a test recorded against an earlier crawl was resolved onto this edge",
+    which is the one a person reading this run's map can act on.
+
+    `action` is never touched. It is what this run observed, and overwriting it
+    would leave nothing to compare run N against run N+1 on -- the property
+    `regression.apply_to_map` returns a copy to protect.
+    """
+    written = 0
+
+    for update in updates:
+        state, was = update.get("state"), update.get("was")
+        now, rung = update.get("now"), update.get("rung") or ""
+        if not state or not was or not now:
+            continue
+
+        rows = list(
+            session.exec(
+                select(StateTransition)
+                .where(StateTransition.run_id == run_id)
+                .where(StateTransition.from_key == state)
+                .where(StateTransition.action == now)
+            ).all()
+        )
+
+        for row in admissible(rows, was, rung):
+            row.healed_from = was
+            row.healed_rung = rung
+            session.add(row)
+            written += 1
+
+    if written:
+        session.commit()
+    return written
+
+
 def load(run_id: int, session: Session) -> WorldMap:
     """Rebuild the WorldMap this run produced.
 

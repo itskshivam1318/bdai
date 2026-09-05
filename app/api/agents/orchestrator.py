@@ -398,6 +398,32 @@ def ant_provider_for(budget: Budget, provider: Provider) -> Provider:
     return load(provider=budget.ant_provider, model=budget.ant_model)
 
 
+def behaviour_for(world, provider, given=None, *, synthesise=synthesise, **kwargs):
+    """The semantic layer the colony plans from, built or inherited.
+
+    The colony cannot plan without one: with no claims to test, the only thing
+    it can see is which actions are untried, so the only plan it can form is
+    "try them". `synthesise` is how it got one -- a single call over the
+    finished map, before the first wave.
+
+    `given` is the other way. `behavior.BehaviourWorker` builds the same model
+    *while* the crawl runs, a few states per turn, and hands the result over.
+    That model is the better of the two -- each of its turns was small enough
+    not to approach the reply ceiling, and each was told what had just arrived
+    -- so when there is one, it is used and `synthesise` is not called.
+    Calling it anyway would send the same map to the same model a second time
+    and throw the incremental answer away.
+
+    An *empty* model handed in still counts. The worker has already spent the
+    call; a second one would ask the same question about the same states.
+    """
+    if given is not None:
+        return given
+    if provider is None or not world.states:
+        return BehaviorModel()
+    return synthesise(world, provider, **kwargs)
+
+
 def run(
     page,
     entry_url: str,
@@ -410,6 +436,7 @@ def run(
     run_id: int | None = None,
     shot: Shot | None = None,
     checkpoint=None,
+    behaviour=None,
     synthesizer=None,
     world: WorldMap | None = None,
     filed_as: str = "",
@@ -501,14 +528,18 @@ def run(
     #
     # It uses the orchestrator's own provider, not the ants': this is one call
     # and it decides where the whole colony looks.
+    result.behaviour = behaviour_for(
+        world, provider, behaviour, run_id=run_id,
+        on_event=lambda level, message: emit(level, message),
+    )
     if world.states:
-        result.behaviour = synthesise(
-            world, provider, run_id=run_id,
-            on_event=lambda level, message: emit(level, message),
-        )
         # The generator dispatch plans from it. Set here rather than passed to
         # `Colony(...)` above because it does not exist until this call returns,
         # and a colony built without it would have to be rebuilt.
+        #
+        # The condition is unchanged from when this called `synthesise`
+        # inline: `Colony.behaviour` stays None for a run that mapped nothing,
+        # and every consumer distinguishes None from an empty model.
         colony.behaviour = result.behaviour
 
     system = instructions("orchestrator")

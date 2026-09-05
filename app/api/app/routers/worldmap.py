@@ -48,6 +48,10 @@ class TransitionOut(BaseModel):
     mutating: bool
     observation_id: int | None
     found_by: str | None
+    # What a kept suite still calls this edge, and the rung that resolved it
+    # here. Null on an edge no replay has healed onto, which is most of them.
+    healed_from: str | None
+    healed_rung: str | None
 
 
 class MapOut(BaseModel):
@@ -108,6 +112,8 @@ def get_map(run_id: int, session: Session = Depends(get_session)) -> MapOut:
                 action=edge.action,
                 to_key=edge.to_key,
                 mutating=edge.mutating,
+                healed_from=edge.healed_from,
+                healed_rung=edge.healed_rung,
                 observation_id=edge.observation_id,
                 found_by=edge.found_by,
             )

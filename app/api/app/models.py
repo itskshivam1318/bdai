@@ -215,6 +215,22 @@ class StateTransition(SQLModel, table=True):
     mutating: bool = False
     # The ant that took this action.
     found_by: Optional[str] = None
+    # What a kept suite calls this same edge, when the Healer re-resolved a
+    # saved step onto it, and which rung did the resolving.
+    #
+    # **Written, never overwritten.** `action` is what this run's crawl
+    # observed and stays exactly as observed; this pair is a second, later
+    # claim about the same edge -- that a test recorded against an earlier
+    # crawl was pointed here. Rewriting `action` instead would leave nothing
+    # to compare run N against run N+1 on, which is the property
+    # `regression.apply_to_map` returns a copy to protect.
+    #
+    # The direction is the one the live data has. Within a run the crawl and
+    # the replay visit the same URL, so the map already carries the *new*
+    # name and the old one survives only in the suite on disk -- see
+    # `store.annotate_heals`.
+    healed_from: Optional[str] = None
+    healed_rung: Optional[str] = None
     observation_id: Optional[int] = Field(
         default=None, foreign_key="stateobservation.id"
     )

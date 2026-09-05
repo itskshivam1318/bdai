@@ -145,6 +145,20 @@ def form_of(page: Page, descriptor: str):
     docstring for why that fallback does not undo the paragraph above.
     """
     element = locate(page, descriptor)
+
+    # `<button type=button>` is the author saying this one does not submit --
+    # a password eye, a clear button, a tab. Inside a form it still landed here
+    # and collected the three `submit[...]` partitions, each typing into the
+    # fields and then not submitting them. Measured 2026-09-05 on a login
+    # page whose eye is exactly that: 15 login states out of 29, 65 of 94
+    # transitions, and the crawl's budget gone before it reached the app.
+    try:
+        kind = (element.get_attribute("type", timeout=1000) or "").lower()
+    except Exception:
+        kind = ""
+    if kind in ("button", "reset"):
+        return None
+
     form = element.locator("xpath=ancestor::form[1]")
     try:
         if form.count() and form.locator("input, textarea, select").count():
@@ -470,7 +484,7 @@ def fill_form(
     reported by the count, and the crawler treats that as a failed action rather
     than pretending it submitted a completed form.
     """
-    filled = 0
+    typed: list[tuple[str, str, str]] = []
     root = scope if scope is not None else page
     # Where the next unnamed field of each role will be looked for. Unnamed
     # fields are the one case with nothing to match on, so they are consumed in
@@ -497,13 +511,37 @@ def fill_form(
                 )
             )
             field.fill(value, timeout=3000)
-            filled += 1
+            typed.append((element.role, element.name, value))
         except Exception:
             # Not in this form, read-only, hidden behind an overlay, or a
             # combobox wanting a selection rather than text. None is fatal.
             continue
 
-    return filled
+    return tuple(typed)
+
+
+@dataclass(frozen=True)
+class Performed:
+    """Whether one action happened, and what was typed to make it happen.
+
+    `perform` used to return a bare bool, so the values it filled died in the
+    frame that chose them. That is the whole of the bug this class exists to
+    close: `Step.fields` could only record *which* fields a form has, `spec()`
+    had to re-derive the text from `forms.value_for`, and `value_for` only
+    knows how to produce input the app should accept. Every exported
+    `submit[invalid]` spec therefore typed the valid credentials and then
+    asserted the rejection they cannot cause -- a negative test that passes
+    with all validation removed.
+
+    Truthy exactly when the action happened, so every `if not forms.perform(...)`
+    call site reads the same as it did when this was a bool.
+    """
+
+    ok: bool
+    typed: tuple[tuple[str, str, str], ...] = ()
+
+    def __bool__(self) -> bool:
+        return self.ok
 
 
 def perform(
@@ -513,8 +551,13 @@ def perform(
     credentials: Credentials,
     synthesizer=None,
     state_key: str = "",
-) -> bool:
-    """Do one action. False if it could not be done at all.
+) -> Performed:
+    """Do one action. Falsy if it could not be done at all.
+
+    Returns a `Performed`, which is falsy exactly where this used to return
+    False, and additionally carries the `(role, name, value)` of every field it
+    typed into -- the record the Generator needs so an exported spec can type
+    what the crawl typed. See `Performed`.
 
     `observation` is the state as it was seen *before* this call, and it is what
     names the fields to fill -- so the caller must have already arrived at that
@@ -532,9 +575,9 @@ def perform(
     if form is None:
         try:
             locate(page, action).click(timeout=3000)
-            return True
+            return Performed(True)
         except Exception:
-            return False
+            return Performed(False)
 
     mode = form.group("mode")
     descriptor = form.group("descriptor")
@@ -543,7 +586,7 @@ def perform(
 
     if mode == "invalid":
         if synthesizer is None:
-            return False
+            return Performed(False)
         overrides = synthesizer.invalid_payload(
             state_key, descriptor, observation.title, fields_of(observation)
         ).values
@@ -561,18 +604,24 @@ def perform(
     # Clearing is unconditional rather than conditional on the fields looking
     # dirty, because "looks dirty" is another observation that can be wrong,
     # and filling a blank field with "" costs nothing.
-    if mode == "empty":
-        fill_form(page, observation, credentials, scope, clear=True)
+    typed: tuple[tuple[str, str, str], ...] = ()
 
-    if mode in {"valid", "invalid"} and not fill_form(
-        page, observation, credentials, scope, overrides
-    ):
-        # Nothing could be typed, so this is not the filled-input case at all.
-        # Submitting anyway would record a path that never happened.
-        return False
+    if mode == "empty":
+        # The emptying is itself what the step typed: a spec that replays
+        # `submit[empty]` has to clear the fields for the same reason the
+        # crawler does -- see the comment above, an unfilled form is not an
+        # empty one.
+        typed = fill_form(page, observation, credentials, scope, clear=True)
+
+    if mode in {"valid", "invalid"}:
+        typed = fill_form(page, observation, credentials, scope, overrides)
+        if not typed:
+            # Nothing could be typed, so this is not the filled-input case at
+            # all. Submitting anyway would record a path that never happened.
+            return Performed(False)
 
     try:
         locate(page, descriptor).click(timeout=3000)
-        return True
+        return Performed(True, typed)
     except Exception:
-        return False
+        return Performed(False, typed)

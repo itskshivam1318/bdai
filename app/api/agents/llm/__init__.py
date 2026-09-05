@@ -111,6 +111,16 @@ class Turn:
     calls: tuple[ToolCall, ...] = ()
     opaque: object | None = None  # the provider's raw turn; see Exchange.opaque
 
+    #: The provider stopped because it ran out of `max_tokens`, not because the
+    #: model was finished. Carried on the turn rather than left as a log line
+    #: because the two are separated by a module: the provider knows the reply
+    #: was cut off, and the *caller* is the only one who knows what was lost by
+    #: it. `behavior.synthesise` reported "no behavioural model returned" for a
+    #: truncated turn, which reads like a model that declined and was actually a
+    #: ceiling set too low -- a diagnosis that took a human joining two log
+    #: lines from two files. A caller that reads this can say which it was.
+    truncated: bool = False
+
     @property
     def done(self) -> bool:
         """No tool calls means the model has nothing further to do."""
@@ -203,7 +213,7 @@ def load(
     if spec.id == "claude":
         from .claude import Claude
 
-        return Claude(model=chosen, api_key=api_key)
+        return Claude(model=chosen, api_key=api_key, notify=notify)
     if spec.id == "google":
         from .gemini import Gemini
 

@@ -15,7 +15,7 @@ import sys
 import tempfile
 
 from fastapi.testclient import TestClient
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine, select
 
 from .db import _add_missing_columns as add_missing_columns
 from .db import get_session
@@ -709,6 +709,165 @@ def _console_plans_from_behaviour() -> bool:
         f"degraded={bare.degraded!r}",
     )
 
+    # Eight was the planner's default and the router passed nothing, so every
+    # console suite was eight scenarios regardless of the map -- measured
+    # 2026-09-05 on a 29-state map: eight tests, all of them the login form.
+    request = explore_router.ExploreRequest()
+    ok &= check(
+        "the suite cap is the request's to set, and wider than eight",
+        getattr(request, "max_scenarios", 0) >= 24,
+        f"max_scenarios={getattr(request, 'max_scenarios', None)!r}",
+    )
+    ok &= check(
+        "and every compile of the executed plan honours it",
+        source.count("_compile(result.world, result.behaviour, limit=body.max_scenarios)") == 2,
+        "a call site still compiles with the planner's default",
+    )
+
+    return ok
+
+
+def _heals_reach_the_map() -> bool:
+    """A healed locator has to be visible on the map, not only in the manifest.
+
+    The Healer's repairs were written onto the suite version and printed in the
+    report, and `regression.apply_to_map` -- the function that folds them into a
+    world model -- had no caller outside this file. So the console drew a map
+    that said nothing about the rename, and the only place the old name existed
+    was a JSON file under `artifacts/`.
+
+    **The direction is the finding.** `apply_to_map` searches for the *old*
+    name, which is right for a map loaded back from the run the suite was
+    recorded against and wrong for the one the console holds: within a run the
+    crawl and the replay visit the same URL minutes apart, so the fresh map
+    already carries the new name. Measured 2026-09-05 -- applying a correction
+    to a freshly crawled map changed nothing at all. `store.annotate_heals`
+    matches on the new name and writes the old one alongside it.
+
+    Both halves are checked. Annotating without serving leaves the console
+    exactly as blind as it was.
+    """
+    from agents.explorer import store
+
+    print("\nHEALS       a repaired locator is visible on the run's map")
+    ok = True
+
+    # The policy seam is deliberately unwritten (see `store.admissible`). Report
+    # that as one FAIL rather than letting it take out every section below --
+    # a probe that stops is not a probe that passed.
+    try:
+        store.admissible([], "was", "rung")
+    except NotImplementedError:
+        return check(
+            "store.admissible decides which edges may carry the annotation",
+            False,
+            "still raises NotImplementedError -- write the policy, then re-run",
+        )
+    except Exception:
+        pass  # any other signature complaint is the real checks' problem
+
+    a, b = "a" * 16, "b" * 16
+    observed, recorded = "submit[valid]:button:Log in", "submit[valid]:button:Sign in"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        engine = create_engine(
+            f"sqlite:///{tmp}/heals.db", connect_args={"check_same_thread": False}
+        )
+        SQLModel.metadata.create_all(engine)
+
+        def override():
+            with Session(engine) as session:
+                yield session
+
+        app.dependency_overrides[get_session] = override
+        client = TestClient(app)
+
+        with Session(engine) as session:
+            run = Run(target_url="https://example.com", status="passed")
+            session.add(run)
+            session.commit()
+            session.refresh(run)
+            run_id = run.id
+            session.add(AppState(run_id=run_id, key=a, url="/", title="Login",
+                                 actions=json.dumps([observed]), is_entry=True))
+            session.add(AppState(run_id=run_id, key=b, url="/ok", title="Done",
+                                 actions="[]"))
+            # The map as a fresh crawl of the *changed* app leaves it: the new
+            # name, and no trace anywhere of what the suite calls it.
+            session.add(StateTransition(run_id=run_id, from_key=a,
+                                        action=observed, to_key=b, mutating=True))
+            session.commit()
+
+        updates = ({"state": a, "was": recorded, "now": observed,
+                    "rung": "structural", "to_key": b, "at": ""},)
+
+        # The claim this section exists for. `apply_to_map` is handed the same
+        # correction and the same map and changes nothing, because it looks for
+        # a name that is not there.
+        with Session(engine) as session:
+            touched = store.annotate_heals(updates, run_id, session)
+        ok &= check(
+            "a correction lands on the edge the crawl recorded under the new name",
+            touched == 1,
+            f"annotated {touched} edge(s)",
+        )
+
+        with Session(engine) as session:
+            row = session.exec(
+                select(StateTransition).where(StateTransition.run_id == run_id)
+            ).one()
+            ok &= check(
+                "and the observed action is left exactly as observed",
+                row.action == observed and row.healed_from == recorded,
+                f"action={row.action!r} healed_from={row.healed_from!r}",
+            )
+            ok &= check(
+                "with the rung, because a structural match and a ranked guess "
+                "are different amounts of trust",
+                row.healed_rung == "structural",
+                f"got {row.healed_rung!r}",
+            )
+
+        # Idempotent: the console annotates after every run, and a second run
+        # that heals the same edge must not multiply rows or lose the name.
+        with Session(engine) as session:
+            store.annotate_heals(updates, run_id, session)
+        with Session(engine) as session:
+            rows = session.exec(
+                select(StateTransition).where(StateTransition.run_id == run_id)
+            ).all()
+        ok &= check(
+            "annotating twice is one edge, not two",
+            len(rows) == 1 and rows[0].healed_from == recorded,
+            f"{len(rows)} row(s)",
+        )
+
+        # A correction naming a state this run never crawled is refused rather
+        # than written somewhere convenient.
+        with Session(engine) as session:
+            stray = store.annotate_heals(
+                ({"state": "f" * 16, "was": recorded, "now": observed,
+                  "rung": "structural"},),
+                run_id,
+                session,
+            )
+        ok &= check(
+            "a correction for a state not on this run's map annotates nothing",
+            stray == 0,
+            f"annotated {stray}",
+        )
+
+        # And the console can actually see it.
+        payload = client.get(f"/api/runs/{run_id}/map").json()
+        edge = payload["transitions"][0]
+        ok &= check(
+            "the map endpoint serves both names",
+            edge["action"] == observed and edge["healed_from"] == recorded,
+            f"served {edge}",
+        )
+
+        app.dependency_overrides.clear()
+
     return ok
 
 
@@ -857,6 +1016,7 @@ def main() -> int:
     ok &= _suite_download()
     ok &= _suites_are_per_session()
     ok &= _console_plans_from_behaviour()
+    ok &= _heals_reach_the_map()
 
     print()
     return 0 if ok else 1

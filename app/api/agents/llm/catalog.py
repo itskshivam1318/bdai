@@ -131,10 +131,36 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         # an error that reads like a code fault.
         default_model="sarvam-105b",
         base_url="https://api.sarvam.ai/v1",
+        # Both were 8192 until 2026-09-05, and on a reasoning model that is not
+        # a generous ceiling -- it is a broken one. Sarvam's docs say reasoning
+        # is **on by default** and that "reasoning tokens count toward
+        # completion tokens", so the thinking is spent out of the same 8192 the
+        # answer has to come from. Measured: the behaviour synthesis call came
+        # back `finish_reason: length` with the `model` tool call truncated
+        # mid-JSON, `_arguments` yielded {}, and `behavior.synthesise` reported
+        # "no behavioural model returned; the map stands alone". The model had
+        # not declined to answer. It had been cut off.
+        #
+        # The two models do not share a ceiling, and the difference is rule 2
+        # above, not rule 1. Measured against the live API on 2026-09-05:
+        #
+        #   sarvam-105b               @ 32768 -> accepted, finish_reason stop
+        #   sarvam-105b-conversations @ 16384 -> 400, "max_tokens (16384)
+        #     exceeds the maximum output length of 8192 tokens for
+        #     sarvam-105b-conversations. For a larger output budget, use
+        #     sarvam-105b."
+        #
+        # So the conversational variant has a hard 8192 output cap that its
+        # 32k context window does not predict -- it was left at 8192 because
+        # the provider refuses anything higher, not because it is safe there.
+        # Anything that needs a long structured reply must use `sarvam-105b`,
+        # which is what `default_model` already picks and what the provider's
+        # own error recommends.
         models=(
-            ModelChoice("sarvam-105b", "Sarvam 105B", "cheapest", max_output=8192),
+            ModelChoice("sarvam-105b", "Sarvam 105B", "cheapest", max_output=32768),
             ModelChoice(
                 "sarvam-105b-conversations", "Sarvam 105B Conversations",
+                "8192-token replies; not for the behavioural model",
                 max_output=8192,
             ),
         ),

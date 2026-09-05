@@ -34,6 +34,7 @@ from sqlmodel import Session, select
 # Absolute, not relative: `agents/` is a sibling of `app/` under `api/`, so a
 # relative import would climb above this package and fail at import time.
 from agents import ant, critic, invariants, orchestrator, regression, runner, suite
+from agents.behavior import BehaviourWorker
 from agents.explorer import crawler, forms, store
 from agents.explorer.synth import Synthesizer
 from agents.context import Context, credentials_for, parse as parse_context
@@ -58,6 +59,10 @@ class ExploreRequest(BaseModel):
     max_waves: int = 3
     max_ants: int = 4
     ant_actions: int = 4
+    # How many scenarios the executed suite may hold. The planner's own default
+    # is eight, sized for a demo app; a 29-state map compiled to eight tests of
+    # its login form and none of the application behind it.
+    max_scenarios: int = 24
 
 
 def report_invariants(world, emit) -> tuple[invariants.Violation, ...]:
@@ -180,6 +185,16 @@ def _crawl_only(
         # run is reused now that there is no model to ask.
         synthesizer=synthesizer,
         checkpoint=checkpoint,
+        # `checkpoint` streams the map and this streams the *account* of it.
+        # Both were needed and only the first was here: the canvas filled while
+        # the timeline sat on one line for the whole crawl, so the panel that
+        # narrates the run said nothing during its longest stage. `emit` was
+        # already a parameter of this function and went unused.
+        #
+        # `explore` is the surface because `lib/stages.ts` stage 0 listens for
+        # it -- an event with no surface lights no stage, which is why the
+        # strip stayed dark end to end.
+        trace=lambda line: emit("info", line, surface="explore"),
         # The console shows a thumbnail per state whichever path built the map,
         # so a degraded run gets cards with pictures in them rather than boxes.
         shot=shot,
@@ -465,26 +480,68 @@ def _explore(
                     # the crawl, so the graph draws while the model is still
                     # being asked its first question.
                     emit("info", "crawling deterministically first", surface="explore")
-                    seed = crawler.crawl(
-                        page,
-                        target_url,
-                        crawler.Budget(),
-                        credentials=credentials,
-                        synthesizer=synthesizer,
-                        checkpoint=checkpoint,
-                        # The seed crawl discovers nearly every state, and
-                        # only the few an ant later stands in get
-                        # re-photographed -- and `attach_screenshot` is
-                        # first-wins, so a state the crawler found and no ant
-                        # re-entered kept no picture at all. `_crawl_only` was
-                        # handed a camera and this call was not, which made the
-                        # thumbnails depend on whether a model was configured.
-                        # Measured: a run whose colony died on its first call
-                        # left 1 of 7 states with a picture and the rest of the
-                        # map reading "no capture"; a healthy colony elsewhere
-                        # still managed 17.
-                        shot=shooter(page, run_id, settings.artifacts_dir),
+                    # The behavioural model is built *while* this crawl runs,
+                    # on a thread the crawl never waits for, a few states per
+                    # turn. `tick` is a checkpoint, so the trigger is the one
+                    # the crawler already fires after every edge.
+                    #
+                    # The worker touches no database: it queues what it wants
+                    # to say and `tick` emits it from this thread, because
+                    # `emit` above closes over one SQLModel session and
+                    # `db.py` sets check_same_thread=False -- a second thread
+                    # committing on it would corrupt it without raising.
+                    behaviour_worker = BehaviourWorker(
+                        provider,
+                        on_event=lambda level, message: emit(
+                            level, message, surface="explore"
+                        ),
                     )
+
+                    def watch(world) -> None:
+                        # Persist first: a crash in the worker's turn still
+                        # leaves the map the console is drawing on disk.
+                        checkpoint(world)
+                        behaviour_worker.tick(world)
+
+                    seed = None
+                    try:
+                        seed = crawler.crawl(
+                            page,
+                            target_url,
+                            crawler.Budget(),
+                            credentials=credentials,
+                            synthesizer=synthesizer,
+                            checkpoint=watch,
+                            # See `_crawl_only`: without this the timeline held
+                            # "crawling deterministically first" and nothing else
+                            # until the seed was finished -- minutes of a live
+                            # elapsed counter climbing beside a stale sentence,
+                            # on the one stage that reports per action.
+                            trace=lambda line: emit(
+                                "info", line, surface="explore"
+                            ),
+                            # The seed crawl discovers nearly every state, and
+                            # only the few an ant later stands in get
+                            # re-photographed -- and `attach_screenshot` is
+                            # first-wins, so a state the crawler found and no ant
+                            # re-entered kept no picture at all. `_crawl_only` was
+                            # handed a camera and this call was not, which made the
+                            # thumbnails depend on whether a model was configured.
+                            # Measured: a run whose colony died on its first call
+                            # left 1 of 7 states with a picture and the rest of the
+                            # map reading "no capture"; a healthy colony elsewhere
+                            # still managed 17.
+                            shot=shooter(page, run_id, settings.artifacts_dir),
+                        )
+                    finally:
+                        # `_run` blocks on its queue forever, so a worker whose
+                        # `close` is skipped is a thread parked for the life of
+                        # this uvicorn process -- one per failed run.
+                        #
+                        # Sends the states left below the batch threshold (the
+                        # deepest ones the crawl reached), waits out the turn
+                        # in flight, and returns everything admitted.
+                        seeded_behaviour = behaviour_worker.close(seed)
                     emit(
                         "decision",
                         f"seed: {len(seed.states)} states, "
@@ -540,6 +597,10 @@ def _explore(
                         synthesizer=synthesizer,
                         intent=intent,
                         experiments=prior,
+                        # `behaviour_for` uses this instead of calling
+                        # `synthesise`, which would send the same map to the
+                        # same model again and throw this one away.
+                        behaviour=seeded_behaviour,
                         budget=orchestrator.Budget(
                             max_waves=body.max_waves,
                             max_ants=body.max_ants,
@@ -676,7 +737,7 @@ def _explore(
                     "recorded state(s)",
                     surface="suite",
                 )
-                planned = _compile(result.world, result.behaviour)
+                planned = _compile(result.world, result.behaviour, limit=body.max_scenarios)
                 plan = planned.scenarios
 
                 # The claims the user typed, matched against tests that already
@@ -764,7 +825,7 @@ def _explore(
                     # the interleave both change, and patching the old plan would
                     # produce a suite the planner would never emit. The colony
                     # ran again, so `result.behaviour` is this wave's model.
-                    planned = _compile(result.world, result.behaviour)
+                    planned = _compile(result.world, result.behaviour, limit=body.max_scenarios)
                     plan = planned.scenarios
                     considered = _compile(
                         result.world, result.behaviour, limit=40
@@ -912,6 +973,39 @@ def _explore(
                         f"suite not kept: {type(exc).__name__}: {exc}",
                         surface="suite",
                     )
+
+                # What the replay learned about *this* run's map.
+                #
+                # A healed locator says a control the kept suite names is
+                # reachable here under a different descriptor. The crawl above
+                # already recorded it under the new name -- it visited the same
+                # URL minutes earlier -- so this writes the *old* name onto the
+                # edge as a second claim, and leaves `action` exactly as
+                # observed. `regression.apply_to_map` is the other direction and
+                # is a no-op against a map this fresh; see `store.annotate_heals`.
+                if kept and kept.version and kept.version.map_updates:
+                    try:
+                        touched = store.annotate_heals(
+                            kept.version.map_updates, run_id, db
+                        )
+                        emit(
+                            "decision" if touched else "warn",
+                            f"map: {touched} edge(s) annotated with the name "
+                            f"{kept.version.label} still uses for them"
+                            if touched
+                            else "map: no edge in this run's crawl matched a "
+                            "healed step -- the correction is on the suite "
+                            "manifest only",
+                            surface="heal",
+                        )
+                    except Exception as exc:
+                        # The map is a read surface. Failing to annotate it must
+                        # not cost the run its verdicts or its kept suite.
+                        emit(
+                            "warn",
+                            f"map not annotated: {type(exc).__name__}: {exc}",
+                            surface="heal",
+                        )
 
                 browser.close()
 

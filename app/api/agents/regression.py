@@ -733,6 +733,22 @@ class Report:
         return f"{parts or 'nothing to run'}; {where}{held}{saved}{thrown}"
 
 
+def _synthesizer():
+    """The cache-backed payload synthesizer both halves of this module need.
+
+    One function because the recorder and the replay must agree: `cache_path`
+    is the replay log, so a scenario is re-submitted with the payload the crawl
+    recorded rather than a fresh one, and a re-run is free and reproducible.
+    Two call sites building it two ways would silently make replay a different
+    experiment from record.
+    """
+    from app.config import settings
+
+    from .explorer.synth import Synthesizer
+
+    return Synthesizer(cache_path=settings.artifacts_dir / "invalid-payloads.json")
+
+
 def verify(
     page: Page,
     directory: str | Path,
@@ -744,8 +760,17 @@ def verify(
     rescue: bool = True,
     provider=None,
     run_id: int | None = None,
+    synthesizer=None,
 ) -> Report:
     """Replay the saved suite, and write back what healed.
+
+    `synthesizer` is not optional in the way its default suggests. `runner.run`
+    re-performs each action rather than replaying a keystroke log, so an
+    invalid submission needs the payload again -- and `forms.perform` refuses
+    the mode outright without one. A replay that omits it does not skip those
+    scenarios; it ESCALATEs them as "the control is present and inert", which
+    is a false verdict on a working test. So `None` here builds the default
+    cache-backed one rather than meaning "go without".
 
     `apply=False` is the dry run: the same replay, the same repairs computed,
     nothing emitted. It exists so that a caller who wants a *report* about
@@ -780,6 +805,7 @@ def verify(
 
     url = target_url or version.target_url
     credentials = credentials or Credentials.from_env()
+    synthesizer = synthesizer or _synthesizer()
     report = Report(directory=root, target_url=url, replayed=version)
 
     # The suite as it will be written if anything is emitted: every scenario,
@@ -800,6 +826,7 @@ def verify(
     for scenario in originals:
         result = runner.run(
             page, scenario, target_url=url, credentials=credentials,
+            synthesizer=synthesizer,
             on_event=on_event, provider=provider, run_id=run_id,
         )
         report.results.append(result)
@@ -883,7 +910,8 @@ def verify(
                 continue
             outcome = runner.run(
                 page, next_suite[index], target_url=url,
-                credentials=credentials, on_event=on_event,
+                credentials=credentials, synthesizer=synthesizer,
+                on_event=on_event,
             )
             report.reverified.append(outcome)
             if outcome.verdict in (runner.PASSED, runner.HEALED):
@@ -1190,9 +1218,25 @@ def record(
     credentials = credentials or Credentials.from_env()
     source = source or source_from_env()
 
+    # **Without this the recorder can only ever write happy paths.**
+    # `forms.perform` refuses `submit[invalid]` outright when handed no
+    # synthesizer -- deliberately, since an invalid edge carrying a valid
+    # payload would be a lie in the map -- and `record` handed it none, so
+    # every `make suite` run recorded submit[valid] and submit[empty] and
+    # nothing else. Measured 2026-09-05 against saucedemo: two runs, 8 and 5
+    # scenarios, zero invalid submissions in either, while the console path
+    # produced three from the same target. Which unhappy paths the brief got
+    # was decided by which entry point somebody used.
+    #
+    # `cache_path` is the same replay log every other caller reads, so a
+    # recorded payload is reused rather than re-synthesised, and a target
+    # crawled before costs nothing here. It degrades the way the rest of the
+    # system does: no provider means the static mutation table, not a crash.
+    synthesizer = _synthesizer()
+
     announce("info", "crawling deterministically first")
     world = crawl(page, entry_url, CrawlBudget(max_actions=40, max_seconds=180),
-                  credentials=credentials)
+                  credentials=credentials, synthesizer=synthesizer)
     announce("info", f"crawl: {len(world.states)} states, {len(world.skipped)} refused")
 
     behaviour = None
@@ -1232,7 +1276,7 @@ def record(
     outcomes = []
     for scenario in planned:
         result = runner.run(page, scenario, target_url=entry_url,
-                            credentials=credentials)
+                            credentials=credentials, synthesizer=synthesizer)
         outcomes.append(result.verdict)
     counts: dict[str, int] = {}
     for verdict in outcomes:

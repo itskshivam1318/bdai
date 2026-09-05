@@ -96,7 +96,17 @@ class Step:
     intent: str
     action: str
     from_key: str
-    fields: tuple[tuple[str, str], ...]  # (role, name) fillable in from_key
+    # `(role, name, value)` for every field the crawl actually typed into to
+    # take this action -- `Transition.typed`, straight from `forms.Performed`.
+    #
+    # **The value is recorded and never re-derived**, and that is the whole of
+    # this field. It used to be `(role, name)`, so `spec()` had to ask
+    # `forms.value_for` what to type, and `value_for` only knows how to produce
+    # input the app should *accept*. Every exported `submit[invalid]` therefore
+    # filled the valid credentials and asserted the rejection they cannot
+    # cause: a negative test that passes with all validation removed, which is
+    # worse than no test because it reads as coverage.
+    fields: tuple[tuple[str, str, str], ...]
     expect: Expectation
 
 
@@ -269,6 +279,65 @@ def _terminal_rank(action: str) -> int:
     return _RANK.get(form.group("mode"), 3) if form else 4
 
 
+def writable(action: str) -> bool:
+    """Can this action be written as a locator that survives drift?
+
+    Only if the control it names has an accessible name.
+    `forms.available_actions` settles the exploration half of this question and
+    states the rule outright -- "an element we cannot name is one we cannot
+    write a stable test for, so it is explored once and honestly". Exploring one
+    is right: the edge is a fact about the application and the map should hold
+    it. *Exporting* one is not, and the export is where the rule was missing.
+
+    Without it `_click` emits `page.getByRole('button').first()`, which is the
+    positional locator this design exists to avoid -- `available_actions` says
+    so in the same breath, and `_next_unnamed` repeats it: position is fine
+    inside one step of one action, re-derived live, and not fine in a spec that
+    has to still mean something next week.
+
+    Measured 2026-09-05 on the exported saucedemo suite: 4 of 8 specs clicked
+    "whatever button or link comes first in the DOM". Three were the login
+    page's error-dismiss X, which is why they fill the credentials, click, and
+    then assert the login form is still on screen -- a test whose subject is a
+    control nobody chose. The fourth clicked an unnamed product link and called
+    itself the item-detail test.
+
+    The map keeps every one of those edges. This only keeps them out of the
+    suite, and it is a *suite-size* trade the honest way round: four scenarios
+    that say what they click beat eight where half do not.
+    """
+    form = _FORM_ACTION.match(action)
+    descriptor = form.group("descriptor") if form else action
+    return bool(descriptor.partition(":")[2].strip())
+
+
+def _typed(
+    world: WorldMap, from_key: str, action: str
+) -> tuple[tuple[str, str, str], ...]:
+    """What the crawl typed to take `action` from `from_key`.
+
+    Read off the recorded edge. The fallback exists for a map recorded before
+    `Transition.typed` did -- an autosaved `runs/*.json`, a database from last
+    week -- and it is the *old*, wrong behaviour on purpose: `value_for` gives
+    valid input for every mode, so an old map still compiles a `submit[invalid]`
+    spec that types the credentials. There is no better answer available: the
+    payload the synthesizer chose was never written down. One re-crawl replaces
+    it with the truth.
+    """
+    for transition in world.transitions.get((from_key, action)) or ():
+        if transition.typed:
+            return tuple(tuple(field) for field in transition.typed)
+
+    node = world.states.get(from_key)
+    if node is None or not node.evidence:
+        return ()
+    credentials = Credentials.from_env()
+    return tuple(
+        (role, name, value_for(role, name, credentials))
+        for role, name in fields_of(world.evidence[node.evidence[0]])
+    )
+
+
 def _where(world: WorldMap, key: str) -> str:
     """A short human name for a destination state: its path, or its title."""
     node = world.states.get(key)
@@ -412,10 +481,11 @@ def from_flow(world: WorldMap, hypothesis) -> Scenario | None:
         )
         if edge is None:
             return None
+        if not writable(edge):
+            return None
         expect = expectation(world, from_key, edge)
         if expect is None:
             return None
-        observation = world.evidence[world.states[from_key].evidence[0]]
         steps.append(
             Step(
                 intent=intent_of(
@@ -425,7 +495,7 @@ def from_flow(world: WorldMap, hypothesis) -> Scenario | None:
                 ),
                 action=edge,
                 from_key=from_key,
-                fields=fields_of(observation),
+                fields=_typed(world, from_key, edge),
                 expect=expect,
             )
         )
@@ -464,6 +534,10 @@ def scenarios(world: WorldMap, limit: int = 8) -> tuple[Scenario, ...]:
             continue
         if not worth_testing(world, taken[0]):
             continue
+        # An unnamed control cannot be written down. See `writable`: the edge
+        # stays in the map, it just does not become a test.
+        if not writable(action) or not all(writable(edge) for edge in route):
+            continue
 
         steps: list[Step] = []
         cursor = world.entry_key
@@ -479,7 +553,7 @@ def scenarios(world: WorldMap, limit: int = 8) -> tuple[Scenario, ...]:
                     ),
                     action=edge,
                     from_key=cursor,
-                    fields=fields_of(observation),
+                    fields=_typed(world, cursor, edge),
                     expect=step_expect,
                 )
             )
@@ -534,7 +608,19 @@ def from_json(text: str) -> Scenario:
                 intent=step["intent"],
                 action=step["action"],
                 from_key=step["from_key"],
-                fields=tuple(tuple(field) for field in step["fields"]),
+                # A `fields` entry recorded before values were kept is a
+                # 2-tuple. Widening it here rather than refusing keeps every
+                # scenario already on disk replayable; `_typed` says what the
+                # third element is worth when it had to be re-derived.
+                fields=tuple(
+                    tuple(field) if len(field) == 3
+                    else (
+                        field[0],
+                        field[1],
+                        value_for(field[0], field[1], Credentials.from_env()),
+                    )
+                    for field in step["fields"]
+                ),
                 expect=Expectation(**{
                     **step["expect"],
                     "added": tuple(step["expect"]["added"]),
@@ -613,14 +699,13 @@ def spec(scenario: Scenario, credentials: Credentials | None = None) -> str:
             mode, descriptor = form.group("mode"), form.group("descriptor")
             if mode == "invalid":
                 lines.append(
-                    "    // Values chosen by the input synthesizer at crawl time;"
+                    "    // Input the synthesizer chose at crawl time to be"
                 )
                 lines.append(
-                    "    // see artifacts/invalid-payloads.json for the recorded payload."
+                    "    // rejected, reproduced here exactly as it was typed."
                 )
             if mode in {"valid", "invalid"}:
-                for role, name in step.fields:
-                    value = value_for(role, name, credentials)
+                for role, name, value in step.fields:
                     lines.append(
                         f"    await page.getByRole('{role}', "
                         f"{{ name: {_ts(name)}, exact: true }})"

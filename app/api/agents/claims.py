@@ -109,9 +109,26 @@ def attribute(
     if provider is None or not scenarios:
         return {claim: () for claim in claims}
 
-    turn = provider.turn(
-        SYSTEM, Transcript(prompt=brief(claims, scenarios, where)), [ATTRIBUTE]
-    )
+    # Built outside the guard below on purpose: the guard exists to absorb a
+    # *provider* failure, and a TypeError from our own prompt-building is a bug
+    # in this file that must not be reported as an unattributed claim.
+    transcript = Transcript(prompt=brief(claims, scenarios, where))
+    try:
+        turn = provider.turn(SYSTEM, transcript, [ATTRIBUTE])
+    except Exception as exc:
+        # Same rule as `critic.prioritise`, and it matters here for the same
+        # reason: this runs *after* `generator.scenarios` has compiled the plan
+        # but *before* `explore.py` writes a single `TestCase` row, so a raise
+        # here throws away a suite that was already built. Landing on the
+        # no-provider answer treats every claim as uncovered, which is the
+        # honest report -- nothing attributed them -- and is exactly what a
+        # model answering in prose already produces one branch below.
+        emit(
+            "warn",
+            f"attribution failed ({type(exc).__name__}: {exc}); "
+            "treating every claim as uncovered",
+        )
+        return {claim: () for claim in claims}
     call = next((c for c in turn.calls if c.name == ATTRIBUTE.name), None)
     if call is None:
         emit("warn", "nothing was attributed to the claims; treating them as uncovered")

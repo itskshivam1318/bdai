@@ -124,6 +124,26 @@ class Ranker:
         )
 
 
+class BrokeRanker:
+    """A provider that fails the way an empty OpenRouter balance fails.
+
+    The critic's docstring promises the no-provider path is "a real ranking and
+    not a degraded mode". A provider that *raises* must land in that same place:
+    ranking is the only thing the model does here, so losing it may cost the
+    order and the risk prose, and nothing else. It must never cost the suite --
+    `generator.scenarios` is deterministic and runs after this call.
+    """
+
+    name, model = "scripted:broke", "none"
+
+    def turn(self, system, transcript, tool_defs):
+        raise RuntimeError(
+            'qwen/qwen3-coder-next: 402 from the provider: {"error":{"message":'
+            '"This request requires more credits, or fewer max_tokens. You '
+            'requested up to 32768 tokens, but can only afford 267."}}'
+        )
+
+
 class Explorer:
     """Takes the first untried action it is shown, then reports."""
 
@@ -536,11 +556,12 @@ def _behaviour_checks() -> bool:
 
     ok &= check(
         "a hypothesis citing a state the map does not hold is refused",
-        admit(world, {"claim": "x", "kind": "flow", "cites": ["deadbeef"]}) is None,
+        admit(world.ground(), {"claim": "x", "kind": "flow", "cites": ["deadbeef"]})
+        is None,
     )
 
     admitted = admit(
-        world,
+        world.ground(),
         {"claim": "signing in authenticates", "kind": "flow",
          "cites": ["aaaaaaaa", "click:Sign in"]},
     )
@@ -561,7 +582,8 @@ def _behaviour_checks() -> bool:
     )
     ok &= check(
         "a hypothesis with no citation at all is refused",
-        admit(world, {"claim": "the app is slow", "kind": "flow", "cites": []})
+        admit(world.ground(), {"claim": "the app is slow", "kind": "flow",
+                              "cites": []})
         is None,
     )
 
@@ -1248,6 +1270,24 @@ def main() -> int:
     print("AGENTS      scripted provider, real browser, no API key\n")
     ok = True
 
+    # Ahead of the browser, deliberately. Everything below the `sync_playwright`
+    # block is gated on the SUT being up, and without `make dev` this module
+    # prints SKIPPED and returns 0 -- a green run that checked almost nothing.
+    # These two read source and drive stubs; a server they do not need must not
+    # be what decides whether they run. Found by adding them below the guard
+    # and watching `make probe` pass without executing either.
+    print()
+    ok &= _ground_checks()
+    ok &= _delta_checks()
+    ok &= _session_checks()
+    ok &= _worker_checks()
+    ok &= _seeding_checks()
+    ok &= _interleave_checks()
+    ok &= _ceiling_checks()
+    print()
+    ok &= _surface_checks()
+    print()
+
     with sync_playwright() as pw:
         try:
             browser, page, world, entry = _page_and_map(pw)
@@ -1698,6 +1738,96 @@ def main() -> int:
             "the error message an unhappy path exists to catch was dropped",
         )
 
+        # 3j. What the test types must be what the crawl typed. Measured
+        #     2026-09-05 on the exported saucedemo suite: every
+        #     `submit[invalid]` spec filled `standard_user` / `secret_sauce` --
+        #     the *valid* credentials -- and then asserted "Password is
+        #     required". Both cannot be true. The spec passed anyway, because
+        #     the assertion is a visibility check on text that happened to be
+        #     on screen at record time, and it would keep passing if the
+        #     application deleted every validation rule it has.
+        #
+        #     Root cause was a data-model hole, not a codegen slip: `Step.fields`
+        #     carried `(role, name)` -- *which* fields exist -- so `spec()` had
+        #     to re-derive the value from `forms.value_for`, and that function
+        #     only knows how to produce valid input. Anything the recorder does
+        #     not persist, the export re-derives, and re-derivation always
+        #     drifts to the default path because it is the only one the deriving
+        #     function knows.
+        from .generator import Expectation as _Exp
+        from .generator import Step as _Step
+        from .generator import Scenario as _Scen
+        from .generator import spec as _spec
+
+        _typed = _Scen(
+            name="submit the Sign in form with input the app should reject",
+            target_url="https://example.test/",
+            steps=(
+                _Step(
+                    intent="submit the Sign in form with input the app should reject",
+                    action="submit[invalid]:button:Sign in",
+                    from_key="a",
+                    fields=(
+                        ("textbox", "Username", "' OR 1=1 --"),
+                        ("textbox", "Password", ""),
+                    ),
+                    expect=_Exp(
+                        moved=False, mutating=False,
+                        added=("- paragraph: Password is required",),
+                        removed=(), to_key="a",
+                    ),
+                ),
+            ),
+        )
+        _exported = _spec(_typed, Credentials("real-user", "real-password"))
+        ok &= check(
+            "a rejected-input spec types what the crawl typed",
+            "' OR 1=1 --" in _exported,
+            "the recorded payload never reached the export -- the spec re-derived "
+            "a valid value and now asserts a rejection it cannot cause",
+        )
+        ok &= check(
+            "a rejected-input spec does not type the valid credentials",
+            "real-password" not in _exported and "real-user" not in _exported,
+            "the negative test fills the happy-path credentials, so it would "
+            "still pass with every validation rule removed",
+        )
+
+        # 3k. An action we cannot name is an action we cannot write a test for.
+        #     `forms.available_actions` says so in as many words -- "an element
+        #     we cannot name is one we cannot write a stable test for, so it is
+        #     explored once and honestly" -- and then the Generator compiled one
+        #     anyway, as `page.getByRole('button').first()`. Measured on the
+        #     exported saucedemo suite: 4 of 8 specs clicked "whatever button or
+        #     link is first in the DOM". Three of them were the error-dismiss X
+        #     on the login page, which is why they submit a form and then assert
+        #     the form is still there.
+        #
+        #     Exploring an unnamed control is right; exporting one is not. The
+        #     map keeps the edge either way -- this drops it from the *suite*.
+        from .generator import scenarios as _scen_of
+
+        _unnamed = _WM()
+        _a = _unnamed.record(_Obs(url="/", title="t", snapshot="- button\n- link"))
+        _b = _unnamed.record(_Obs(url="/x", title="u", snapshot="- heading: Done"))
+        _unnamed.transitions[(_a, "button")] = [_T(_a, "button", _b, True, 1)]
+        ok &= check(
+            "an action with no accessible name is not compiled into a suite",
+            not _scen_of(_unnamed),
+            "compiled a scenario whose only locator is getByRole(role).first() "
+            "-- the positional locator this design exists to avoid",
+        )
+
+        _named = _WM()
+        _c = _named.record(_Obs(url="/", title="t", snapshot='- button "Go"'))
+        _d = _named.record(_Obs(url="/x", title="u", snapshot="- heading: Done"))
+        _named.transitions[(_c, "button:Go")] = [_T(_c, "button:Go", _d, True, 1)]
+        ok &= check(
+            "a named action still compiles",
+            bool(_scen_of(_named)),
+            "the name guard is too strict -- it dropped a nameable action",
+        )
+
         # 4. The executable layer: a path through the map becomes a test, and
         #    the test's failure classifies itself. These six checks are the
         #    acceptance experiment for the whole product claim, so they drive
@@ -1867,7 +1997,10 @@ def main() -> int:
                 intent="submit a payment form this page does not have",
                 action="submit[valid]:button:Place order",
                 from_key="",
-                fields=(("textbox", "Card number"), ("textbox", "CVC")),
+                fields=(
+                    ("textbox", "Card number", "4111111111111111"),
+                    ("textbox", "CVC", "123"),
+                ),
                 expect=Expectation(True, False, (), (), ""),
             )
             refusal = resolve(page, impostor, here)
@@ -1923,6 +2056,25 @@ def main() -> int:
                 "an omitted gap is still reported, after the ranked ones",
                 all(not g.risk for g in ranked[2:]) and len(ranked) > 2,
                 "omission deleted evidence instead of demoting it",
+            )
+
+            # Runs 31 and 33 of 2026-09-05 are the same 402 on the same key:
+            # 31 reached this call and died with 0 tests, 33 had no candidates
+            # to rank, never made the call, and reported 12. The difference was
+            # never about coverage -- it was that this one model call could
+            # abort a deterministic suite compiled after it.
+            try:
+                survived = prioritise(mapped, BrokeRanker())
+            except Exception as exc:
+                survived = None
+                broke = f"{type(exc).__name__}: {exc}"
+            else:
+                broke = ""
+            ok &= check(
+                "a provider that fails leaves the computed ranking standing",
+                survived is not None
+                and set(g.citation for g in survived) == set(cells),
+                broke or "the candidates did not survive the provider failure",
             )
 
             # The one call that decides the order of the final report, and the
@@ -2824,6 +2976,37 @@ def _ladder_checks() -> bool:
         ladder(exact_step, tie, (), None).action is None,
     )
 
+    # --- a form submit is matched on which fields exist, not what was typed ---
+    #
+    # `Step.fields` carries `(role, name, value)` since the recorded payload had
+    # to reach the export (see `Step.fields`). `fields_now` is read off a live
+    # page nobody has typed into yet, so it is `(role, name)` and always will
+    # be. Comparing the two directly compares a recording against a blank form,
+    # never matches, and every form submit escalates as `unresolved` -- which is
+    # exactly what happened the moment the value was added, and what these two
+    # checks exist to catch if the projection is ever dropped again.
+    _form_step = Step(
+        intent="complete the Sign in form and submit it",
+        action="submit[valid]:button:Sign in",
+        from_key="a" * 16,
+        fields=(("textbox", "Email", "a@b.test"), ("textbox", "Password", "pw")),
+        expect=step.expect,
+    )
+    _same_form = (("textbox", "Email"), ("textbox", "Password"))
+    _renamed = ladder(_form_step, ("submit[valid]:button:Log in",), _same_form)
+    ok &= check(
+        "a renamed submit heals when the form still has the same fields",
+        _renamed.action == "submit[valid]:button:Log in",
+        f"rung={_renamed.rung} action={_renamed.action!r} -- the recorded value "
+        f"was compared against a blank page",
+    )
+    ok &= check(
+        "a submit whose form lost a field still refuses to heal onto it",
+        ladder(
+            _form_step, ("submit[valid]:button:Log in",), (("textbox", "Email"),)
+        ).action is None,
+    )
+
     # --- with no provider, nothing changes -------------------------------
     ok &= check(
         "no provider is the behaviour that shipped: the tie still escalates",
@@ -2927,6 +3110,43 @@ def _reverify_checks() -> bool:
 
     print("REVERIFY    a repair is not a repair until it has been replayed")
     ok = True
+
+    # The crawl `record` runs is the only one that can produce a
+    # `submit[invalid]` edge, and `forms.perform` refuses that mode outright
+    # when handed no synthesizer -- deliberately, because an invalid edge
+    # carrying a valid payload would be a lie in the map. `record` passed none,
+    # so `make suite` could never record an unhappy path at all: measured
+    # 2026-09-05 against saucedemo, 8 scenarios and 5 scenarios across two runs,
+    # zero `submit[invalid]` in either, while the console path -- which does
+    # pass one -- produced three. The brief's "not just happy paths" was
+    # decided by which entry point you used.
+    ok &= check(
+        "the suite recorder gives its crawl a synthesizer",
+        "synthesizer=" in _function_source(regression, "record"),
+        "submit[invalid] is refused for want of one, so `make suite` can only "
+        "ever record happy paths and empty submissions",
+    )
+
+    # The replay half of the same omission, and the more damaging one, because
+    # it does not go quiet -- it reports. `runner.run` re-submits a form by
+    # re-performing the action, so an invalid submission replayed without a
+    # synthesizer is refused and the step ESCALATEs as "the action would not
+    # execute -- the control is present and inert". The control is fine. We
+    # declined to type. Measured 2026-09-05 on the saucedemo suite this
+    # recorder had just written: 4 escalate, 4 passed, and every one of the
+    # four escalations was an invalid or empty submission the recorder itself
+    # had watched the app handle correctly minutes earlier.
+    for name in ("record", "verify"):
+        body = _function_source(regression, name)
+        ok &= check(
+            f"`{name}` replays with the synthesizer it recorded with",
+            all(
+                "synthesizer=" in call
+                for call in body.split("runner.run(")[1:]
+            ),
+            "an invalid-input scenario escalates as inert, which is a false "
+            "verdict on a test this same function wrote and watched pass",
+        )
 
     body = _function_source(regression, "verify")
 
@@ -3335,6 +3555,972 @@ def _suite_checks() -> bool:
         "the cheap gate is available, but only when asked for by name",
         not regression.should_replay(calm, if_drifted=True)
         and regression.should_replay(moved, if_drifted=True),
+    )
+
+    return ok
+
+
+def _surface_checks() -> bool:
+    """Every surface the backend emits on must be one the console listens for.
+
+    `Event.surface` is a string agreed between two languages and checked by
+    nobody. `web/lib/stages.ts` maps a surface to a slot in the stage strip and
+    `web/lib/agents.ts` maps it to an agent; both are hand-maintained tables in
+    TypeScript keyed on literals written in Python. A surface with no listener
+    is not an error anywhere -- the row is written, the console reads it, and
+    no stage lights.
+
+    Found the expensive way on 2026-09-05. The console's seed crawl passed
+    `checkpoint` and no `trace`, so the *map* streamed while the timeline held
+    one sentence -- "crawling deterministically first" -- for the whole crawl,
+    with a live elapsed counter climbing beside it. `_crawl_only` was handed an
+    `emit` it never called. `pipeline.run` passed a `trace` with no surface at
+    all, which lights nothing. All three were the longest stage of the run
+    reporting into a table with no row for it.
+
+    Offline: reads source, runs nothing.
+    """
+    import re
+
+    from . import pipeline
+    from app.routers import explore as explore_router
+
+    print("SURFACE     the crawl reports somewhere the console is looking")
+    ok = True
+
+    web = Path(__file__).resolve().parents[2] / "web" / "lib"
+    stages, agents = web / "stages.ts", web / "agents.ts"
+    if not stages.exists():
+        return check("web/lib/stages.ts is where it is expected", False, str(stages))
+
+    # What the console listens for, from both tables. `surfaces: [...]` is the
+    # shape in each, so one pattern reads both.
+    listened = set(
+        re.findall(r'"([a-z]+)"', " ".join(
+            re.findall(r"surfaces:\s*\[([^\]]*)\]", stages.read_text() + agents.read_text())
+        ))
+    )
+
+    # What the backend actually writes. Both spellings: `surface="x"` and the
+    # positional third argument `emit(level, message, "x")`.
+    emitted: set[str] = set()
+    for module in (pipeline, explore_router):
+        text = _source(module, "def ")
+        emitted |= set(re.findall(r'surface=["\']([a-z]+)["\']', text))
+        emitted |= set(re.findall(r'emit\([^)]*?,\s*["\']([a-z]+)["\']\s*\)', text))
+
+    orphans = sorted(emitted - listened)
+    ok &= check(
+        "every surface the backend emits has a stage listening for it",
+        not orphans,
+        f"{orphans} reach the database and light nothing; add them to "
+        "web/lib/stages.ts or stop emitting them",
+    )
+
+    # The specific one that was missing, named so a regression says which.
+    ok &= check(
+        "the crawl is one of them",
+        "explore" in emitted and "explore" in listened,
+        "the longest stage of a run has no surface, so the stage strip stays "
+        "dark from the first action to the last",
+    )
+
+    # And the crawl must actually *say* something per action, not only persist.
+    # `checkpoint` streams the map; `trace` streams the account of it, and the
+    # canvas filling while the timeline sits still is the confusing half.
+    for name in ("_crawl_only",):
+        body = _function_source(explore_router, name)
+        ok &= check(
+            f"{name} narrates the crawl as well as persisting it",
+            "trace=" in body and "checkpoint=" in body,
+            "it was handed an `emit` and never called it: the map filled and "
+            "the timeline said nothing for the whole crawl",
+        )
+
+    seeds = _source(explore_router, "crawling deterministically first")
+    ok &= check(
+        "the seed crawl in front of the colony narrates too",
+        seeds.count("trace=lambda line: emit(") >= 1,
+        "the seed crawl is minutes long and reported twice: once when it "
+        "started and once when it finished",
+    )
+
+    ok &= check(
+        "pipeline.run's crawl traces carry a surface, not just a level",
+        _source(pipeline, "trace=lambda").count('emit("info", line, "explore")') == 2,
+        'both crawls in pipeline.run must pass the surface; `emit("info", '
+        "line)` defaults it to None and lights no stage",
+    )
+    return ok
+
+
+def _ground_checks() -> bool:
+    """The citation guard, detached from a map that is still being written.
+
+    `admit` reads `world.vocabulary()` and the keys of `world.states`, and
+    `vocabulary()` iterates `states`. Once the behavioural model runs beside
+    the crawl rather than after it, that iteration happens on a second thread
+    while the crawler inserts -- which is `RuntimeError: dictionary changed
+    size during iteration`, raised somewhere in the model's reply handling and
+    nowhere near the cause.
+
+    `Ground` is the fix: an immutable pair of frozensets taken on the crawl
+    thread and handed across. These pin that it carries what `admit` needs,
+    that it cannot tear, and that using it does not loosen the guard.
+
+    Offline: no browser, no key, no network.
+    """
+    from .explorer.worldmap import Ground
+
+    print("GROUND      the citation guard, detached from a live map")
+    ok = True
+    world = _behaviour_world()
+
+    ground = world.ground()
+    ok &= check(
+        "a ground carries the map's state keys",
+        ground.states == frozenset(world.states),
+        f"got {sorted(ground.states)}, map has {sorted(world.states)}",
+    )
+    ok &= check(
+        "and its action vocabulary",
+        ground.actions == frozenset(world.vocabulary()),
+        f"got {sorted(ground.actions)}, map has {sorted(world.vocabulary())}",
+    )
+    ok &= check(
+        "and is frozen, so two threads cannot see it half-written",
+        isinstance(ground, Ground)
+        and isinstance(ground.states, frozenset)
+        and isinstance(ground.actions, frozenset),
+        "a mutable snapshot is the bug wearing a different name",
+    )
+
+    # The guard itself, now reading a value rather than a map. Same rule:
+    # every citation must resolve, an 8-character id widens to 16, an
+    # ambiguous prefix is refused, and a claim left with none is dropped.
+    from .behavior import admit
+
+    hypothesis = admit(ground, {
+        "claim": "signing in reaches the dashboard",
+        "kind": "flow",
+        "cites": ["a" * 8, "click:Sign in"],
+    })
+    ok &= check(
+        "admit resolves a short state id and an action against a ground",
+        hypothesis is not None and set(hypothesis.cites) == {"a" * 16, "click:Sign in"},
+        f"got {hypothesis.cites if hypothesis else None}",
+    )
+    ok &= check(
+        "and still refuses a claim whose every citation is invented",
+        admit(ground, {
+            "claim": "the checkout page totals the cart",
+            "kind": "flow",
+            "cites": ["click:Checkout", "f" * 8],
+        }) is None,
+        "a claim about web applications in general passed the guard",
+    )
+
+    # Staleness, in the one direction it can happen. The crawl keeps walking
+    # while the model is thinking, so a reply is admitted against a ground
+    # taken before it. States are never removed, so the worst this can do is
+    # refuse something the newer map would allow.
+    from .explorer.worldmap import StateNode
+
+    stale = world.ground()
+    world.states["c" * 16] = StateNode(
+        key="c" * 16, url="/cart", title="Cart",
+        actions=("click:Checkout",), label="cart", evidence=(2,),
+    )
+    ok &= check(
+        "a ground taken earlier still resolves everything it was taken with",
+        admit(stale, {"claim": "c", "kind": "flow", "cites": ["a" * 8]}) is not None,
+        "the guard got stricter about states it already had, which would drop "
+        "claims for no reason",
+    )
+    ok &= check(
+        "and refuses a state that arrived after it was taken",
+        admit(stale, {"claim": "c", "kind": "flow", "cites": ["c" * 8]}) is None,
+        "too lax is the dangerous direction: a ground must never admit a "
+        "citation it cannot itself resolve",
+    )
+    ok &= check(
+        "while a ground taken after does admit it",
+        admit(world.ground(), {"claim": "c", "kind": "flow", "cites": ["c" * 8]})
+        is not None,
+        "the newer ground should see the newer state",
+    )
+
+    # The reason `Ground` exists at all. Iterating a live map while the
+    # crawler inserts into it raises; iterating a ground cannot.
+    torn = None
+    try:
+        for _ in world.ground().states:
+            world.states["d" * 16] = StateNode(
+                key="d" * 16, url="/d", title="D", actions=(), evidence=(),
+            )
+    except RuntimeError as exc:
+        torn = exc
+    ok &= check(
+        "a ground survives the map growing underneath it",
+        torn is None,
+        f"raised {torn!r} -- which is what the crawler thread would cause",
+    )
+    return ok
+
+
+def _delta_checks() -> bool:
+    """What one turn of an incremental behavioural model is shown.
+
+    `brief` renders the whole map, and its reply grows with it -- which is how
+    `sarvam-105b` came to be cut off mid-`tool_calls` (see `_ceiling_checks`).
+    Fed a few states at a time the reply stays small, and each turn can be told
+    what arrived since the last one rather than re-reading everything.
+
+    Offline: no browser, no key, no network.
+    """
+    from .behavior import delta_brief
+
+    print("DELTA       one turn sees what arrived, not everything")
+    ok = True
+    world = _behaviour_world()
+    login, dash = "a" * 16, "b" * 16
+
+    first = delta_brief(world, since=frozenset())
+    ok &= check(
+        "the first turn is shown every state",
+        first is not None and login[:8] in first and dash[:8] in first,
+        "a first turn with nothing in it would make the whole model empty",
+    )
+
+    later = delta_brief(world, since=frozenset({login}))
+    ok &= check(
+        "a later turn names the state that arrived",
+        later is not None and dash[:8] in later,
+        f"{dash[:8]} missing from {later!r}",
+    )
+    ok &= check(
+        "and does not re-describe the one already sent",
+        later is not None and login[:8] not in later.split("Since")[-1],
+        "re-sending every state is the growth this exists to stop -- the "
+        "reply scales with the map again",
+    )
+    ok &= check(
+        "while still carrying the shape of the whole map",
+        later is not None and "2 states" in later,
+        "a turn shown four states and nothing else cannot tell a small app "
+        "from the corner of a large one",
+    )
+
+    ok &= check(
+        "nothing new means no turn to take",
+        delta_brief(world, since=frozenset({login, dash})) is None,
+        "an empty delta must not be sent: it is a paid model call that can "
+        "only produce claims about states already claimed",
+    )
+    return ok
+
+
+def _session_checks() -> bool:
+    """Hypotheses accumulating across turns, and never un-said.
+
+    `synthesise` asked once. A session asks repeatedly over one transcript, so
+    turn 3 can revise its reading of turn 1 in the light of states that only
+    arrived in between -- which is the whole reason to interleave.
+
+    **What it may not do is withdraw.** A turn that could delete an earlier
+    hypothesis would be a model grading its own claim, which is what
+    `behavior.py` exists to prevent, and it would be the invisible form of it:
+    a claim removed before `examine` runs leaves no count and no verdict. So
+    turns add, `examine` rules at the end from the map, and a claim that later
+    states contradict comes back `contradicted` -- a finding, not a silence.
+
+    Offline: a scripted provider. No key, no network.
+    """
+    from .behavior import BehaviourSession
+    from .llm import ToolCall, Turn
+
+    def call(*hypotheses, summary="", truncated=False):
+        return Turn(
+            text="",
+            calls=(ToolCall(id="c", name="model", arguments={
+                "summary": summary, "hypotheses": list(hypotheses),
+            }),),
+            truncated=truncated,
+        )
+
+    class Scripted:
+        """Replays turns in order and records what it was asked."""
+
+        name, model = "scripted", "stub"
+
+        def __init__(self, *turns):
+            self.turns, self.prompts = list(turns), []
+
+        def turn(self, system, transcript, tools):
+            # Depth and follow-up captured *now*. The transcript is one mutable
+            # object the session keeps appending to, so holding a reference and
+            # reading it later measures the end of the run, not this turn.
+            last = transcript.exchanges[-1] if transcript.exchanges else None
+            self.prompts.append((
+                len(transcript.exchanges),
+                last.follow_up if last else "",
+                transcript.prompt,
+                len(last.results) if last else 0,
+            ))
+            nxt = self.turns.pop(0)
+            if isinstance(nxt, Exception):
+                raise nxt
+            return nxt
+
+    print("SESSION     one transcript, hypotheses accumulating")
+    ok = True
+    world = _behaviour_world()
+    login, dash = "a" * 16, "b" * 16
+    ground = world.ground()
+
+    LOGIN = {"claim": "the entry state is a sign-in form", "kind": "flow",
+             "cites": [login[:8]]}
+    DASH = {"claim": "signing in reaches a dashboard", "kind": "flow",
+            "cites": [dash[:8]]}
+    INVENTED = {"claim": "there is a checkout page", "kind": "flow",
+                "cites": ["ffffffff"]}
+
+    # 1. Two turns, and both survive.
+    provider = Scripted(call(LOGIN, summary="a login"), call(DASH))
+    session = BehaviourSession(provider, system="sys")
+    session.feed("turn one", ground)
+    session.feed("turn two", ground)
+    model = session.model()
+    claims = {h.claim for h in model.hypotheses}
+    ok &= check(
+        "a hypothesis from the first turn survives the second",
+        LOGIN["claim"] in claims,
+        f"got {claims}",
+    )
+    ok &= check(
+        "and the second turn's is there too",
+        DASH["claim"] in claims,
+        f"got {claims} -- last-turn-wins loses everything said earlier",
+    )
+
+    # 2. One transcript, so a later turn can see what it already said.
+    # Every tool call must be answered before the next turn is sent. Measured
+    # live on 2026-09-05 against `minimax/minimax-m3:free`: turns 1 and 2
+    # succeeded, and turn 3 came back
+    #
+    #   400 ... "invalid params, tool call result does not follow tool call"
+    #
+    # because the transcript held an assistant turn that called `model` and no
+    # `role: "tool"` message answering it. `synthesise` never met this -- it
+    # sends one turn and never sends the transcript back -- so it is a bug that
+    # only exists once the conversation continues.
+    answered = provider.prompts[1][3]
+    ok &= check(
+        "the first turn's tool call is answered before the second is sent",
+        answered == 1,
+        f"{answered} result(s) for 1 call: a provider that validates the "
+        "message list rejects the whole turn, and every turn after it",
+    )
+
+    depth, follow_up, opening = provider.prompts[1][:3]
+    ok &= check(
+        "the second turn is shown the first turn's exchange",
+        depth == 1,
+        f"the transcript carried {depth} exchange(s) at call time; with 0, "
+        "each turn is a fresh conversation and the context this exists to "
+        "build never accumulates",
+    )
+    ok &= check(
+        "and the second turn's text reaches the model as the reply to it",
+        follow_up == "turn two" and opening == "turn one",
+        f"follow_up={follow_up!r} opening={opening!r} -- every provider "
+        "serialises `Exchange.follow_up` as the next user message; without "
+        "it the turn is sent with nothing new to read",
+    )
+
+    # 3. The guard still runs, per turn, and still counts what it drops.
+    provider = Scripted(call(LOGIN, INVENTED))
+    session = BehaviourSession(provider, system="sys")
+    session.feed("turn one", ground)
+    ok &= check(
+        "an invented citation is dropped inside a session too",
+        session.model().dropped == 1
+        and {h.claim for h in session.model().hypotheses} == {LOGIN["claim"]},
+        f"dropped={session.model().dropped}",
+    )
+
+    # 4. A turn that fails must not cost the turns that worked. This runs on a
+    #    worker thread beside a crawl; losing the crawl's semantic layer to one
+    #    bad reply is the failure the whole design is built to avoid.
+    provider = Scripted(call(LOGIN), RuntimeError("provider exploded"))
+    session = BehaviourSession(provider, system="sys")
+    session.feed("turn one", ground)
+    session.feed("turn two", ground)
+    ok &= check(
+        "a turn that raises leaves the earlier turns intact",
+        {h.claim for h in session.model().hypotheses} == {LOGIN["claim"]},
+        f"got {[h.claim for h in session.model().hypotheses]}",
+    )
+    ok &= check(
+        "and says so rather than failing silently",
+        any(level == "error" for level, _ in session.notes),
+        f"notes={session.notes}",
+    )
+
+    # 5. The summary is the first one offered, not the last. A later turn sees
+    #    a fraction of the app and would narrow it.
+    provider = Scripted(call(LOGIN, summary="a login and a dashboard"),
+                        call(DASH, summary="a dashboard"))
+    session = BehaviourSession(provider, system="sys")
+    session.feed("one", ground)
+    session.feed("two", ground)
+    ok &= check(
+        "the summary is kept from the turn that saw the most",
+        session.model().summary == "a login and a dashboard",
+        f"got {session.model().summary!r}",
+    )
+    return ok
+
+
+def _worker_checks() -> bool:
+    """The behavioural model running beside the crawl, not after it.
+
+    The crawler walks on the main thread and the model call is network I/O, so
+    the model runs on a worker and the crawl never waits for it. Two things
+    make that safe rather than merely fast, and both are checked here.
+
+    **The worker touches no database.** `routers/explore.py`'s `emit` closes
+    over one SQLModel `Session` and commits on it, and `db.py` sets
+    `check_same_thread: False` -- so a second thread writing events would not
+    raise, it would corrupt that session's unit of work quietly. Everything the
+    worker wants to say is queued and emitted by whoever calls `tick`, which is
+    the crawl thread.
+
+    **The worker touches no live map.** It is handed `delta_brief` text and a
+    frozen `Ground`, both built on the crawl thread. See `worldmap.Ground`.
+
+    Offline: a scripted provider, no browser, no key, no network.
+    """
+    import threading
+
+    from .behavior import BehaviourWorker
+    from .explorer.worldmap import StateNode
+    from .llm import ToolCall, Turn
+
+    def call(*hypotheses):
+        return Turn(text="", calls=(ToolCall(
+            id="c", name="model",
+            arguments={"summary": "s", "hypotheses": list(hypotheses)},
+        ),))
+
+    class Scripted:
+        name, model = "scripted", "stub"
+
+        def __init__(self, *turns, record=None):
+            self.turns, self.record = list(turns), record
+            self.threads: set[int] = set()
+
+        def turn(self, system, transcript, tools):
+            self.threads.add(threading.get_ident())
+            nxt = self.turns.pop(0) if self.turns else call()
+            if isinstance(nxt, Exception):
+                raise nxt
+            return nxt
+
+    def grow(world, n: int, start: int = 0):
+        """Add `n` states, the way a crawl does -- one at a time."""
+        for i in range(start, start + n):
+            key = f"{i:016x}"
+            world.states[key] = StateNode(
+                key=key, url=f"/s{i}", title=f"S{i}",
+                actions=(f"click:go{i}",), evidence=(),
+            )
+
+    print("WORKER      the model runs beside the crawl, not after it")
+    ok = True
+    main_thread = threading.get_ident()
+
+    # 1. A batch is sent once enough states have arrived, and not before.
+    world = _behaviour_world()
+    provider = Scripted()
+    worker = BehaviourWorker(provider, every=4)
+    worker.tick(world)
+    ok &= check(
+        "two states is not yet a batch",
+        worker.batches == 0,
+        f"sent {worker.batches} batch(es) for 2 states with every=4",
+    )
+    grow(world, 2)
+    worker.tick(world)
+    ok &= check(
+        "the fourth state sends one",
+        worker.batches == 1,
+        f"sent {worker.batches}",
+    )
+    grow(world, 3, start=2)
+    worker.tick(world)
+    ok &= check(
+        "three more is not another",
+        worker.batches == 1,
+        f"sent {worker.batches} -- the threshold is per batch, not cumulative",
+    )
+    worker.close()
+
+    # 2. The crawl thread is the only one that emits. This is the check that
+    #    stands between a worker and a quietly corrupted SQLModel session.
+    world = _behaviour_world()
+    grow(world, 6)
+    emitted_from: set[int] = set()
+    said: list[tuple[str, str]] = []
+
+    def emit(level, message):
+        emitted_from.add(threading.get_ident())
+        said.append((level, message))
+
+    provider = Scripted(call({"claim": "c", "kind": "flow",
+                              "cites": ["a" * 8]}))
+    worker = BehaviourWorker(provider, every=4, on_event=emit)
+    worker.tick(world)
+    model = worker.close()
+
+    ok &= check(
+        "the model really ran on another thread",
+        provider.threads and main_thread not in provider.threads,
+        f"provider ran on {provider.threads}, main is {main_thread} -- if it "
+        "ran here, the crawl waited for it and nothing was gained",
+    )
+    ok &= check(
+        "and every event was emitted from the crawl thread",
+        emitted_from <= {main_thread},
+        f"emitted from {emitted_from}, main is {main_thread}: a worker "
+        "calling `emit` writes to a SQLModel session from two threads, which "
+        "check_same_thread=False lets corrupt silently instead of raising",
+    )
+    ok &= check(
+        "what the worker admitted comes back from close()",
+        len(model.hypotheses) == 1,
+        f"got {len(model.hypotheses)} hypothesis(es)",
+    )
+    ok &= check(
+        "and the run is told the model said something",
+        any("hypothes" in m for _, m in said),
+        f"said {said}",
+    )
+
+    # 3. A worker that dies must cost the model and nothing else.
+    world = _behaviour_world()
+    grow(world, 6)
+    before = dict(world.states)
+    worker = BehaviourWorker(
+        Scripted(RuntimeError("provider exploded")), every=4, on_event=emit,
+    )
+    worker.tick(world)
+    model = worker.close()
+    ok &= check(
+        "a worker that raises leaves the map untouched",
+        world.states == before,
+        "the crawl's own result must not depend on the model beside it",
+    )
+    ok &= check(
+        "and returns an empty model rather than propagating",
+        model.hypotheses == (),
+        f"got {model.hypotheses}",
+    )
+    ok &= check(
+        "and the failure reaches the run as an error",
+        any(level == "error" for level, _ in said),
+        f"said {said}",
+    )
+
+    # 4. No provider, no thread. This is the whole no-key path.
+    world = _behaviour_world()
+    grow(world, 6)
+    worker = BehaviourWorker(None, every=4, on_event=emit)
+    worker.tick(world)
+    ok &= check(
+        "with no provider nothing is started and nothing is claimed",
+        worker.close().hypotheses == () and worker.batches == 0,
+        "a colony with no key still crawls; it must not grow a thread",
+    )
+
+    # 5. close() must not hang the run waiting on a model call.
+    ok &= check(
+        "close() is bounded, so a wedged provider cannot hold the run open",
+        BehaviourWorker(None).close() is not None,
+        "close must always return a model, even an empty one",
+    )
+
+    # 6. The tail of the crawl. Batches are sent every `every` states, so a
+    #    crawl that ends with fewer than that left over would leave its last
+    #    states unexamined -- and the last states of a crawl are the deepest
+    #    ones it reached, which is where the interesting behaviour is.
+    world = _behaviour_world()
+    grow(world, 2)          # 4 states -> one full batch
+    provider = Scripted(call({"claim": "first", "kind": "flow",
+                              "cites": ["a" * 8]}),
+                        call({"claim": "tail", "kind": "flow",
+                              "cites": ["b" * 8]}))
+    worker = BehaviourWorker(provider, every=4, on_event=emit)
+    worker.tick(world)
+    grow(world, 2, start=2)  # 2 more -> below the threshold, never sent
+    worker.tick(world)
+    sent_during = worker.batches
+    model = worker.close(world)
+    ok &= check(
+        "the states left over when the crawl stops are still sent",
+        worker.batches == sent_during + 1,
+        f"{worker.batches} batch(es) total after {sent_during} during the "
+        "crawl -- without a final flush the deepest states the crawl reached "
+        "are the ones the model never sees",
+    )
+    ok &= check(
+        "and what that last turn said is in the model",
+        {h.claim for h in model.hypotheses} == {"first", "tail"},
+        f"got {[h.claim for h in model.hypotheses]}",
+    )
+
+    ok &= check(
+        "closing twice does not send the tail twice",
+        BehaviourWorker(None).close(world).hypotheses == (),
+        "close is called from a finally block on more than one path",
+    )
+    return ok
+
+
+def _seeding_checks() -> bool:
+    """Who builds the behavioural model when the crawl already built one.
+
+    `orchestrator.run` calls `synthesise` before its first wave, because
+    without a semantic layer the only plan it can form is "try the untried
+    actions". Once the crawl builds that layer *while it crawls*, the colony
+    is handed one -- and calling `synthesise` anyway would pay for the same
+    model twice and throw away the incremental one, which is the better of the
+    two because it was built a few states at a time.
+
+    The decision is its own function so it can be checked without a browser.
+    `orchestrator.run` needs a live `Page`; this needs nothing.
+
+    Offline: no browser, no key, no network.
+    """
+    from .behavior import BehaviorModel
+    from .orchestrator import behaviour_for
+
+    print("SEEDING     the colony uses the model the crawl already built")
+    ok = True
+    world = _behaviour_world()
+    calls: list[str] = []
+
+    def synth(*args, **kwargs):
+        calls.append("called")
+        return BehaviorModel(summary="freshly synthesised")
+
+    handed = BehaviorModel(summary="built beside the crawl")
+
+    got = behaviour_for(world, provider=object(), given=handed, synthesise=synth)
+    ok &= check(
+        "a model handed in is the one the colony uses",
+        got is handed,
+        f"got {got.summary!r}",
+    )
+    ok &= check(
+        "and no second model is paid for",
+        calls == [],
+        "synthesise ran anyway: the same map is sent to the same model twice "
+        "and the incremental answer is discarded for the one-shot one",
+    )
+
+    calls.clear()
+    got = behaviour_for(world, provider=object(), given=None, synthesise=synth)
+    ok &= check(
+        "with nothing handed in the colony still builds its own",
+        calls == ["called"] and got.summary == "freshly synthesised",
+        f"calls={calls} got={got.summary!r} -- every path that does not run "
+        "the worker must keep working exactly as it did",
+    )
+
+    calls.clear()
+    ok &= check(
+        "an empty model handed in is still a model, not a missing one",
+        behaviour_for(world, provider=object(), given=BehaviorModel(),
+                      synthesise=synth) is not None and calls == [],
+        "a worker that admitted nothing has already spent the model call; "
+        "re-running synthesise would spend a second on the same states",
+    )
+
+    calls.clear()
+    ok &= check(
+        "with no provider nothing is built and nothing is called",
+        behaviour_for(world, provider=None, given=None,
+                      synthesise=synth).hypotheses == () and calls == [],
+        "the no-key path must not reach a model",
+    )
+
+    calls.clear()
+    empty = _behaviour_world()
+    empty.states = {}
+    ok &= check(
+        "an empty map is not worth a model call either",
+        behaviour_for(empty, provider=object(), given=None,
+                      synthesise=synth).hypotheses == () and calls == [],
+        "there is nothing to interpret",
+    )
+    return ok
+
+
+def _interleave_checks() -> bool:
+    """The crawl and the behavioural model, wired together in both callers.
+
+    Two entry points build a map and then colonise it: `pipeline.run`, which
+    `make pipeline` drives, and the inline sequence in `routers/explore.py`,
+    which the console's Start button drives. They are not the same code, and a
+    feature wired into one of them exists on half the product.
+
+    `_signature` and `_source` rather than a run: both need a live browser and
+    a target, and what is being pinned here is that the wiring is present on
+    both paths, which is structural. The behaviour itself is checked in
+    `_worker_checks` and by running `make pipeline`.
+    """
+    import re
+
+    from app.routers import explore as explore_router
+
+    from . import pipeline
+
+    print("INTERLEAVE  both callers run the model beside the crawl")
+    ok = True
+
+    sig = _signature(pipeline.run)
+    ok &= check(
+        "pipeline.run takes a checkpoint",
+        "checkpoint" in sig,
+        f"{sig} -- without it the crawl inside it persists nothing until it "
+        "finishes, so its map cannot be watched and no worker can be fed",
+    )
+
+    body = _function_source(pipeline, "run")
+    ok &= check(
+        "and hands the crawl's checkpoint to the worker",
+        "BehaviourWorker" in body and "checkpoint=" in body,
+        "the worker is never fed, so the model still runs after the crawl",
+    )
+    # `(?<!_)` because `from_behaviour=` is already in this function and
+    # matched a bare substring test -- a check that passes before the code
+    # exists is not a check.
+    ok &= check(
+        "and hands what the worker built to the colony",
+        re.search(r"(?<!_)behaviour=", body) is not None,
+        "the colony would call synthesise and pay for the same model twice",
+    )
+    ok &= check(
+        "and closes the worker with the finished map",
+        ".close(" in body,
+        "close() sends the states left over below the batch threshold -- the "
+        "deepest ones the crawl reached",
+    )
+
+    # A crawl that raises must still stop the worker. Both callers run inside
+    # a long-lived uvicorn process, and `_run` blocks on `self._work.get()`
+    # forever -- so a worker whose `close` is skipped is a thread parked for
+    # the life of the server, one per failed run. `daemon=True` only means the
+    # process can still exit; it does not reclaim anything while it runs.
+    ok &= check(
+        "pipeline.run closes the worker even when the crawl raises",
+        "finally:" in body,
+        "a crawl that throws leaks a parked thread per run",
+    )
+
+    console = _source(explore_router, "crawling deterministically first")
+    ok &= check(
+        "the console's own crawl feeds a worker too",
+        "BehaviourWorker" in console,
+        "the console is the demo path; a feature only `make pipeline` has is "
+        "a feature the product does not have",
+    )
+    ok &= check(
+        "and hands the result to its colony",
+        "behaviour=" in console,
+        "orchestrator.run would synthesise from scratch and discard it",
+    )
+    ok &= check(
+        "and closes it even when the crawl raises",
+        "behaviour_worker.close" in console
+        and _function_source(explore_router, "watch") != ""
+        and console.count("finally:") >= 1,
+        "the console runs inside uvicorn: a leaked worker is a thread parked "
+        "for the life of the server",
+    )
+
+    # And the worker must tolerate being closed with nothing, which is what a
+    # failed crawl hands it.
+    from .behavior import BehaviourWorker
+
+    ok &= check(
+        "closing with no map is not an error",
+        BehaviourWorker(None).close(None) is not None,
+        "the failure path passes None because the crawl never returned a map",
+    )
+    return ok
+
+
+def _ceiling_checks() -> bool:
+    """A reply cut off at the ceiling must say so, and say what it cost.
+
+    Measured 2026-09-05. `sarvam-105b` was catalogued at `max_output=8192`
+    while Sarvam enables reasoning by default and charges reasoning tokens
+    against the same completion budget. The behaviour synthesis call came back
+    `finish_reason: length` with its `model` tool call severed mid-JSON,
+    `_arguments` yielded `{}`, and the console printed two lines from two
+    modules:
+
+        sarvam-105b: the reply hit the 8192-token ceiling and was cut off
+        no behavioural model returned; the map stands alone
+
+    Nothing joined them. The second sentence is what a model that *declined*
+    would produce, so the failure read as a modelling problem and was a config
+    one. `Turn.truncated` is the join, and these checks are what stop the two
+    from drifting apart again.
+
+    Offline: no key, no network, no quota. `_client` is a stub.
+    """
+    from .behavior import synthesise
+    from .llm import Tool, Transcript, Turn
+    from .llm.catalog import max_output_for
+    from .llm.openai_compat import OpenAICompat
+
+    class Response:
+        def __init__(self, payload):
+            self.status_code, self.text, self._payload = 200, "", payload
+
+        def json(self):
+            return self._payload
+
+    class Client:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def post(self, path, json):
+            return Response(self.payload)
+
+    def reply(finish_reason: str, arguments: str):
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "c1",
+                                "function": {
+                                    "name": "model",
+                                    "arguments": arguments,
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": finish_reason,
+                }
+            ]
+        }
+
+    def provider(model: str, payload):
+        fake = object.__new__(OpenAICompat)
+        fake.model, fake.max_tokens = model, max_output_for(model)
+        fake.name = "openrouter"
+        fake.notes = []
+        fake._notify = lambda level, message: fake.notes.append((level, message))
+        fake._client = Client(payload)
+        return fake
+
+    print("CEILING     a truncated reply names itself, and names what it lost")
+    ok = True
+
+    # 1. The catalogue moved, and it moved to the two real context windows.
+    #    A regression here is silent: the run still works, it just loses the
+    #    behavioural model on every call and blames the model for it.
+    ok &= check(
+        "sarvam-105b's ceiling clears the 8192 that severed the tool call",
+        max_output_for("sarvam-105b") == 32768,
+        f"got {max_output_for('sarvam-105b')}, expected 32768 (128k window)",
+    )
+    # Not raised, and the reason is measured rather than inferred: the API
+    # refuses anything above 8192 for this one ("exceeds the maximum output
+    # length of 8192 tokens ... For a larger output budget, use sarvam-105b").
+    # Its 32k context window does not predict that cap, so the number has to
+    # be pinned or the next person will raise it to match its sibling and get
+    # a 400 on every call instead of a truncation on some.
+    ok &= check(
+        "sarvam-105b-conversations stays at the 8192 its provider enforces",
+        max_output_for("sarvam-105b-conversations") == 8192,
+        f"got {max_output_for('sarvam-105b-conversations')}; the API 400s "
+        "above 8192 for this model, so raising it breaks every call",
+    )
+
+    # 2. `finish_reason: length` reaches the caller as a fact, not only a log
+    #    line. This is the seam the whole diagnosis hangs on.
+    cut = provider("sarvam-105b", reply("length", '{"summary": "half a sen'))
+    turn = cut.turn("sys", Transcript(prompt="p"), [])
+    ok &= check(
+        "a reply stopped at the ceiling comes back marked truncated",
+        turn.truncated is True,
+        "Turn.truncated was not set, so no caller can tell a severed reply "
+        "from a model that declined",
+    )
+    ok &= check(
+        "the severed tool call is what the caller actually receives",
+        bool(turn.calls) and turn.calls[0].arguments == {},
+        f"expected an empty-argument call, got {turn.calls!r}",
+    )
+    ok &= check(
+        "and the provider still says so out loud",
+        any("ceiling" in message for _, message in cut.notes),
+        f"notes were {cut.notes!r}",
+    )
+
+    whole = provider("sarvam-105b", reply("stop", '{"summary": "done"}'))
+    ok &= check(
+        "a reply the model finished is not marked truncated",
+        whole.turn("sys", Transcript(prompt="p"), []).truncated is False,
+        "every turn would report as cut off, which is the same blindness "
+        "pointing the other way",
+    )
+
+    # 3. The consequence names the cause. `synthesise` is the caller that lost
+    #    something, and until now it reported the loss without the reason.
+    world = _behaviour_world()
+
+    class Stub:
+        def __init__(self, truncated: bool, calls=()):
+            self.name, self.model = "stub", "sarvam-105b"
+            self._truncated, self._calls = truncated, calls
+
+        def turn(self, system, transcript, tools):
+            return Turn(text="", calls=self._calls, truncated=self._truncated)
+
+    said: list[tuple[str, str]] = []
+    synthesise(world, Stub(truncated=True), on_event=lambda l, m: said.append((l, m)))
+    warned = " ".join(m for l, m in said if l == "warn")
+    ok &= check(
+        "a run that lost its model to the ceiling is told the ceiling did it",
+        "cut off" in warned and "LLM_MAX_TOKENS" in warned,
+        f"said {warned!r} -- a person had to join two log lines by hand to "
+        "learn this, which is the bug",
+    )
+    ok &= check(
+        "and is told which model's ceiling to raise",
+        "sarvam-105b" in warned,
+        f"said {warned!r}; catalog.py has one entry per model and the "
+        "message has to say which line to open",
+    )
+
+    said.clear()
+    synthesise(world, Stub(truncated=False), on_event=lambda l, m: said.append((l, m)))
+    warned = " ".join(m for l, m in said if l == "warn")
+    ok &= check(
+        "a model that simply declined is not blamed on the ceiling",
+        "the map stands alone" in warned and "cut off" not in warned,
+        f"said {warned!r} -- reporting a modelling problem as a config one "
+        "sends the next person to the wrong file",
     )
 
     return ok
@@ -4380,6 +5566,22 @@ def _claim_checks() -> bool:
     ok &= check(
         "no claims means no model call",
         attribute((), plan, Chatty()) == {},
+    )
+
+    # Attribution runs after `generator.scenarios` has compiled the plan and
+    # before `explore.py` writes a TestCase row, so a provider that raises here
+    # discards a suite that was already built -- the same shape as the critic's
+    # 402 on 2026-09-05, one stage further down.
+    try:
+        unattributed = attribute(claims, plan, BrokeRanker())
+    except Exception as exc:
+        unattributed, broke_attr = None, f"{type(exc).__name__}: {exc}"
+    else:
+        broke_attr = ""
+    ok &= check(
+        "a provider that fails costs the attribution, not the suite",
+        unattributed == {claims[0]: ()},
+        broke_attr or "the run did not survive the provider failure",
     )
 
     # An unmatched claim is the honest outcome, and it has to be visible. A

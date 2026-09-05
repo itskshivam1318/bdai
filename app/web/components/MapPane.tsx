@@ -112,7 +112,13 @@ export default function MapPane({
         id: `${edge.from_key}-${index}`,
         source: edge.from_key,
         target: edge.to_key,
-        label: edge.action,
+        // The observed name, and under it the name a kept suite still uses.
+        // Two claims about one edge -- `action` is what the crawl saw and is
+        // never overwritten, so an edge a replay healed onto reads as the
+        // rename it is rather than as a map that quietly changed.
+        label: edge.healed_from
+          ? `${edge.action}\n⤳ suite: ${edge.healed_from}`
+          : edge.action,
         type: "smoothstep",
         // A non-GET fired: heavier line. This is the distinction runner.py
         // classifies on, so it belongs on the picture.
@@ -124,7 +130,11 @@ export default function MapPane({
             ? { stroke: antColour(edge.found_by, ants) as string }
             : {}),
         },
-        labelStyle: { fontSize: 10 },
+        labelStyle: {
+          fontSize: 10,
+          // The label is two lines when a suite disagrees about the name.
+          ...(edge.healed_from ? { whiteSpace: "pre" as const } : {}),
+        },
       })),
     };
   }, [payload, runId]);

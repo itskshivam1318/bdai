@@ -369,7 +369,25 @@ def prioritise(
 
     system = instructions or load_instructions("critic")
     transcript = Transcript(prompt=brief(found, world.summary(), intent))
-    turn = provider.turn(system, transcript, [PRIORITISE])
+    try:
+        turn = provider.turn(system, transcript, [PRIORITISE])
+    except Exception as exc:
+        # Same rule as `behavior.py`'s synthesis guard and `context.py`'s box:
+        # the model's only job in this function is ordering, so losing it costs
+        # the order and the risk prose and nothing else. It must not cost the
+        # candidates -- which are computed, not asked for -- and above all it
+        # must not cost the suite, because `generator.scenarios` is
+        # deterministic and is compiled *after* this call returns.
+        #
+        # Runs 31 and 33 of 2026-09-05 are the same 402 on the same key, and
+        # they differ only here: 31 had candidates, made this call, and died
+        # reporting 0 tests; 33 had none, never made it, and reported 12.
+        emit(
+            "warn",
+            f"critic did not rank ({type(exc).__name__}: {exc}); "
+            "keeping the computed order",
+        )
+        return found
 
     # Written before the answer is inspected, so a ranking that gets rejected
     # for citing gaps that were never candidates still leaves the evidence of

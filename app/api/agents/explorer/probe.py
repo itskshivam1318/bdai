@@ -379,6 +379,99 @@ def frontier_noise(page) -> bool:
     return passed
 
 
+# A MUI sidebar, as recorded on d2928k9vety1kj.cloudfront.net after login: an
+# icon and a <p> inside each link, nothing else. Playwright's AI-mode snapshot
+# leaves the accessible name off a node whose name is only its own content, so
+# every one of these was recorded as a bare `link` -- and `generator.writable`
+# refuses to export a path through an unnamed control. The whole application
+# behind the login wall produced zero tests.
+_CONTENT_NAMED = (
+    '<nav><a href="/agentflows"><svg viewBox="0 0 1 1"></svg><p>Agentflows</p></a>'
+    '<a href="/executions"><svg viewBox="0 0 1 1"></svg><p>Executions</p></a>'
+    "<button type=button><p>DW</p><p>Default Workspace</p></button>"
+    '<button type=button><svg viewBox="0 0 1 1"></svg></button></nav>'
+    "<main><form><label>Password <input type=password name=p></label>"
+    "<button type=button aria-label='Show password'>eye</button>"
+    "<button>Sign in</button></form></main>"
+)
+
+
+def content_names(page) -> bool:
+    """Section 0c: is a control named by what it says, when the snapshot is not?
+
+    Each descriptor here must also *resolve*: a derived name is only worth
+    recording if `locate` finds exactly the element it came from.
+    """
+    from agents.explorer import forms
+
+    observer = Observer(page)
+    observer.start_window()
+    page.set_content(_CONTENT_NAMED)
+    observation = observer.observe(settle_ms=50)
+    actions = set(forms.available_actions(page, observation))
+
+    def resolves(descriptor: str) -> bool:
+        return forms.locate(page, descriptor).count() == 1
+
+    cases = (
+        ("a link named only by its text is named", "link:Agentflows" in actions),
+        ("and its sibling is a different action", "link:Executions" in actions),
+        ("the derived name resolves to that one element", resolves("link:Executions")),
+        ("a button named by two text runs joins them", "button:DW Default Workspace" in actions),
+        ("and that name resolves too", resolves("button:DW Default Workspace")),
+        ("an icon-only button stays unnamed, honestly", "button" in actions),
+        ("the password eye is a click, not a submit", "button:Show password" in actions
+         and not any(a.endswith(":button:Show password") for a in actions)),
+        ("the real submit still gets its partitions", "submit[valid]:button:Sign in" in actions),
+    )
+
+    print("NAMES       what a control is called when the snapshot does not say")
+    passed = True
+    for label, ok in cases:
+        passed &= ok
+        print(f"  {'PASS' if ok else 'FAIL'}  {label}")
+    if not passed:
+        print(f"        got: {sorted(actions)}")
+    print()
+    return passed
+
+
+# A SPA shell, as served by d2928k9vety1kj.cloudfront.net on a cold browser:
+# "Loading..." for the better part of a second, then the login form. Two
+# identical reads of the shell 400ms apart satisfied `observe`'s stability
+# rule, the entry state was recorded with zero actions, and the crawl ended
+# with "frontier empty" three seconds after it began.
+_LATE_MOUNT = (
+    '<div id=root><p>Loading...</p></div>'
+    '<script>setTimeout(() => { document.getElementById("root").innerHTML ='
+    ' "<a href=/x>Go</a><button>Start</button>"; }, 900)</script>'
+)
+
+
+def late_mount(page) -> bool:
+    """Section 0d: does a page get to finish mounting before it is observed?"""
+    observer = Observer(page)
+    observer.start_window()
+    page.set_content(_LATE_MOUNT)
+    observation = observer.observe()
+    actions = {element.descriptor for element in observation.interactive}
+
+    cases = (
+        ("a shell that mounts late is observed after it mounts", "button:Start" in actions),
+        ("and every control it mounted is there", "link:Go" in actions),
+    )
+
+    print("MOUNT       a page is observed once there is something to act on")
+    passed = True
+    for label, ok in cases:
+        passed &= ok
+        print(f"  {'PASS' if ok else 'FAIL'}  {label}")
+    if not passed:
+        print(f"        got: {sorted(actions)}")
+    print()
+    return passed
+
+
 def projection_grid(page) -> bool:
     """Section 0: does `normalize` keep the right differences? Needs no server.
 
@@ -414,6 +507,18 @@ def projection_grid(page) -> bool:
 # Google` out of unrelated page chrome (practicesoftwaretesting.com, where ten
 # of eleven buttons had nothing to do with the login).
 SCOPE_CASES = (
+    (
+        "a type=button inside the form is a click, not its submit",
+        "<main><form><label>Password <input type=password name=p></label>"
+        "<button type=button aria-label='Show password'>eye</button>"
+        "<button>Sign in</button></form></main>",
+        "Show password",
+        "none",
+        # d2928k9vety1kj.cloudfront.net/sso/login exactly: the password eye is
+        # `<button type=button>` in the form. Treating it as a submit gave it
+        # empty/valid/invalid variants and 15 login states out of 29 -- 65 of
+        # 94 transitions spent before the crawl saw the application.
+    ),
     (
         "a real <form> is still authoritative",
         "<main><form><label>Email <input name=e></label>"
@@ -561,6 +666,8 @@ def main(base_url: str) -> int:
         # --- 0. the projection, in isolation ----------------------------------
         projection_ok = projection_grid(page)
         projection_ok &= frontier_noise(page)
+        projection_ok &= content_names(page)
+        projection_ok &= late_mount(page)
         projection_ok &= form_scope(page)
         projection_ok &= form_fill(page)
 

@@ -232,6 +232,17 @@ export default function StateDetail({
                     />
                     <span className="break-all font-mono text-ink">{t.action}</span>
                   </div>
+                  {/* The kept suite's name for this same edge. Shown under the
+                      observed one rather than replacing it: the app calls it
+                      one thing, the saved tests call it another, and which is
+                      which is the whole content of a heal. */}
+                  {t.healed_from && (
+                    <div className="ml-3 text-fault/80">
+                      ⤳ your suite calls this{" "}
+                      <span className="break-all font-mono">{t.healed_from}</span>
+                      {t.healed_rung && ` · healed by ${t.healed_rung}`}
+                    </div>
+                  )}
                   <div className="ml-3 text-muted">
                     →{" "}
                     {/* An edge back to where it started is the most informative

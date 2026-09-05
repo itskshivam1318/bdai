@@ -364,7 +364,8 @@ class OpenAICompat:
         # Warned rather than raised so one long `finish` cannot kill a colony
         # run that is otherwise complete; the console shows it beside the
         # retry warnings.
-        if choice.get("finish_reason") == "length":
+        truncated = choice.get("finish_reason") == "length"
+        if truncated:
             self._notify(
                 "warn",
                 f"{self.model}: the reply hit the {self.max_tokens}-token "
@@ -385,6 +386,12 @@ class OpenAICompat:
             text=(message.get("content") or "").strip(),
             calls=calls,
             opaque=message,
+            # The warning above says a reply was cut off. It cannot say what
+            # that cost, because the loss lands in the caller: a truncated
+            # `tool_calls` payload arrives here as `arguments={}` and reaches
+            # `behavior.synthesise` indistinguishable from a model that chose
+            # not to call the tool. Carrying the fact lets the caller name it.
+            truncated=truncated,
         )
 
 

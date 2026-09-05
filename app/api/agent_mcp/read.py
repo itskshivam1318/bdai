@@ -201,7 +201,7 @@ def impact_of(run_id: int, names: list[str]) -> dict:
             if _matches(name, names) or _matches(role, names):
                 acts.append({"step": index, "intent": step.intent,
                              "why": f"acts on {step.action}"})
-            for field_role, field_name in step.fields:
+            for field_role, field_name, _ in step.fields:
                 if _matches(field_name, names):
                     acts.append({"step": index, "intent": step.intent,
                                  "why": f"fills {field_role}:{field_name}"})

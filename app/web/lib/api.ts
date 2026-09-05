@@ -263,6 +263,17 @@ export type MapTransition = {
   observation_id: number | null;
   /** The ant that took this action. Null for a run with no colony. */
   found_by: string | null;
+  /**
+   * What a kept suite still calls this edge, when a replay healed a saved step
+   * onto it — and the ladder rung that did the resolving.
+   *
+   * `action` is what this run's crawl observed and is never overwritten, so
+   * the pair reads as two claims about one edge rather than as a correction:
+   * "the app calls this `button:Log in`; your v001 tests call it
+   * `button:Sign in`". Null on every edge no replay has touched.
+   */
+  healed_from: string | null;
+  healed_rung: string | null;
 };
 
 export type WorldMapPayload = {

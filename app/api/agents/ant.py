@@ -272,9 +272,10 @@ def explore(
                 continue
 
             observer.start_window()
-            if not forms.perform(
+            performed = forms.perform(
                 page, action, here, credentials, synthesizer, here_key
-            ):
+            )
+            if not performed:
                 # Recorded on the map, in the crawler's own words, not just in
                 # this ant's prose. `brief()` reads `skipped`, so without this
                 # the orchestrator saw the action as still untried and sent the
@@ -312,7 +313,7 @@ def explore(
             report.actions_taken += 1
 
             from_key = here_key
-            to_key = world.connect(from_key, action, after).to_key
+            to_key = world.connect(from_key, action, after, performed.typed).to_key
             if shot is not None and world.states[to_key].screenshot is None:
                 world.attach_screenshot(to_key, shot(to_key))
             report.trail.append(f"{action}  -> {to_key[:8]}")

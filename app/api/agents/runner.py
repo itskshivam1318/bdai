@@ -356,7 +356,9 @@ def ladder(
         mode, role, name = _parts(action)
         if mode != want_mode or role != want_role:
             continue
-        if want_mode is not None and sorted(fields_now) != sorted(step.fields):
+        if want_mode is not None and sorted(fields_now) != sorted(
+            (role, name) for role, name, _ in step.fields
+        ):
             # A form submit whose form no longer has the same fields is not the
             # same step. Healing onto it would silently retarget the test.
             #
@@ -364,6 +366,14 @@ def ladder(
             # renders Password before Email for exactly this reason, and an
             # ordered comparison here refused to heal a form that had not
             # changed in any way a user could perceive.
+            #
+            # And on `(role, name)` only, because that is the question: does
+            # this page still offer the same fields? `step.fields` also carries
+            # the value that was typed into each one (see `Step.fields`), and
+            # `fields_now` is read off a live page that has been typed into by
+            # nobody -- so comparing the triples compares a recording against a
+            # blank form and never matches. Measured: every form submit
+            # escalated as `unresolved` the moment the value was added.
             continue
         candidates.append((action, name))
 
