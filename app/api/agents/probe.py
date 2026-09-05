@@ -2359,6 +2359,7 @@ def main() -> int:
     print()
     ok &= _versioning_checks()
     ok &= _rescue_checks()
+    ok &= _ladder_checks()
     ok &= _reverify_checks()
 
     print()
@@ -2688,6 +2689,222 @@ def _rescue_checks() -> bool:
     ok &= check(
         "a rescue that found nothing changes nothing",
         repair is None and patched.steps[0].action == "button:Sign in",
+    )
+    return ok
+
+
+def _ladder_checks() -> bool:
+    """The bottom rung of the resolution ladder: a ranking, and its adjudicator.
+
+    `runner.resolve` walks exact -> structural -> similarity, and the file's own
+    docstring named the seam this closes: a model belongs *above* `escalate`,
+    not above `structural`, because every rung over it already produces evidence
+    and a model asked earlier would be overruling a deterministic answer.
+
+    So there are two properties here and they pull in opposite directions.
+
+    **It must speak when nothing else can.** Several structural candidates, none
+    similar enough to the recorded name to clear the margin, is the coin-flip
+    `resolve` refuses -- and refusing it costs a whole scenario. Choosing among
+    controls that all exist is exactly what the research says judges are good at.
+
+    **It must not speak anywhere else, and must never be believed on its own.**
+    It answers by index into a list it was given, so an invented control cannot
+    survive the return. It refuses outright below two candidates, so it cannot
+    reach past the rung above it. And a repair it proposes is still replayed:
+    `runner.run` classifies the step afterwards exactly as before, which is the
+    healing invariant -- healing cannot override a failed verification.
+    """
+    from .llm import ToolCall, Turn
+    from .runner import Step, ranked
+    from .generator import Expectation
+
+    print("LADDER      the ranked rung chooses, and cannot invent")
+    ok = True
+
+    step = Step(
+        intent="click the primary action",
+        action="button:Continue",
+        from_key="a" * 16,
+        fields=(),
+        expect=Expectation(moved=True, mutating=False, added=(), removed=(),
+                           to_key="b" * 16),
+    )
+    # Two controls that both exist, both of the right kind, and neither of which
+    # reads like "Continue". This is the input `resolve` currently escalates on.
+    tied = (("button:Proceed", "Proceed"), ("button:Next step", "Next step"))
+
+    class Picks:
+        name, model = "scripted:picks", "none"
+
+        def __init__(self, index):
+            self.index = index
+            self.asked = 0
+
+        def turn(self, system, transcript, tool_defs):
+            self.asked += 1
+            return Turn(
+                text="",
+                calls=(ToolCall(id="1", name="choose", arguments={
+                    "id": self.index,
+                    "why": "it carries the same position in the flow",
+                }),),
+            )
+
+    class Silent:
+        name, model = "scripted:silent", "none"
+
+        def turn(self, system, transcript, tool_defs):
+            return Turn(text="I cannot tell these two apart.", calls=())
+
+    class Broken:
+        name, model = "scripted:broken", "none"
+
+        def turn(self, system, transcript, tool_defs):
+            raise RuntimeError("402 insufficient credits")
+
+    class Exploding:
+        name, model = "scripted:exploding", "none"
+
+        def turn(self, system, transcript, tool_defs):
+            raise AssertionError("the model was consulted and must not have been")
+
+    # --- where the rung sits in the ladder --------------------------------
+    #
+    # The ordering property, checked by consulting a provider that raises if it
+    # is ever reached. `resolve`'s docstring reserved this position -- above
+    # `escalate`, below `structural` -- and an off-by-one rung here is not a
+    # worse repair, it is a model overruling an observable fact.
+    from .runner import ladder
+
+    fields = (("textbox", "Email"), ("textbox", "Password"))
+    exact_step = Step(intent="click Continue", action="button:Continue",
+                      from_key="a" * 16, fields=(), expect=step.expect)
+
+    verbatim = ladder(exact_step, ("button:Continue", "button:Proceed"), (),
+                      Exploding())
+    ok &= check(
+        "the recorded control still being there is not a question for a model",
+        verbatim.rung == "exact",
+        f"{verbatim.rung}: {verbatim.detail}",
+    )
+    only_one = ladder(exact_step, ("button:Proceed",), (), Exploding())
+    ok &= check(
+        "the only control of its kind is a structural answer, not a ranked one",
+        only_one.rung == "structural" and only_one.action == "button:Proceed",
+        f"{only_one.rung}: {only_one.detail}",
+    )
+    by_name = ladder(exact_step, ("button:Continue now", "button:Delete"), (),
+                     Exploding())
+    ok &= check(
+        "a name that plainly matches is a similarity answer, not a ranked one",
+        by_name.rung == "similarity" and by_name.action == "button:Continue now",
+        f"{by_name.rung}: {by_name.detail}",
+    )
+    nothing = ladder(
+        Step(intent="pay", action="submit[valid]:button:Place order",
+             from_key="a" * 16, fields=fields, expect=step.expect),
+        ("button:Continue",), (), Exploding(),
+    )
+    ok &= check(
+        "a step nothing on the page can play is rescue's problem, not a tie",
+        nothing.action is None,
+        f"{nothing.rung}: {nothing.detail}",
+    )
+
+    # --- and the tie that used to be the end of the road ------------------
+    tie = ("button:Proceed", "button:Next step")
+    ok &= check(
+        "the tie the ladder refuses is what reaches the model",
+        ladder(exact_step, tie, (), Picks(0)).action == "button:Proceed",
+        ladder(exact_step, tie, (), Picks(0)).detail,
+    )
+    ok &= check(
+        "and with no provider that tie still escalates, as it always did",
+        ladder(exact_step, tie, (), None).action is None,
+    )
+
+    # --- with no provider, nothing changes -------------------------------
+    ok &= check(
+        "no provider is the behaviour that shipped: the tie still escalates",
+        ranked(step, tied, None).action is None,
+    )
+
+    # --- the rung cannot reach past the one above it ----------------------
+    ok &= check(
+        "one candidate is the structural rung's answer, and is not asked about",
+        ranked(step, tied[:1], Exploding()).action is None,
+    )
+    ok &= check(
+        "no candidates is rescue's problem, and is not asked about",
+        ranked(step, (), Exploding()).action is None,
+    )
+
+    # --- it answers by index into the list it was given --------------------
+    chose = ranked(step, tied, Picks(1))
+    ok &= check(
+        "a tie the ladder refuses is decided by index into the candidates",
+        chose.action == "button:Next step" and chose.rung == "ranked",
+        f"got {chose.action!r} via {chose.rung}: {chose.detail}",
+    )
+    ok &= check(
+        "the repair carries the reason it was chosen, not just the choice",
+        "same position in the flow" in chose.detail,
+        chose.detail,
+    )
+
+    # --- and cannot answer with anything else ------------------------------
+    invented = ranked(step, tied, Picks(7))
+    ok &= check(
+        "an index that names no candidate is dropped, not resolved",
+        invented.action is None and invented.rung == "unresolved",
+        f"the model invented {invented.action!r}",
+    )
+    ok &= check(
+        "a model that declines to choose leaves the escalation standing",
+        ranked(step, tied, Silent()).action is None,
+    )
+
+    # --- the rung has to actually be reachable from a run ------------------
+    #
+    # A rung nobody threads a provider to is a rung that never fires, and that
+    # failure is silent: every check above still passes and every replay still
+    # escalates exactly as it did before. This asserts the wiring, and only the
+    # wiring -- the live replays in section 4 are what show the ladder still
+    # heals and still refuses.
+    import inspect
+
+    from . import regression, runner as runner_mod
+
+    ok &= check(
+        "a replay can be given the provider its ladder would rank with",
+        "provider" in inspect.signature(runner_mod.run).parameters,
+    )
+    # Exactly one forward, and which one it is matters. The first replay is
+    # where a repair is *proposed* and is allowed to rank; the re-verification
+    # below it is where that repair is *confirmed*, and handing a provider to a
+    # confirmation would let a bad repair be rescued by a second guess during
+    # its own check -- the definition of shopping for a verdict.
+    body = inspect.getsource(regression.verify)
+    proposal, _, confirmation = body.partition("if reverify:")
+    proposing = proposal.split("result = runner.run(")[1].split(")")[0]
+    ok &= check(
+        "the replay that proposes a repair is given the provider",
+        "provider=provider" in proposing,
+        proposing,
+    )
+    ok &= check(
+        "the replay that confirms one is not: a check may not repair itself",
+        "provider" not in confirmation.split("report.reverified")[0],
+        confirmation.split("report.reverified")[0][-200:],
+    )
+
+    # --- losing the model must never cost the escalation -------------------
+    refused = ranked(step, tied, Broken())
+    ok &= check(
+        "a provider that raises escalates and names why it could not rank",
+        refused.action is None and "402" in refused.detail,
+        refused.detail,
     )
     return ok
 

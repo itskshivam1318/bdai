@@ -88,10 +88,13 @@ export const AGENTS: Agent[] = [
     roles: ["healer"],
     surfaces: ["run", "heal", "defect"],
     deterministic:
-      "The resolution ladder is deterministic: re-observe, compare state keys, " +
-      "and the failure classifies itself. A model is asked one question only — " +
-      "when nothing on the page plays the recorded part at all, rescue.py " +
-      "explores the region and asks the fresh map what replaced it.",
+      "Three of the four resolution rungs are deterministic: re-observe, " +
+      "compare state keys, and the failure classifies itself. A model is asked " +
+      "only where nothing observable is left — to pick between controls that " +
+      "all exist when none matches by name, and, when nothing on the page " +
+      "plays the recorded part at all, to explore the region and ask the fresh " +
+      "map what replaced it. Neither can invent a control, and both are " +
+      "replayed before they are believed.",
   },
   {
     key: "meta",

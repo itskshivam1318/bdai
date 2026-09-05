@@ -792,7 +792,8 @@ def verify(
 
     for scenario in originals:
         result = runner.run(
-            page, scenario, target_url=url, credentials=credentials, on_event=on_event
+            page, scenario, target_url=url, credentials=credentials,
+            on_event=on_event, provider=provider, run_id=run_id,
         )
         report.results.append(result)
 
