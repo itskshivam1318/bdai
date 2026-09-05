@@ -67,6 +67,24 @@ def _slug(url: str) -> str:
     ).strip("-") or "run"
 
 
+def saved_maps(url: str) -> tuple[Path, ...]:
+    """Every map `autosave` has written for this target, oldest last.
+
+    Lives here rather than in `snapshot.py` because the filename convention is
+    `autosave`'s -- a reader of these files has to agree with their writer
+    about what identifies a target, and one function away from the other is how
+    that stops being true.
+
+    The caller that wants "the map before this run" must ask **before**
+    crawling: `crawl` autosaves its own map on the way out, so by the time a
+    run is finished the newest file for this target is its own.
+    """
+    try:
+        return tuple(sorted(RUNS.glob(f"*-{_slug(url)}.json")))
+    except Exception:
+        return ()
+
+
 def autosave(world, url: str, **meta):
     """Write this run beside the others. Never raises -- losing the file must
     not lose the run that produced it."""

@@ -2475,6 +2475,31 @@ def _planner_checks() -> bool:
         "lets a label and its steps disagree after a heal",
     )
 
+    # The `only` filter: incremental generation stands entirely on it, and it
+    # has to hold for both halves of the planner. A believed flow that slipped
+    # past it would write a test for behaviour that is not new.
+    one_edge = {(a, "submit[valid]:button:Sign in")}
+    scoped = plan(world, believed, source="behaviour", limit=8, only=one_edge)
+    ok &= check(
+        "a plan scoped to one edge compiles only scenarios ending on it",
+        all(
+            (s.terminal.from_key, s.terminal.action) in one_edge
+            for s in scoped.scenarios
+        ),
+        f"got {[(s.terminal.from_key[:4], s.terminal.action) for s in scoped.scenarios]}",
+    )
+    ok &= check(
+        "an empty scope compiles nothing at all",
+        len(plan(world, believed, source="behaviour", limit=8, only=set())) == 0,
+        "a run that found no new edge must add no test; an empty filter that "
+        "fell through to the whole map would append the suite to itself",
+    )
+    ok &= check(
+        "and no scope is still the whole map",
+        len(plan(world, believed, source="behaviour", limit=8, only=None)) == len(rich),
+        "every caller from before incremental generation passes None",
+    )
+
     # No provider at all. This is the whole no-key path, and it must say so.
     silent = plan(world, None, source="behaviour", limit=8)
     ok &= check(
@@ -2508,6 +2533,58 @@ def _planner_checks() -> bool:
         "the comparison is computed from the two plans, not asserted",
         "scenarios" in compare(rich, plain) and "nodes covered" in compare(rich, plain),
     )
+
+    # --- the redundancy guard ------------------------------------------------
+    #
+    # `regression.unseen` is what stops the kept suite growing on every run.
+    # Measured before it existed: a re-crawl of the SUT reports 32 added edges
+    # against an application nobody touched, because `state_key` folds in
+    # accessible names and the crawl reaches the drift variants in a different
+    # order each time. Keyed on the state, those 32 would have appended 32
+    # duplicate tests; keyed on the action sequence, they append none.
+    import tempfile
+    from dataclasses import replace
+
+    from . import regression
+
+    with tempfile.TemporaryDirectory() as tmp:
+        saved = plan(world, believed, source="map", limit=8).scenarios
+        regression.emit(saved, tmp, because="probe baseline", target_url="http://sut/")
+
+        ok &= check(
+            "a candidate the saved suite already walks is not added again",
+            regression.unseen(saved, tmp) == (),
+            f"{len(regression.unseen(saved, tmp))} of {len(saved)} came back as new",
+        )
+
+        moved = tuple(
+            replace(s, name=f"{s.name} (renamed)") for s in saved
+        )
+        ok &= check(
+            "and renaming it does not make it new -- the actions are matched",
+            regression.unseen(moved, tmp) == (),
+            "matched on the name, a healed suite would re-add everything the "
+            "Healer had just renamed",
+        )
+
+        fresh = plan(world, believed, source="behaviour", limit=8).scenarios
+        genuinely_new = tuple(
+            s for s in fresh
+            if tuple(step.action for step in s.steps)
+            not in {tuple(step.action for step in k.steps) for k in saved}
+        )
+        ok &= check(
+            "a path the suite does not walk is added",
+            len(regression.unseen(fresh, tmp)) == len(genuinely_new),
+            "the guard must not be so strict it can never grow; a new flow is "
+            "the one change to a kept suite that cannot hide a regression",
+        )
+        ok &= check(
+            "extending an empty set of additions writes no version",
+            regression.extend(tmp, (), because="nothing") is None,
+            "a run that found nothing new must leave no version behind",
+        )
+
     return ok
 
 
