@@ -275,6 +275,11 @@ def _explore(
             db.commit()
 
         run = db.get(Run, run_id)
+        # Captured now, beside the run it comes from: the kept suite is scoped
+        # to the session (see `regression.directory_for`), and by the time the
+        # suite is written this function is deep inside a browser context where
+        # re-reading the row would be a query in the middle of a crawl.
+        session_id = run.session_id if run else None
 
         traces = start_tracing()
         if traces:
@@ -559,6 +564,19 @@ def _explore(
                 # class of output `critic.py` exists to make impossible. The two
                 # are kept apart rather than merged: one is evidence, the other
                 # is an observation, and only one of them can be looked up.
+                # Announced before the call, for the reason the context box
+                # above is: measured on run 32, the console sat silent for 49.6
+                # seconds between "plan: N flows" and the critic's first line,
+                # and a run that says nothing for a minute is indistinguishable
+                # from one that has died. The candidates are computed, so the
+                # count is known before the model is asked anything.
+                pending = len(critic.candidates(result.world))
+                emit(
+                    "info",
+                    f"ranking {pending} coverage gap(s)"
+                    + (" with the model" if provider else " (computed order, no model)"),
+                    surface="coverage",
+                )
                 ranked = critic.prioritise(
                     result.world,
                     provider,
@@ -592,6 +610,12 @@ def _explore(
                 )
 
                 # --- suite -------------------------------------------
+                emit(
+                    "info",
+                    f"compiling scenarios from {len(result.world.states)} "
+                    "recorded state(s)",
+                    surface="suite",
+                )
                 plan = scenarios(result.world)
 
                 # The claims the user typed, matched against tests that already
@@ -606,6 +630,13 @@ def _explore(
                 considered = (
                     scenarios(result.world, limit=40) if context.claims else plan
                 )
+                if context.claims and provider:
+                    emit(
+                        "info",
+                        f"matching {len(context.claims)} claim(s) against "
+                        f"{len(considered)} scenario(s)",
+                        surface="coverage",
+                    )
                 matched = attribute(
                     context.claims,
                     considered,
@@ -764,6 +795,13 @@ def _explore(
                         outcomes=tuple(r.verdict for r in results[: len(plan)]),
                         credentials=credentials,
                         source="map",
+                        # This session's suite, not this URL's. Without the
+                        # scope a second session on the same app replays the
+                        # first one's baseline and reports tests it never
+                        # compiled. See `regression.directory_for`.
+                        root=regression.directory_for(
+                            target_url, session_id=session_id
+                        ),
                         # So a control the ladder cannot resolve is looked for
                         # by ants at the region that lost it, rather than only
                         # by a breadth-first crawl of the same screen.
@@ -771,6 +809,10 @@ def _explore(
                         on_event=lambda level, message: emit(
                             level, message, surface="suite"
                         ),
+                        # The Healer's rescue wave is model-backed, and without
+                        # this its transcripts land in `transcripts/adhoc/`,
+                        # which `GET /runs/{id}/transcripts` does not list.
+                        run_id=run_id,
                     )
                 except Exception as exc:
                     # A suite that could not be written must not cost this run

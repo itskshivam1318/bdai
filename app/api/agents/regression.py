@@ -83,9 +83,33 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def directory_for(target_url: str, root: Path | None = None) -> Path:
-    """One suite per target, named after the target a reader would recognise."""
-    return (root or SUITES) / _slug(target_url.split("://", 1)[-1])
+def directory_for(
+    target_url: str, root: Path | None = None, session_id: int | None = None
+) -> Path:
+    """One suite per target -- and per session, wherever there is one.
+
+    **A session is the unit of a suite's history, not a URL.** Keyed on the
+    target alone, a second session pointed at the same app opened on the first
+    session's tests: `keep` asks the filesystem whether a suite exists, finds
+    one, and replays it instead of recording. Everything downstream then reads
+    as drift -- the new session's console shows scenarios it never compiled,
+    healed against a baseline someone else recorded, sometimes with a context
+    box that says something different. Two people testing the same staging URL
+    is the normal case, not an edge one.
+
+    Within a session the old behaviour is exactly what is wanted: run twice and
+    the second run replays the first one's suite, heals it, and emits v002. That
+    is the drift story, and it is why this scopes rather than disables.
+
+    `session_id=None` keeps the target-only path, which is what every CLI entry
+    point (`make suite`, `make pipeline`, `rescue.py`) has and should have --
+    there is no session at a command line, and one suite per target is the right
+    answer there.
+    """
+    slug = _slug(target_url.split("://", 1)[-1])
+    if session_id is not None:
+        slug = f"{slug}-s{session_id}"
+    return (root or SUITES) / slug
 
 
 # ---------------------------------------------------------------- fingerprint
@@ -712,6 +736,7 @@ def verify(
     reverify: bool = True,
     rescue: bool = True,
     provider=None,
+    run_id: int | None = None,
 ) -> Report:
     """Replay the saved suite, and write back what healed.
 
@@ -784,6 +809,11 @@ def verify(
                     page, scenario, result,
                     target_url=url, credentials=credentials,
                     provider=provider, on_event=on_event,
+                    # So the wave it may send files its transcripts under this
+                    # run rather than under `adhoc/`. A console run is the only
+                    # caller that has an id; the CLI passes None and keeps the
+                    # old destination.
+                    run_id=run_id,
                 )
             except Exception as exc:
                 # An exploration that fell over must not cost the rest of the
@@ -945,6 +975,7 @@ def keep(
     export_too: bool = True,
     provider=None,
     on_event=None,
+    run_id: int | None = None,
 ) -> Kept:
     """Record this run's plan as the baseline, or replay the kept suite and heal.
 
@@ -1007,6 +1038,7 @@ def keep(
         # `rescue.look` degrades to the crawl, which answers the common case.
         provider=provider,
         on_event=on_event,
+        run_id=run_id,
     )
     version = report.emitted or existing
     if export_too and version is not None:

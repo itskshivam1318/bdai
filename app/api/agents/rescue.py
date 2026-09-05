@@ -164,6 +164,7 @@ def look(
     provider=None,
     budget: CrawlBudget | None = None,
     on_event=None,
+    run_id: int | None = None,
 ) -> tuple[WorldMap, str]:
     """Map the region around `url`. Deterministically, then with ants if we can.
 
@@ -198,6 +199,18 @@ def look(
             credentials=credentials,
             world=world,
             on_event=lambda level, message: say(level, f"rescue: {message}"),
+            # Without this the wave writes its transcripts to
+            # `artifacts/transcripts/adhoc/`, and the console lists only
+            # `run-<id>/` -- so the Healer's one model-backed step, the one that
+            # decides what replaced a lost control, was the single stage of the
+            # pipeline whose reasoning could not be read back. It ran, it was
+            # recorded, and it was filed where nothing looks.
+            run_id=run_id,
+            # Filed as the Healer, not as the colony: this wave belongs to a
+            # scenario that could not be replayed, and grouping it with the
+            # exploration would put the answer to "what did the Healer do"
+            # under the wrong agent.
+            filed_as="healer",
         )
         say("info", f"rescue: colony left {len(exploration.world.states)} state(s)")
         return exploration.world, "colony"
@@ -297,6 +310,7 @@ def attempt(
     provider=None,
     budget: CrawlBudget | None = None,
     on_event=None,
+    run_id: int | None = None,
 ) -> Rescue | None:
     """Recover one escalated scenario, or say why it could not be.
 
@@ -338,6 +352,7 @@ def attempt(
             "would now do here instead."
         ),
         credentials=credentials, provider=provider, budget=budget, on_event=on_event,
+        run_id=run_id,
     )
 
     # Where we are standing *now*, not where the suite thinks we are. The whole

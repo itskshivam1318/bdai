@@ -477,9 +477,15 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
         </button>
       </header>
 
-      {/* `relative` because the chat dock floats inside this box rather than
-          taking a column of it -- see ChatDock for why an overlay. */}
-      <div className="relative min-h-0 flex-1">
+      {/* The chat dock floats rather than taking a column of it -- see ChatDock
+          for why an overlay. It is anchored to the *map* column below and not
+          to this box, because anchored here its right edge is the window's:
+          22rem of chat window sat on top of the test panel's own footer, and
+          the two controls living there -- Agents and Log, the only way into
+          what the agents said -- could not be clicked at all. Playwright
+          reports it as "subtree intercepts pointer events"; a person reports
+          it as the transcripts not being in the UI. */}
+      <div className="min-h-0 flex-1">
         {/* One column when the rail is away, so the graph reflows into the
             width rather than staying crowded into the left two-thirds. */}
         <div
@@ -487,11 +493,25 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
             railOpen ? "grid-cols-[3fr_2fr]" : "grid-cols-1"
           }`}
         >
-          <div className="min-w-0">
+          <div className="relative min-w-0">
             <MapPane
               runId={shownRunId}
               selectedKeys={attachedKeys}
               onToggleSelect={toggleAttached}
+            />
+            <ChatDock
+              threads={threads}
+              focusedId={focusedId}
+              attachedByThread={attachedByThread}
+              runId={shownRunId}
+              onFocus={setFocusedId}
+              onPatch={patchThread}
+              onDelete={deleteThread}
+              onNew={() => void newThread()}
+              onDetach={detach}
+              onClearAttached={(id) =>
+                setAttachedByThread((current) => ({ ...current, [id]: [] }))
+              }
             />
           </div>
           {railOpen && (
@@ -505,20 +525,6 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
           )}
         </div>
 
-        <ChatDock
-          threads={threads}
-          focusedId={focusedId}
-          attachedByThread={attachedByThread}
-          runId={shownRunId}
-          onFocus={setFocusedId}
-          onPatch={patchThread}
-          onDelete={deleteThread}
-          onNew={() => void newThread()}
-          onDetach={detach}
-          onClearAttached={(id) =>
-            setAttachedByThread((current) => ({ ...current, [id]: [] }))
-          }
-        />
       </div>
 
       {/*

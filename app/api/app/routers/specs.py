@@ -113,7 +113,10 @@ def _pick(run_id: int, run: Run, db: Session) -> tuple[Path, tuple[regression.Ve
     showing run 4's files against run 3's verdicts, which is a lie about which
     tests produced which result.
     """
-    directory = regression.directory_for(run.target_url)
+    # Scoped to the run's session, and that is what the writer does too: two
+    # sessions on one URL keep two suites, so serving the target's suite would
+    # hand this run somebody else's tests.
+    directory = regression.directory_for(run.target_url, session_id=run.session_id)
     known = regression.versions(directory)
     labelled = db.exec(
         select(TestCase.suite_version)
@@ -225,7 +228,9 @@ def download_suite(
         archive.writestr("README.md", _readme(chosen, len(specs)))
         archive.writestr("playwright.config.ts", _CONFIG)
 
-    slug = regression.directory_for(run.target_url).name
+    slug = regression.directory_for(
+        run.target_url, session_id=run.session_id
+    ).name
     return Response(
         content=buffer.getvalue(),
         media_type="application/zip",

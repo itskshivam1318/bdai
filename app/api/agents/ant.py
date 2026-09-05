@@ -141,6 +141,7 @@ def explore(
     run_id: int | None = None,
     shot: Shot | None = None,
     synthesizer=None,
+    role: str = "ant",
 ) -> Report:
     """Run one ant to completion.
 
@@ -395,7 +396,11 @@ def explore(
             save_transcript(
                 transcript,
                 run_id=run_id,
-                role="ant",
+                # Not always "ant": the same code explores for the colony and
+                # for a rescue, and the console groups a run's transcripts by
+                # which agent produced them. Filed under one name, the Healer's
+                # only model-backed step reads as more of the Planner's work.
+                role=role,
                 system=instructions("ant"),
                 label=start_key[:8],
             )
