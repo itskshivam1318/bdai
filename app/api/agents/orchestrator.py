@@ -36,7 +36,7 @@ from . import tools
 from .ant import Report, explore, instructions
 from .explorer import forms
 from .explorer.forms import Credentials
-from .explorer.observer import Observer
+from .explorer.observer import Observer, goto
 from .explorer.crawler import Budget as CrawlBudget, autosave, crawl
 from .explorer.synth import Synthesizer
 from .explorer.worldmap import WorldMap
@@ -213,7 +213,18 @@ def run(
 
     observer = Observer(page)
     observer.start_window()
-    page.goto(entry_url)
+    # `goto` carries its own retry budget -- see `explorer.observer.goto` for
+    # why one timeout is not evidence the target is unreachable. If it still
+    # fails after that budget, there is no entry state to explore from, which
+    # is a fact about this run and not a reason to crash it.
+    if not goto(page, entry_url):
+        result.stopped = "error"
+        result.summary = (
+            f"could not reach {entry_url} after retrying -- the target may be "
+            "down or too slow to load, which is not a fact about its behaviour"
+        )
+        emit("error", result.summary)
+        return result
     entry_key = world.record(observer.observe())
     if shot is not None:
         world.attach_screenshot(entry_key, shot(entry_key))

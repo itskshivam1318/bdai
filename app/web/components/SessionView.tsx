@@ -230,12 +230,25 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
   );
 
   const newThread = useCallback(async () => {
+    // "New chat" is the same default title the server hands back for one
+    // nobody has sent a message in yet (see chat.py: `title == "New chat"` is
+    // its own check for "still empty"). Reusing that thread instead of
+    // minting another is what stops a click-happy "+ New chat" from filling
+    // the dock with windows that were never asked anything.
+    const unused = threads.find((t) => t.title === "New chat");
+    if (unused) {
+      if (!unused.open || unused.minimised) {
+        patchThread(unused.id, { open: true, minimised: false });
+      }
+      setFocusedId(unused.id);
+      return unused;
+    }
     const created = await api.createThread(sessionId).catch(() => null);
     if (!created) return null;
     setThreads((current) => [...current, created]);
     setFocusedId(created.id);
     return created;
-  }, [sessionId]);
+  }, [sessionId, threads, patchThread]);
 
   const deleteThread = useCallback((id: number) => {
     setThreads((current) => current.filter((t) => t.id !== id));

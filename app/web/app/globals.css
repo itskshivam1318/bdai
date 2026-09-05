@@ -83,3 +83,16 @@ body {
 .react-flow__pane {
   background: var(--hush);
 }
+
+/* xyflow ships its own light/dark palette for Controls, independent of this
+   app's tokens -- under prefers-color-scheme: dark its icons turn near-white,
+   invisible against this app's own dark surfaces. Pin to --ink/--paper so the
+   glyphs (+, -, the fit-view box, the lock) stay dark-on-light regardless of
+   OS theme, same as every other icon on the page. */
+.react-flow__controls-button {
+  background: var(--paper);
+  color: var(--ink);
+}
+.react-flow__controls-button:hover {
+  background: var(--hush);
+}

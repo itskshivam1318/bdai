@@ -51,7 +51,7 @@ from playwright.sync_api import Page
 
 from .explorer import forms
 from .explorer.forms import Credentials
-from .explorer.observer import Observation, Observer
+from .explorer.observer import Observation, Observer, goto
 from .explorer.statekey import explain, state_key
 from .generator import Scenario, Step
 
@@ -267,7 +267,18 @@ def run(
             on_event(level, message)
 
     observer.start_window()
-    page.goto(url)
+    # `goto` carries its own retry budget -- see `explorer.observer.goto`.
+    if not goto(page, url):
+        detail = (
+            f"{url} could not be reached at all after retrying, so no step "
+            "was attempted -- this is a fact about reaching the target, not "
+            "about whether the application behaved as recorded. A human has "
+            "to say what this run now means."
+        )
+        resolution = Resolution(action=None, rung="unresolved", detail=detail)
+        result.steps.append(StepResult(scenario.steps[0], ESCALATE, resolution, detail))
+        emit(f"could not replay {scenario.name!r}: {detail}", level="error")
+        return result
     here = observer.observe()
     emit(f"replaying {scenario.name!r} against {url}")
 

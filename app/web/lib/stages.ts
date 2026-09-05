@@ -13,26 +13,22 @@ export type Stage = {
   ordinal: string;
   /** True when every matching event should be listed, not just the latest. */
   accumulate?: boolean;
-  /** How many lines to keep on an accumulating card. Defaults to KEEP. */
-  keep?: number;
   /** What the card says while it is still empty. */
   waiting: string;
 };
 
 export const STAGES: Stage[] = [
   // Stage 0 is the colony walking the app, and it is the only one that reports
-  // while it is still happening. It accumulates like the rest, but three lines
-  // deep rather than ten: a wave rationale is a paragraph, and ten of them
-  // would bury the five cards underneath it. One was too few -- the last thing
-  // the colony says is where it wrote its transcript, which is not what the
-  // person watching wants the card to be showing.
+  // while it is still happening. A wave rationale is a paragraph, and the card
+  // used to cap itself to three lines to keep from burying the five cards
+  // underneath it -- now every card is a fixed-height box that scrolls
+  // (StageRail.tsx), so nothing here needs a count of its own.
   {
     surfaces: ["explore"],
     title: "Explore",
     ordinal: "0",
     waiting: "waiting for the colony",
     accumulate: true,
-    keep: 3,
   },
   { surfaces: ["plan"], title: "Plan", ordinal: "1", waiting: "named after the map is walked", accumulate: true },
   { surfaces: ["coverage"], title: "Coverage", ordinal: "2", waiting: "computed before generation", accumulate: true },

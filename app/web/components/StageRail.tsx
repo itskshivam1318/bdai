@@ -11,9 +11,6 @@ const LEVEL_TONE: Record<string, string> = {
   info: "text-muted",
 };
 
-/** How many lines an accumulating card shows before it starts eliding. */
-const KEEP = 10;
-
 const clock = (iso: string) => {
   const d = new Date(iso.endsWith("Z") ? iso : `${iso}Z`);
   return Number.isNaN(d.getTime()) ? "" : d.toLocaleTimeString([], { hour12: false });
@@ -152,11 +149,7 @@ export default function StageRail({
           const lines = condense(
             mine.filter((e) => e.surface && stage.surfaces.includes(e.surface)),
           );
-          const shown = stage.accumulate ? lines.slice(-(stage.keep ?? KEEP)) : lines.slice(-1);
-          // Only an accumulating card is claiming to show everything, so only
-          // it owes the reader a count of what it left out. On a latest-only
-          // card the earlier lines were never the point.
-          const elided = stage.accumulate ? lines.length - shown.length : 0;
+          const shown = stage.accumulate ? lines : lines.slice(-1);
           const live = running && i === reached;
           // A stage the run passed *through*. Emptiness is the disclosure here:
           // ticking a card that never said anything is how the old rail ended
@@ -193,14 +186,11 @@ export default function StageRail({
                   {stage.waiting}
                 </p>
               ) : (
-                <ul className="mt-2 space-y-1">
-                  {elided > 0 && (
-                    <li className="text-[11px] text-muted">+{elided} earlier</li>
-                  )}
+                <ul className="mt-2 max-h-48 space-y-1 overflow-y-auto pr-1">
                   {shown.map((event) => (
                     <li
                       key={event.id}
-                      className={`text-xs leading-snug ${
+                      className={`break-words text-xs leading-snug ${
                         LEVEL_TONE[event.level] ?? "text-muted"
                       }`}
                     >

@@ -77,6 +77,66 @@ _VALUE = re.compile(
 # Accessible name on a node line, e.g. `- button "Sign in" [...]`.
 _NAME = re.compile(r'^\s*-\s+[a-zA-Z][\w-]*\s+"(?P<name>(?:[^"\\]|\\.)*)"')
 
+# `- /url: <href>` -- the one place a hyperlink's destination appears. Its
+# "role" token is `/url`, which does not start with a letter, so `_VALUE`
+# never matches it and it reaches `normalize()` untouched by every projection
+# above. That is deliberate for the href itself (`decisions.md` 2026-09-04
+# 18:20: "a link pointing somewhere new *is* a different page") but not for a
+# session identifier a server stamps into it -- see `_strip_session_id`.
+_URL_LINE = re.compile(r"^(?P<head>\s*-\s+/url:\s*)(?P<url>.+)$")
+
+# A server-minted session id embedded in a URL, in either convention:
+#   path parameter   /admin.htm;jsessionid=1D058CE7A24E8B98B4893151D889D9A2
+#   query parameter  ?PHPSESSID=... or &sid=...
+_JSESSIONID = re.compile(r";jsessionid=[^;?#]*", re.IGNORECASE)
+_SESSION_PARAM_NAMES = frozenset(
+    {"jsessionid", "phpsessid", "sessionid", "session_id", "sid"}
+)
+
+
+def _strip_session_id(url: str) -> str:
+    """Drop a server-minted session id from a URL. Not identity.
+
+    Measured on ParaBank: the first load of a fresh session stamps every href
+    on the page with `;jsessionid=1D058CE7A24E8B98B4893151D889D9A2` -- a Java
+    servlet-container convention, a path parameter rather than a query one.
+    Once the browser's cookie is set, later loads of the *identical* page
+    drop it. `state_key` then never matches its own entry state again: every
+    ant sent there calls `navigate()`, reloads, observes a page whose links no
+    longer carry the id it was recorded with, and reports `stuck` before
+    taking a single action. Not this page's bug -- ordinary Java session
+    bookkeeping, the same class of noise as a renumbered `[ref=e9]`.
+
+    Query parameters are rebuilt rather than regexed in place, so removing the
+    first one does not leave a dangling `&` in front of the second.
+
+    **Known risk, taken deliberately.** `sid` is common enough as an
+    unrelated business parameter (a store id, a section id) that stripping it
+    is a real trade-off, not a free one -- named here because `sid` was the
+    one in `_SESSION_PARAM_NAMES` most likely to also mean something else.
+    Weighed against the alternative: a party who reads `sid` as identity looks
+    "stuck" identically to ParaBank, for the same reason, and that failure
+    mode is the one this function exists to close.
+    """
+    url = _JSESSIONID.sub("", url)
+
+    path, sep, query = url.partition("?")
+    if not sep:
+        return url
+
+    query, has_fragment, fragment = query.partition("#")
+    kept = [
+        param
+        for param in query.split("&")
+        if param.split("=", 1)[0].lower() not in _SESSION_PARAM_NAMES
+    ]
+    rebuilt = "&".join(kept)
+    return (
+        path
+        + (f"?{rebuilt}" if rebuilt else "")
+        + (f"#{fragment}" if has_fragment else "")
+    )
+
 
 # Any run of digits in a node's text. See `canonical_value`.
 _DIGITS = re.compile(r"[0-9]+")
@@ -377,14 +437,15 @@ def anonymise_rows(lines: list[str]) -> list[str]:
 def normalize(snapshot: str, *, keep_values: bool = False) -> str:
     """Reduce a snapshot to the part we treat as identity.
 
-    Four projections, applied in this order. Each answers one question, and
+    Five projections, applied in this order. Each answers one question, and
     each got its answer from a measurement rather than from taste:
 
-        _NOISE           is focus identity?          no; disabled/checked are
-        canonical_value  is rendered text identity?  the prose is, digits are not
-        field_value      is typed input identity?    presence is, content is not
-        collapse_runs    is *how many* identity?     no, past one-vs-several
-        collapse_siblings  ... when the rows are not alike?  still no
+        _NOISE            is focus identity?          no; disabled/checked are
+        canonical_value   is rendered text identity?  the prose is, digits are not
+        field_value       is typed input identity?    presence is, content is not
+        _strip_session_id is a URL's session id identity?  no, only its destination is
+        collapse_runs     is *how many* identity?     no, past one-vs-several
+        collapse_siblings   ... when the rows are not alike?  still no
 
     Also gone: injected chrome that is not the application (`noise.py`), and the
     trailing `:` that marks a node as having children.
@@ -418,6 +479,10 @@ def normalize(snapshot: str, *, keep_values: bool = False) -> str:
                 project = field_value if role in FIELD_ROLES else canonical_value
                 text = project(role, value.group("name") or "", value.group("value"))
                 line = f'{value.group("head")}: {text}'
+
+            url_line = _URL_LINE.match(line)
+            if url_line:
+                line = url_line.group("head") + _strip_session_id(url_line.group("url"))
 
         # `- list:` means "children follow" and `- list` means "none do" -- but
         # the following lines already say that, and on a field whose value we

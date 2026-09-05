@@ -134,7 +134,7 @@ export default function TranscriptViewer({
               type="button"
               onClick={onClose}
               aria-label="Close transcripts"
-              className="ml-auto rounded p-1 text-muted hover:bg-hush hover:text-ink"
+              className="ml-auto cursor-pointer rounded p-1 text-muted hover:bg-hush hover:text-ink"
             >
               ✕
             </button>

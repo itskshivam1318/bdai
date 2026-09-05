@@ -327,6 +327,38 @@ def parse_snapshot(snapshot: str) -> tuple[Element, ...]:
     return tuple(elements)
 
 
+def goto(page: Page, url: str, *, attempts: int = 3, timeout_ms: float = 30_000) -> bool:
+    """Load `url`, retrying a slow or momentarily-unreachable target.
+
+    A `goto` timeout is not evidence the target is down -- a public demo
+    server under load, one slow third-party resource, a transient DNS hiccup
+    all look identical to it from here. `attempts` is the budget for telling
+    a real outage from a bad moment, each one waiting a little longer than the
+    last so a genuinely struggling server is not hammered.
+
+    `wait_until="domcontentloaded"` rather than the default `load` -- see
+    `agents.orchestrator.run` for the measured sites where `load` never fires
+    even though the page is ready in under 2s.
+
+    Returns whether any attempt landed, and never raises: a caller that cannot
+    reach its target has a fact to report, not a stack trace to propagate.
+    `ant.navigate`'s `None` return already means exactly this, and this is what
+    lets that contract absorb the failure instead of the whole run dying on
+    one slow load -- measured against `the-internet.herokuapp.com`, whose free
+    hosting stalls past 30s often enough that a single attempt is not a fair
+    test of whether the app is reachable at all.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            return True
+        except PlaywrightError:
+            if attempt == attempts:
+                return False
+            page.wait_for_timeout(1_000 * attempt)
+    return False
+
+
 class Observer:
     """Watches one Playwright page and produces Observations.
 

@@ -58,7 +58,7 @@ exploration-landscape.md`.
 # agents.explorer.crawler`), and importing it here makes the package import it
 # before runpy executes it, which Python warns about. Import it by module.
 from .forms import Credentials
-from .observer import Element, NetworkEvent, Observation, Observer
+from .observer import Element, NetworkEvent, Observation, Observer, goto
 from .statekey import normalize, state_key
 from .worldmap import StateNode, Transition, WorldMap
 
@@ -71,6 +71,7 @@ __all__ = [
     "StateNode",
     "Transition",
     "WorldMap",
+    "goto",
     "normalize",
     "state_key",
 ]

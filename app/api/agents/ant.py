@@ -30,7 +30,7 @@ from playwright.sync_api import Page, sync_playwright
 from . import tools
 from .explorer import forms
 from .explorer.forms import Credentials
-from .explorer.observer import Observation, Observer
+from .explorer.observer import Observation, Observer, goto
 from .explorer.synth import Synthesizer
 from .explorer.worldmap import WorldMap
 from .llm import Exchange, Provider, ToolResult, Transcript, load
@@ -108,7 +108,11 @@ def navigate(
         return None
 
     observer.start_window()
-    page.goto(entry_url)
+    if not goto(page, entry_url):
+        # A target that will not even load is indistinguishable, from here,
+        # from a state that stopped being reachable -- both mean this ant has
+        # nowhere to stand. `None` already carries that meaning to `explore`.
+        return None
     observation = observer.observe()
     if world.record(observation) == target_key:
         return observation
@@ -438,7 +442,9 @@ def main(entry_url: str, instruction: str | None = None) -> int:
 
         observer = Observer(page)
         observer.start_window()
-        page.goto(entry_url)
+        if not goto(page, entry_url):
+            print(f"could not reach {entry_url} after retrying")
+            return 1
         entry_key = world.record(observer.observe())
 
         report = explore(

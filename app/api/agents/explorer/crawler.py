@@ -40,7 +40,7 @@ from . import forms
 # `DESTRUCTIVE`/`is_safe` moved to forms.py so both walkers can honour them;
 # re-exported here because this module's callers and probes name them.
 from .forms import DESTRUCTIVE, Credentials, is_safe  # noqa: F401
-from .observer import Observation, Observer
+from .observer import Observation, Observer, goto
 from .statekey import state_key
 from .synth import Synthesizer
 from .worldmap import WorldMap
@@ -155,7 +155,11 @@ def crawl(
 
     def visit(url: str) -> Observation:
         observer.start_window()
-        page.goto(url)
+        # `goto` carries its own retry budget -- see `observer.goto`. A target
+        # that never loads at all falls through to `observer.observe()`'s
+        # existing empty-document handling: no elements to act on, which the
+        # crawler already reads as a dead end rather than a reason to crash.
+        goto(page, url)
         return observer.observe()
 
     # Where the browser is standing right now, and what it saw there. Tracking
