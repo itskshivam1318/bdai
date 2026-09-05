@@ -46,6 +46,7 @@ from agents.ant import instructions
 from agents.llm import Exchange, Transcript, load
 from agents.suite import verdicts_by_state
 
+from ..byok import Choice, byok
 from ..db import get_session
 from ..models import AppState, ChatMessage, ChatThread, Run, StateTransition, TestSession
 
@@ -477,7 +478,12 @@ def _latest_run_id(session_id: int, db: Session) -> int | None:
 
 
 @router.post("/api/chat/threads/{thread_id}/messages", response_model=ChatTurn)
-def send(thread_id: int, body: ChatRequest, db: Session = Depends(get_session)):
+def send(
+    thread_id: int,
+    body: ChatRequest,
+    db: Session = Depends(get_session),
+    keys: Choice = Depends(byok),
+):
     """Ask, and answer.
 
     Deliberately `def`, not `async def`: the provider call is blocking and takes
@@ -538,7 +544,7 @@ def send(thread_id: int, body: ChatRequest, db: Session = Depends(get_session)):
     )
 
     try:
-        provider = load()
+        provider = load(**keys.kwargs())
         turn = provider.turn(instructions("analyst"), transcript, [])
     except Exception as exc:  # noqa: BLE001 -- the reason is the whole point
         # 502 rather than 500: the failure is almost always an absent or spent

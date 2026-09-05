@@ -1,4 +1,4 @@
-"""One tool-calling interface, two providers.
+"""One tool-calling interface, every provider behind it.
 
 The ant does not know which model is driving it. That is the point: `agent.md`
 is the tunable part, and it has to mean the same thing to Claude, to Gemini, and
@@ -132,14 +132,33 @@ def load(
     provider: str | None = None,
     model: str | None = None,
     notify=None,
+    api_key: str | None = None,
 ) -> Provider:
     """Pick a provider by name, or by whichever API key is present.
 
     Auto-detection exists because the two of us are unlikely to have the same
     keys exported, and a harness that hard-fails on the wrong one wastes a
     minute every time. Explicit beats implicit when `provider` is passed.
+
+    `api_key` is the bring-your-own-key path: the console sends the key the
+    person typed into Advanced, and it is used *instead of* the environment for
+    this one provider, never written to it. Writing it to `os.environ` would be
+    the shorter fix and it is the wrong one -- exploration runs as a background
+    task in a worker thread, so two runs started a second apart share one
+    process, and the second person's key would silently drive the first
+    person's colony. Passing it down the call is what keeps a run's key
+    belonging to that run.
+
+    A caller who passes `api_key` without `provider` is naming a secret and not
+    saying what it opens, which we cannot guess from the string -- so that is an
+    error rather than a key quietly ignored while the server's own is used.
     """
     import os
+
+    from .catalog import resolve
+
+    if api_key and provider is None:
+        raise ValueError("api_key given without a provider; say which one it is")
 
     if provider is None:
         # OpenRouter is probed first *on cost*, not on quality. A full colony
@@ -158,38 +177,57 @@ def load(
         elif os.environ.get("ANTHROPIC_API_KEY"):
             provider = "claude"
         elif os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
-            provider = "gemini"
+            provider = "google"
+        elif os.environ.get("SARVAM_API_KEY"):
+            provider = "sarvam"
         else:
             raise RuntimeError(
-                "No model configured. Export OPENROUTER_API_KEY, "
-                "ANTHROPIC_API_KEY or GEMINI_API_KEY, or run the deterministic "
-                "crawler instead: python -m agents.explorer.crawler <url>"
+                "No model configured. Add a key under Advanced in the console, "
+                "or export OPENROUTER_API_KEY, ANTHROPIC_API_KEY or "
+                "GEMINI_API_KEY, or run the deterministic crawler instead: "
+                "python -m agents.explorer.crawler <url>"
             )
 
-    if provider == "claude":
+    spec = resolve(provider)
+
+    # Resolved here for every provider rather than inside each one, because the
+    # catalogue is what the console's Advanced panel offers -- a provider module
+    # holding a second default is how the dialog came to show "Claude Haiku 4.5
+    # (default)" over a run that used Opus. Precedence, widest to narrowest: the
+    # catalogue's cheap default, then the provider's own `*_MODEL` variable if a
+    # `.env` sets one, then whatever the caller explicitly asked for.
+    chosen = model or (
+        (spec.model_env and os.environ.get(spec.model_env)) or spec.default_model
+    )
+
+    if spec.id == "claude":
         from .claude import Claude
 
-        return Claude(model=model) if model else Claude()
-    if provider == "gemini":
+        return Claude(model=chosen, api_key=api_key)
+    if spec.id == "google":
         from .gemini import Gemini
 
-        return Gemini(model=model, notify=notify) if model else Gemini(notify=notify)
+        return Gemini(model=chosen, notify=notify, api_key=api_key)
 
     # Every OpenAI-compatible endpoint is this one class behind a base URL, so
-    # `openrouter` is a named default rather than a distinct provider. Point
-    # OPENROUTER_BASE_URL at DeepSeek, Groq, Cerebras or a local Ollama and the
-    # same code path serves them; only the key and the model string change.
-    if provider in ("openrouter", "openai-compat"):
-        from .openai_compat import DEFAULT_BASE_URL, DEFAULT_MODEL, OpenAICompat
+    # `openrouter` and `sarvam` are named defaults rather than distinct
+    # providers. `OPENROUTER_BASE_URL` repoints the same code path at DeepSeek,
+    # Groq, Cerebras or a local Ollama; only the key and the model string
+    # change. It overrides only OpenRouter's own URL -- pointing it at Sarvam's
+    # would make one variable mean two endpoints.
+    from .openai_compat import OpenAICompat
 
-        return OpenAICompat(
-            model=model or os.environ.get("OPENROUTER_MODEL") or DEFAULT_MODEL,
-            base_url=os.environ.get("OPENROUTER_BASE_URL") or DEFAULT_BASE_URL,
-            notify=notify,
-        )
+    base_url = spec.base_url or ""
+    if spec.id == "openrouter":
+        base_url = os.environ.get("OPENROUTER_BASE_URL") or base_url
 
-    raise ValueError(
-        f"unknown provider {provider!r}; expected claude, gemini or openrouter"
+    return OpenAICompat(
+        model=chosen,
+        base_url=base_url,
+        api_key=api_key or os.environ.get(spec.key_env),
+        key_env=spec.key_env,
+        name=spec.id,
+        notify=notify,
     )
 
 

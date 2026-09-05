@@ -31,6 +31,16 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
   const [reasonFor, setReasonFor] = useState<number | null>(null);
   const [name, setName] = useState("");
   const [intent, setIntent] = useState("");
+  /*
+   * The session's context box, and whether it is on screen.
+   *
+   * Editable here and not only at creation because the single most likely thing
+   * to be wrong with it is a mistyped password, and the alternative to fixing
+   * it in place is starting a new session -- which throws away the map that
+   * just told you the login was failing.
+   */
+  const [context, setContext] = useState("");
+  const [contextOpen, setContextOpen] = useState(false);
   const [selectedRunId, setSelectedRunId] = useState<number | null>(null);
   /*
    * The chat windows, and which one the map is aimed at.
@@ -74,6 +84,7 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
       .then((s) => {
         setSession(s);
         setName(sessionLabel(s));
+        setContext(s.context ?? "");
       })
       .catch(() => {});
     refreshRuns();
@@ -139,6 +150,12 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
     const next = name.trim();
     if (!session || !next || next === sessionLabel(session)) return;
     void api.renameSession(sessionId, next);
+  }
+
+  function commitContext() {
+    const next = context.trim();
+    if (!session || next === (session.context ?? "")) return;
+    void api.setSessionContext(sessionId, next).then(setSession);
   }
 
   /**
@@ -350,6 +367,25 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
           {session?.target_url}
         </a>
 
+        {/*
+          A dot, not a count. Whether context exists is the thing worth seeing
+          from the header; what is in it is a password, and the header is the
+          part of the screen that is always on the projector.
+        */}
+        <button
+          onClick={() => setContextOpen((open) => !open)}
+          aria-expanded={contextOpen}
+          className="flex shrink-0 items-center gap-1.5 rounded-md border border-rule px-2 py-1.5 text-xs text-muted hover:bg-hush hover:text-ink"
+        >
+          <span
+            aria-hidden
+            className={`h-1.5 w-1.5 rounded-full ${
+              context.trim() ? "bg-ink" : "border border-rule"
+            }`}
+          />
+          Context
+        </button>
+
         <button
           onClick={startRun}
           className="rounded-md bg-ink px-3 py-1.5 text-xs text-paper"
@@ -441,6 +477,33 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
         typing into the other. Each window owns its text now, and this owns the
         run's.
       */}
+      {contextOpen && (
+        <div className="border-t border-rule px-4 py-3">
+          <label
+            htmlFor="session-context"
+            className="text-xs uppercase tracking-wide text-muted"
+          >
+            What the run should know about this app
+          </label>
+          <textarea
+            id="session-context"
+            value={context}
+            onChange={(e) => setContext(e.target.value)}
+            onBlur={commitContext}
+            rows={3}
+            placeholder={
+              "Log in as standard_user / secret_sauce. Focus on checkout. " +
+              "Check that an out-of-stock item can't be added to the cart."
+            }
+            className="mt-2 w-full resize-y rounded-md border border-rule bg-paper px-3 py-2 text-sm leading-relaxed outline-none focus:border-ink placeholder:text-muted/60"
+          />
+          <p className="mt-2 text-xs text-muted">
+            Saved to this session and read by every run under it. Applies from
+            the next run — it is not retroactive.
+          </p>
+        </div>
+      )}
+
       <form
         onSubmit={(e) => {
           e.preventDefault();

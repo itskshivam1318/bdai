@@ -35,15 +35,17 @@ from sqlmodel import Session, select
 # relative import would climb above this package and fail at import time.
 from agents import ant, orchestrator, runner, suite
 from agents.explorer import crawler, forms, store
-from agents.explorer.forms import Credentials
 from agents.explorer.synth import Synthesizer
+from agents.context import Context, credentials_for, parse as parse_context
+from agents.claims import attribute, claimed_by, gaps_for, steer, with_claimed
 from agents.generator import scenarios
 from agents.llm import load
 from agents.shots import shooter
 from agents.tracing import start as start_tracing
+from ..byok import Choice, byok
 from ..config import settings
 from ..db import engine, get_session
-from ..models import AppState, Event, Run, TestCase
+from ..models import AppState, Event, Run, TestCase, TestSession
 
 router = APIRouter(prefix="/api/runs", tags=["explore"])
 
@@ -58,7 +60,9 @@ class ExploreRequest(BaseModel):
     ant_actions: int = 4
 
 
-def _crawl_only(page, target_url: str, emit, checkpoint, shot) -> orchestrator.Exploration:
+def _crawl_only(
+    page, target_url: str, emit, checkpoint, shot, credentials
+) -> orchestrator.Exploration:
     """The no-model path: the same WorldMap, built breadth-first with no model.
 
     Returned as an `Exploration` so the caller's save-and-report block does not
@@ -73,7 +77,7 @@ def _crawl_only(page, target_url: str, emit, checkpoint, shot) -> orchestrator.E
     world = crawler.crawl(
         page,
         target_url,
-        credentials=Credentials.from_env(),
+        credentials=credentials,
         # Same cache the CLI uses, so a payload the model chose on an earlier
         # run is reused now that there is no model to ask.
         synthesizer=Synthesizer(cache_path=settings.artifacts_dir / "invalid-payloads.json"),
@@ -124,8 +128,34 @@ def _tls_warning(target_url: str) -> str | None:
         return None
 
 
-def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
-    """The background job. Owns its own DB session and its own browser."""
+def _session_context(run: Run, db: Session) -> str | None:
+    """The box typed beside this run's URL, or None.
+
+    Read in the request rather than in the background job: the job already owns
+    a database session, but making it walk `Run -> TestSession` would give the
+    agent layer a reason to know what a session is, and it does not.
+    """
+    if run.session_id is None:
+        return None
+    row = db.get(TestSession, run.session_id)
+    return row.context if row else None
+
+
+def _explore(
+    run_id: int,
+    target_url: str,
+    body: ExploreRequest,
+    keys: Choice,
+    context_raw: str | None = None,
+) -> None:
+    """The background job. Owns its own DB session and its own browser.
+
+    `keys` travels as an argument rather than as process state because
+    FastAPI runs this in a worker thread of a shared process -- see
+    `app/byok.py`. `context_raw` travels the same way and for the same reason:
+    it is read off the session row in the request, so the job never has to know
+    that sessions exist.
+    """
     from playwright.sync_api import sync_playwright
 
     with Session(engine) as db:
@@ -166,15 +196,15 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
         # by hand the thing this function was already standing in front of.
         provider = None
         try:
-            provider = load(notify=emit)
-        except RuntimeError as exc:
+            provider = load(notify=emit, **keys.kwargs())
+        except (RuntimeError, ValueError) as exc:
             emit("error", str(exc))
             emit("warn", "no model: falling back to the deterministic crawler")
 
         emit("info", f"exploring {target_url}", surface="timeline")
         emit(
             "info",
-            f"model: {provider.name} / {provider.model}"
+            f"model: {provider.name} / {provider.model} [{keys.redacted}]"
             if provider
             else "model: none -- breadth-first crawl, no flows and no summary",
         )
@@ -182,6 +212,52 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
             # Better than silently ignoring it: the crawler has nowhere to put
             # an intent, and a user who typed one deserves to know that.
             emit("warn", f"intent ignored without a model: {body.intent!r}")
+
+        # The box beside the URL. Parsed here rather than when it was typed,
+        # because telling a password from a sentence takes a model and the model
+        # is only chosen now -- the caller may have brought their own key.
+        #
+        # Announced *before* the call, not after. A slow model turned this into
+        # minutes of a run sitting on "running" behind two timeline lines, with
+        # nothing saying what it was waiting for.
+        if context_raw and context_raw.strip():
+            emit("info", "reading the context box", surface="timeline")
+        context = parse_context(context_raw or "", provider)
+        if context:
+            if provider is None:
+                # Said plainly. A run that quietly ignored the credentials it
+                # was given will fail at the login wall and report a map of the
+                # login page, which looks like the app being small rather than
+                # like the box being dropped.
+                emit(
+                    "warn",
+                    "context ignored without a model: nothing can tell a "
+                    "password from a sentence. Falling back to AIVAR_USERNAME "
+                    "/ AIVAR_PASSWORD, if set.",
+                )
+            elif not context.parsed:
+                # Not the same as an empty box, and the difference is what the
+                # user should do next: nothing, and try again.
+                emit(
+                    "warn",
+                    "could not read the context box -- the model did not answer. "
+                    "Exploring without it; the box itself is fine.",
+                )
+            else:
+                emit("info", f"context: {context.redacted}", surface="timeline")
+                if not (context.credentials or context.focus or context.claims):
+                    emit(
+                        "warn",
+                        f"nothing usable in the context box: {context.raw!r}",
+                    )
+
+        credentials = credentials_for(context)
+
+        # Session context first, this run's intent second. Both are steering and
+        # the model reads them as one section; the later one is the one being
+        # typed right now, and recency is the only ordering that matches what a
+        # person means by changing their mind.
+        intent = " ".join(p for p in (context.focus, body.intent) if p) or None
 
         # Incremental, because a map that only appears when the crawl finishes
         # cannot be watched, and watching it is the demo. `store.save` is
@@ -198,6 +274,11 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
         # Assigned inside the `with` block below but read after it, and the
         # `except` path must still find a list rather than a NameError.
         results: list = []
+        # Same hazard, same fix: a crawl that throws before generation still
+        # reaches the report, and a claim that was never attributed is reported
+        # as uncovered rather than crashing the run that would have said so.
+        matched: dict[str, tuple[int, ...]] = {claim: () for claim in context.claims}
+        answering: dict[str, tuple[str, ...]] = {claim: () for claim in context.claims}
 
         try:
             with sync_playwright() as pw:
@@ -208,7 +289,10 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
                 # `_tls_warning`.
                 page = browser.new_page(ignore_https_errors=True)
                 synthesizer = Synthesizer(
-                    cache_path=settings.artifacts_dir / "invalid-payloads.json"
+                    cache_path=settings.artifacts_dir / "invalid-payloads.json",
+                    # Only Claude drives the payload synthesizer, so only a
+                    # Claude key is its to use.
+                    api_key=keys.api_key if keys.provider == "claude" else None,
                 )
                 if provider is None:
                     result = _crawl_only(
@@ -217,6 +301,7 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
                         emit,
                         checkpoint,
                         shooter(page, run_id, settings.artifacts_dir),
+                        credentials,
                     )
                 else:
                     # Crawl first, then colonise. The deterministic walk costs
@@ -236,9 +321,21 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
                         page,
                         target_url,
                         crawler.Budget(),
-                        credentials=Credentials.from_env(),
+                        credentials=credentials,
                         synthesizer=synthesizer,
                         checkpoint=checkpoint,
+                        # The colony gets a camera and so must this. Since the
+                        # console started crawling deterministically first, the
+                        # crawler discovers nearly every state and the ants only
+                        # photograph the ones they stand in -- and
+                        # `attach_screenshot` is first-wins, so a state the
+                        # crawler found and no ant re-entered kept no picture at
+                        # all. How visible that is depends on how far the colony
+                        # gets: measured here, a run whose colony died on its
+                        # first call left 1 of 7 states with a thumbnail and the
+                        # rest of the map reading "no capture", while a healthy
+                        # colony on another checkout still photographed 17.
+                        shot=shooter(page, run_id, settings.artifacts_dir),
                     )
                     emit(
                         "decision",
@@ -254,13 +351,13 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
                         provider,
                         world=seed,
                         synthesizer=synthesizer,
-                        intent=body.intent,
+                        intent=intent,
                         budget=orchestrator.Budget(
                             max_waves=body.max_waves,
                             max_ants=body.max_ants,
                             ant_actions=body.ant_actions,
                         ),
-                        credentials=Credentials.from_env(),
+                        credentials=credentials,
                         # Tagged, so the colony's own reasoning opens a widget
                         # rather than only scrolling past in the timeline.
                         on_event=lambda level, message: emit(
@@ -316,6 +413,93 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
 
                 # --- suite -------------------------------------------
                 plan = scenarios(result.world)
+
+                # The claims the user typed, matched against tests that already
+                # exist -- never against tests a model wrote for them. See
+                # `agents/claims.py` for why that distinction is the product.
+                #
+                # Attribution runs against a *wider* plan than the one that will
+                # be executed: `scenarios()` caps and interleaves for fairness,
+                # which is right for a suite nobody asked anything specific of,
+                # and wrong for the one scenario answering a question somebody
+                # typed out. Anything a claim needs is added back below.
+                considered = (
+                    scenarios(result.world, limit=40) if context.claims else plan
+                )
+                matched = attribute(
+                    context.claims,
+                    considered,
+                    provider,
+                    on_event=lambda level, message: emit(
+                        level, message, surface="coverage"
+                    ),
+                )
+                plan = with_claimed(plan, considered, matched)
+
+                # One more wave, aimed. This is the meta-agent deciding rather
+                # than looping: the claim the first pass could not cover is
+                # itself the steer for the second, so this is a different
+                # exploration and not a longer one. Exactly once -- a claim the
+                # app genuinely does not implement would otherwise buy waves
+                # forever, and `agents/critic.py` records why one round is the
+                # number the research supports.
+                uncovered = steer(matched, provider)
+                if uncovered:
+                    emit(
+                        "decision",
+                        f"{len(uncovered)} claim(s) uncovered -- one more wave, "
+                        f"aimed at: {'; '.join(uncovered)}",
+                        surface="coverage",
+                    )
+                    result = orchestrator.run(
+                        page,
+                        target_url,
+                        provider,
+                        world=result.world,
+                        synthesizer=synthesizer,
+                        intent=(
+                            "Reach and exercise these specific behaviours, which "
+                            "the exploration so far has not covered:\n"
+                            + "\n".join(f"- {claim}" for claim in uncovered)
+                        ),
+                        budget=orchestrator.Budget(
+                            max_waves=1,
+                            max_ants=body.max_ants,
+                            ant_actions=body.ant_actions,
+                        ),
+                        credentials=credentials,
+                        on_event=lambda level, message: emit(
+                            level, message, surface="explore"
+                        ),
+                        run_id=run_id,
+                        shot=shooter(page, run_id, settings.artifacts_dir),
+                        checkpoint=checkpoint,
+                    )
+                    store.save(result.world, run_id, db)
+                    # Re-compiled, not amended: the map grew, so the ranking and
+                    # the interleave both change, and patching the old plan would
+                    # produce a suite `generator.scenarios` would never emit.
+                    plan = scenarios(result.world)
+                    considered = scenarios(result.world, limit=40)
+                    matched = attribute(
+                        context.claims,
+                        considered,
+                        provider,
+                        on_event=lambda level, message: emit(
+                            level, message, surface="coverage"
+                        ),
+                    )
+                    plan = with_claimed(plan, considered, matched)
+
+                answering = claimed_by(matched, considered)
+                for claim, names in answering.items():
+                    emit(
+                        "decision" if names else "warn",
+                        f"claim {'covered by' if names else 'uncovered'}: {claim}"
+                        + (f" -- {', '.join(names)}" if names else ""),
+                        surface="coverage",
+                    )
+
                 for scenario in plan:
                     emit(
                         "info",
@@ -329,7 +513,6 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
                 )
 
                 # --- run and heal ------------------------------------
-                credentials = Credentials.from_env()
                 for index, scenario in enumerate(plan, start=1):
                     # Emitted *before* the replay, not after: a scenario takes
                     # seconds and this is the only line that says which one is
@@ -393,6 +576,40 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
                         surface="defect",
                     )
 
+            # The user's own sentence, with the verdict of the test that
+            # answered it. This is the line the whole context box exists for:
+            # everything else is steering, and this is the reply.
+            #
+            # A claim nothing covered says so in the user's words. That is a
+            # real answer -- "you asked for this and nothing in the map
+            # exercises it" -- and the one thing that must never happen here is
+            # a claim reported green because a scenario was nearby.
+            for claim, names in answering.items():
+                verdicts = [r.verdict for r in results if r.scenario.name in names]
+                if not verdicts:
+                    emit(
+                        "warn",
+                        f"claim not tested: {claim}"
+                        + (" -- the scenario covering it never returned a verdict"
+                           if names else " -- nothing in the suite exercises it"),
+                        surface="report",
+                    )
+                    continue
+                # The worst verdict wins: a claim covered by two scenarios, one
+                # of which found a defect, is a claim that found a defect.
+                worst = next(
+                    (v for v in (runner.ESCALATE, runner.DEFECT, runner.HEALED)
+                     if v in verdicts),
+                    runner.PASSED,
+                )
+                emit(
+                    "error" if worst in {runner.DEFECT, runner.ESCALATE} else "decision",
+                    f"claim {worst}: {claim} -- {', '.join(names)}",
+                    surface="report",
+                )
+
+            unmatched = gaps_for(matched)
+
             tally = {
                 v: sum(1 for r in results if r.verdict == v)
                 for v in (runner.PASSED, runner.HEALED, runner.DEFECT, runner.ESCALATE)
@@ -401,7 +618,10 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
                 "decision",
                 f"report: {tally[runner.PASSED]} passed, {tally[runner.HEALED]} healed, "
                 f"{tally[runner.DEFECT]} defect, {tally[runner.ESCALATE]} escalate, "
-                f"{len(result.gaps)} gap(s) remaining ({written} rows)",
+                f"{len(result.gaps) + len(unmatched)} gap(s) remaining "
+                + (f"({len(unmatched)} of them claims nothing covered) "
+                   if unmatched else "")
+                + f"({written} rows)",
                 surface="report",
             )
 
@@ -421,6 +641,12 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
                 incomplete = not plan or len(results) != len(plan)
                 if tally[runner.DEFECT] or tally[runner.ESCALATE] or incomplete:
                     run.status = "failed"
+                elif unmatched:
+                    # Not `failed`: nothing about the application misbehaved.
+                    # Not `passed` either -- the user named a behaviour and the
+                    # run did not test it, and a green badge over that answers a
+                    # question nobody asked while burying the one they did.
+                    run.status = "degraded"
                 else:
                     run.status = "passed" if provider else "degraded"
                 run.summary = result.summary or (
@@ -431,6 +657,20 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
                     if provider is None
                     else f"stopped: {result.stopped}"
                 )
+                if unmatched:
+                    # The header disclosure reads `run.summary`, and it is the
+                    # only place a grey badge explains itself. A run that went
+                    # degraded because the user's own sentence went untested
+                    # must say that first, ahead of whatever the colony wrote
+                    # about where it stopped.
+                    run.summary = (
+                        f"{len(unmatched)} claim(s) untested: "
+                        + "; ".join(
+                            gap.why.removeprefix("nothing in the suite exercises: ")
+                            for gap in unmatched
+                        )
+                        + f" -- {run.summary}"
+                    )[:500]
 
         except Exception as exc:
             # An exploration that dies half way still discovered something, but
@@ -454,6 +694,7 @@ def start_exploration(
     body: ExploreRequest,
     background: BackgroundTasks,
     session: Session = Depends(get_session),
+    keys: Choice = Depends(byok),
 ):
     """Kick off exploration for an existing run. Returns before it finishes."""
     run = session.get(Run, run_id)
@@ -466,7 +707,9 @@ def start_exploration(
     session.add(run)
     session.commit()
 
-    background.add_task(_explore, run_id, run.target_url, body)
+    background.add_task(
+        _explore, run_id, run.target_url, body, keys, _session_context(run, session)
+    )
     return {"run_id": run_id, "status": "running"}
 
 
@@ -529,7 +772,13 @@ def _brief(action: str | None, instruction: str | None) -> str | None:
     return "\n\n".join(parts) or None
 
 
-def _dispatch_ant(run_id: int, target_url: str, body: AntRequest) -> None:
+def _dispatch_ant(
+    run_id: int,
+    target_url: str,
+    body: AntRequest,
+    keys: Choice,
+    context_raw: str | None = None,
+) -> None:
     """The background job for one hand-aimed ant. Mirrors `_explore`'s shape.
 
     Writes into the same run as the crawl that produced the map: a state this
@@ -548,8 +797,8 @@ def _dispatch_ant(run_id: int, target_url: str, body: AntRequest) -> None:
             db.commit()
 
         try:
-            provider = load(notify=emit)
-        except RuntimeError as exc:
+            provider = load(notify=emit, **keys.kwargs())
+        except (RuntimeError, ValueError) as exc:
             # Unlike the crawl, there is no deterministic fallback here: an ant
             # *is* the model. Say so and stop rather than pretending.
             emit("error", f"no model, so no ant: {exc}")
@@ -585,7 +834,12 @@ def _dispatch_ant(run_id: int, target_url: str, body: AntRequest) -> None:
                     entry_url=target_url,
                     start_key=body.state_key,
                     instruction=_brief(body.action, body.instruction),
-                    credentials=Credentials.from_env(),
+                    # An ant sent by hand walks the same app behind the same
+                    # login wall. It has a model by definition -- there is no
+                    # ant without one -- so the box is always parseable here.
+                    credentials=credentials_for(
+                        parse_context(context_raw or "", provider)
+                    ),
                     budget=max(1, min(body.budget, 8)),
                     run_id=run_id,
                     shot=shooter(page, run_id, settings.artifacts_dir),
@@ -622,6 +876,7 @@ def dispatch_ant(
     body: AntRequest,
     background: BackgroundTasks,
     session: Session = Depends(get_session),
+    keys: Choice = Depends(byok),
 ):
     """Send one ant to a state on this run's map. Returns before it lands."""
     run = session.get(Run, run_id)
@@ -650,7 +905,14 @@ def dispatch_ant(
         if body.action not in available:
             raise HTTPException(400, "that action is not available on this state")
 
-    background.add_task(_dispatch_ant, run_id, run.target_url, body)
+    background.add_task(
+        _dispatch_ant,
+        run_id,
+        run.target_url,
+        body,
+        keys,
+        _session_context(run, session),
+    )
     return {"run_id": run_id, "state_key": body.state_key, "status": "dispatched"}
 
 

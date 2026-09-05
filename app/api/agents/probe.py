@@ -302,6 +302,46 @@ def _parity_checks() -> bool:
         "nothing here could be filled" in rendered,
         "a refusal with no reason is a to-do nobody can action",
     )
+
+    # A dead ant was survivable and a dead orchestrator was not. Measured on a
+    # seeded saucedemo run: the wave-3 model call raised a 402 and the
+    # exception left `run` entirely, so a 24-state crawl, a completed wave and
+    # the autosave went with it and the process ended on a traceback.
+    class DiesOnWaveTwo(Colony):
+        def turn(self, system, transcript, tool_defs):
+            names = {t.name for t in tool_defs}
+            if "dispatch" in names and self.waves >= 1:
+                raise RuntimeError("402 from the provider: out of credits")
+            return super().turn(system, transcript, tool_defs)
+
+    with sync_playwright() as pw:
+        browser, page, _, _ = _page_and_map(pw)
+        try:
+            result = run(
+                page, SUT, DiesOnWaveTwo(),
+                budget=Budget(max_waves=3, max_ants=2, ant_actions=1),
+                credentials=CREDENTIALS,
+                on_event=lambda level, message: None,
+            )
+            ok &= check(
+                "a provider failure ends the colony, it does not erase it",
+                bool(result.world.states) and result.stopped == "error",
+                f"states={len(result.world.states)} stopped={result.stopped!r}",
+            )
+            ok &= check(
+                "the run says why it has no summary",
+                any("model call failed" in gap for gap in result.gaps),
+                f"gaps={result.gaps}",
+            )
+        except Exception as exc:
+            ok &= check(
+                "a provider failure ends the colony, it does not erase it",
+                False,
+                f"the exception escaped `run`: {type(exc).__name__}: {exc}",
+            )
+        finally:
+            browser.close()
+
     return ok
 
 
@@ -1127,8 +1167,344 @@ def main() -> int:
     print()
     ok &= _parity_checks()
 
+    # 10. Bring-your-own-key. The console's Advanced panel is only a form until
+    # the key it holds reaches `load()`; these checks are the wire between them.
+    print()
+    ok &= _byok_checks()
+
+    # 11. The second input. A URL is still all the brief requires, but a box
+    # beside it now carries credentials, focus and claims -- and the parse that
+    # tells those apart is a model, so it needs pinning like any other seam.
+    print()
+    ok &= _context_checks()
+
+    # 12. What happens to a claim after it is parsed. The failure these guard
+    # against is the attractive one: letting a model write a test for the
+    # sentence, whose expectation nothing ever measured, and whose failure is
+    # therefore unclassifiable on the one test the user asked for by name.
+    print()
+    ok &= _claim_checks()
+
+    # 13. A crawl walks off the site it was given and meets documents that are
+    # still committing. One of those ended a run in `error` after five states.
+    print()
+    ok &= _navigation_checks()
+
     print()
     return 0 if ok else 1
+
+
+def _byok_checks() -> bool:
+    """Does a key typed into the console actually drive the run it paid for?
+
+    The failure this section exists for is silent in both directions. A key that
+    never reaches `load()` leaves the run on the server's own key -- it works,
+    it just bills the wrong person and runs the wrong model. A key that reaches
+    it by way of `os.environ` works too, until two runs overlap in the one
+    process the API serves them from and the second one's key drives the first
+    one's colony.
+
+    Every check here is offline: no network, no browser, no quota. The keys are
+    obvious fakes, and nothing below sends one anywhere.
+    """
+    import os
+
+    from .llm import load
+    from .llm.catalog import (
+        BY_ID,
+        FALLBACK_MAX_OUTPUT,
+        PROVIDERS,
+        as_json,
+        max_output_for,
+        resolve,
+    )
+    from .llm import Transcript
+    from .llm.openai_compat import OpenAICompat
+
+    print("BYOK        a key from the console drives the run it paid for")
+    ok = True
+
+    ok &= check(
+        "every catalogued provider is one load() can build",
+        all(resolve(spec.id).id == spec.id for spec in PROVIDERS),
+        "the dialog offers a provider the backend cannot resolve",
+    )
+    ok &= check(
+        "every provider's default model is one it lists",
+        all(
+            any(m.id == spec.default_model for m in spec.models)
+            for spec in PROVIDERS
+        ),
+        "a provider defaults to a model missing from its own select",
+    )
+    # The ceiling was a flat 4096 in `openai_compat.py` for every model on
+    # every provider -- 14% of what the default model emits, and small enough
+    # that a `finish` call returning flows and a summary was being cut off
+    # inside it. These four checks are what stop it drifting back: a number
+    # that is per-model, that an env var can still rescue, and a truncation
+    # that says so instead of returning a stump.
+    ok &= check(
+        "every catalogued model declares its own reply ceiling",
+        all(
+            choice.max_output >= 4096
+            for spec in PROVIDERS
+            for choice in spec.models
+        ),
+        "a model would send less than the flat ceiling this replaced",
+    )
+    ok &= check(
+        "a model nobody catalogued still gets a safe ceiling",
+        max_output_for("nobody/has-heard-of-this") == FALLBACK_MAX_OUTPUT,
+        "the free-text model box would send max_tokens=None",
+    )
+    ok &= check(
+        "the ceiling is the model's, not one number for the class",
+        max_output_for("deepseek/deepseek-chat")
+        != max_output_for("qwen/qwen3-coder-next"),
+        "DeepSeek caps at 16384 and would 400 on the larger ask",
+    )
+
+    # Constructed with a fake key and no network: `turn()` is driven through a
+    # stubbed `_post`, so this proves the wiring, not the provider.
+    fake = object.__new__(OpenAICompat)
+    fake.model = "qwen/qwen3-coder-next"
+    fake.max_tokens = max_output_for(fake.model)
+    warnings: list[str] = []
+    fake._notify = lambda level, message: warnings.append(message)
+    sent: list[dict] = []
+    fake._post = lambda payload: sent.append(payload) or {
+        "choices": [
+            {"message": {"content": "cut off mid-", "role": "assistant"},
+             "finish_reason": "length"}
+        ]
+    }
+    reply = OpenAICompat.turn(fake, "sys", Transcript(prompt="hi"), [])
+
+    ok &= check(
+        "the request carries the model's ceiling, not 4096",
+        sent and sent[0]["max_tokens"] == max_output_for(fake.model),
+        f"sent max_tokens={sent[0]['max_tokens'] if sent else 'nothing'}",
+    )
+    ok &= check(
+        "a reply cut off at the ceiling says so instead of passing as whole",
+        any("cut off" in w for w in warnings) and reply.text == "cut off mid-",
+        f"finish_reason=length produced {len(warnings)} warning(s)",
+    )
+
+    # `GET /api/providers` is unauthenticated and its whole job is to describe
+    # keys, so the line between "names the variable" and "prints its contents"
+    # is one substitution away. Compared against the real environment, because a
+    # check against a fixture would pass on a machine that has no keys at all.
+    served = json.dumps(as_json())
+    present = [
+        value
+        for spec in PROVIDERS
+        if (value := os.environ.get(spec.key_env))
+    ]
+    ok &= check(
+        "the served catalogue names the variables, never their contents",
+        not any(value in served for value in present),
+        "GET /api/providers is returning a credential",
+    )
+    ok &= check(
+        "the catalogue is checked against a machine that has keys",
+        bool(present),
+        "no provider key is set here, so the leak check proved nothing",
+    )
+
+    # The four providers the console offers, each built with a fake key and no
+    # environment at all -- so anything that constructs did so on the key it
+    # was handed. `google` and `claude` need their SDKs; a missing one is a
+    # skipped check, not a failure, because neither is needed to crawl.
+    saved = {
+        name: os.environ.pop(name, None)
+        for name in (
+            "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY",
+            "GOOGLE_API_KEY", "SARVAM_API_KEY", "OPENROUTER_MODEL",
+        )
+    }
+    try:
+        for spec in PROVIDERS:
+            try:
+                provider = load(spec.id, api_key="probe-not-a-real-key")
+            except ImportError:
+                print(f"  SKIP  {spec.id}: SDK not installed")
+                continue
+            ok &= check(
+                f"{spec.id} builds on a brought key with an empty environment",
+                provider.model == spec.default_model,
+                f"got model {provider.model!r}, wanted {spec.default_model!r}",
+            )
+
+        ok &= check(
+            "a chosen model is not overridden by the environment",
+            (
+                load("openrouter", model="chosen/model", api_key="k").model
+                == "chosen/model"
+            ),
+            "the dialog says one model and the run uses another",
+        )
+
+        # The reason `api_key` is a parameter and not an `os.environ` write:
+        # the API serves every run from one process, so an exported key is
+        # every concurrent run's key.
+        ok &= check(
+            "a brought key is never exported",
+            all(os.environ.get(name) is None for name in saved),
+            "load() wrote a caller's key into the process environment",
+        )
+
+        # A key with no provider is a secret we cannot route. Guessing is worse
+        # than refusing: it would spend someone's Claude key on OpenRouter.
+        orphaned = False
+        try:
+            load(api_key="k")
+        except ValueError:
+            orphaned = True
+        ok &= check(
+            "a key with no provider is refused, not guessed",
+            orphaned,
+            "load() accepted a key without being told what it opens",
+        )
+
+        unknown = False
+        try:
+            resolve("not-a-provider")
+        except ValueError:
+            unknown = True
+        ok &= check("an unknown provider name is refused", unknown)
+    finally:
+        for name, value in saved.items():
+            if value is not None:
+                os.environ[name] = value
+
+    # `gemini` is what `agents/` has always called it and `google` is what the
+    # dialog shows. Both must land on one spec, or a `.env` written yesterday
+    # stops working today.
+    ok &= check(
+        "the vendor's name and the internal one resolve alike",
+        resolve("gemini") is resolve("google") is BY_ID["google"],
+        "an alias points somewhere else",
+    )
+
+    # Every route from the console into a model has to carry the choice, or
+    # one of them quietly spends the server's key instead of the caller's.
+    from app.routers import chat, explore
+
+    for module, name in ((explore, "_explore"), (explore, "_dispatch_ant"),
+                         (chat, "send")):
+        ok &= check(
+            f"{name} takes the caller's key",
+            "keys" in _signature(getattr(module, name)),
+            "this path still loads a provider from the environment only",
+        )
+
+    return ok
+
+
+def _navigation_checks() -> bool:
+    """Can a page that is between documents be observed without killing the run?
+
+    The bug: a crawl of `practicetestautomation.com` ended in `error` after five
+    states with `Locator.aria_snapshot: Selector "body" does not match any
+    element`. Its "AI Workshop" link leaves the site for `luma.com`, and while
+    that document was committing there was no `body` to snapshot -- reproduced 3
+    times in 6 clicks.
+
+    Two defects compose there, and both are checked here because fixing either
+    alone leaves a live failure:
+
+    1. `crawler` calls `observer.observe()` *before* `_same_origin`, so the rule
+       that refuses off-site destinations cannot fire -- observing the foreign
+       page raises first. A correct policy one line too late is no policy.
+    2. `observe()` assumed `body` exists. Off-origin is not the only way to meet
+       a document still committing; a slow-hydrating same-origin SPA is the case
+       this codebase has already been bitten by once.
+
+    Offline and deterministic: the bodyless document is made by removing the
+    element, not by racing a real navigation.
+    """
+    from .explorer.observer import Observer
+
+    print("NAVIGATION  a document between states does not end the run")
+    ok = True
+    observed = None
+
+    # Its own playwright lifetime: `main`'s `with sync_playwright()` block has
+    # already closed by the time the section list gets here, and a section that
+    # borrows a stopped one dies before printing a single check.
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch()
+        page = browser.new_page()
+        try:
+            page.goto("about:blank")
+            page.evaluate(
+                "() => document.documentElement.removeChild(document.body)"
+            )
+            ok &= check(
+                "the probe really built a document with no body",
+                page.locator("body").count() == 0,
+                "the reproduction is not reproducing; every check below is "
+                "vacuous",
+            )
+
+            raised = ""
+            try:
+                observed = Observer(page).observe(settle_ms=10, patience_ms=30)
+            except Exception as exc:  # noqa: BLE001 -- what it raises is the finding
+                raised = f"{type(exc).__name__}: {exc}"
+
+            ok &= check(
+                "observing a document with no body does not raise",
+                observed is not None,
+                f"observe() raised {raised}; one such page ends the whole crawl",
+            )
+            if observed is not None:
+                ok &= check(
+                    "the empty observation is still a usable Observation",
+                    observed.url is not None and observed.elements == (),
+                    "a bodyless page must read as 'nothing to act on', not as "
+                    "a half-built object the crawler then trips over",
+                )
+        finally:
+            browser.close()
+
+    # The other half: having survived being observed, the foreign page must
+    # then be *refused*. This is asserted as a composition rather than as an
+    # ordering of the two lines in `crawler`, deliberately. Moving the origin
+    # test above `observe()` would save the observation, but it would read
+    # `page.url` before navigation has necessarily committed -- and a false
+    # refusal silently drops a legitimate state from the map, which is a worse
+    # failure than the one being fixed here. Observing then discarding costs
+    # one settle per off-site link and is always correct.
+    ok &= check(
+        "a page from another origin is refused, not mapped",
+        observed is not None
+        and not crawler._same_origin("https://example.com/app/", observed.url),
+        "the crawl would record another site's page as a state of this app",
+    )
+    # Every Observation is built in one place. This is what makes "no
+    # Observation exists un-redacted" a claim about six lines rather than a
+    # rule each return site has to remember -- see `Observer._observation`.
+    # Asserted structurally because the next return path is the one that will
+    # forget, and it does not exist yet to be tested behaviourally.
+    from .explorer import observer as observer_mod
+
+    built = _source(observer_mod, "_observation").count("return Observation(")
+    ok &= check(
+        "an Observation is constructed in exactly one place",
+        built == 1,
+        f"{built} construction sites; a property that must hold of all of them "
+        "now has to be repeated, and repeated is where it drifts",
+    )
+
+    ok &= check(
+        "the refusal is on the origin, not on the page being unreadable",
+        crawler._same_origin("https://example.com/a", "https://example.com/b")
+        and not crawler._same_origin("https://example.com/a", "https://luma.com/x"),
+        "_same_origin does not compare hosts the way the bug requires",
+    )
+    return ok
 
 
 def _chat_transcript_checks() -> bool:
@@ -1233,6 +1609,453 @@ def _chat_transcript_checks() -> bool:
         "an ant's transcript is untouched by the chat's seam",
         blocks == ["tool_result"],
         f"answering turn held {blocks}",
+    )
+    return ok
+
+
+def _context_checks() -> bool:
+    """Does the free-text box beside the URL become something the run can use?
+
+    The box is one textarea holding three different kinds of thing -- who to log
+    in as, what to focus on, and statements the user wants tested -- and a model
+    is what tells them apart. So the parse is the seam, and these checks pin the
+    two failures that matter: inventing credentials nobody typed, and losing the
+    ones somebody did.
+    """
+    from .context import Context, parse
+    from .explorer.forms import Credentials
+
+    print("CONTEXT     one textarea, three consumers")
+    ok = True
+
+    typed = (
+        "log in as standard_user / secret_sauce. focus on checkout. "
+        "check that an out-of-stock item can't be added to the cart."
+    )
+
+    class Parser:
+        """Answers the parse exactly as the schema asks."""
+
+        name, model = "scripted:parser", "none"
+
+        def __init__(self) -> None:
+            self.systems: list[str] = []
+
+        def turn(self, system, transcript, tool_defs):
+            self.systems.append(transcript.prompt)
+            return Turn(
+                text="",
+                calls=(
+                    ToolCall(
+                        "1",
+                        "record_context",
+                        {
+                            "username": "standard_user",
+                            "password": "secret_sauce",
+                            "focus": "checkout",
+                            "claims": [
+                                "an out-of-stock item can't be added to the cart"
+                            ],
+                        },
+                    ),
+                ),
+            )
+
+    parser = Parser()
+    parsed = parse(typed, parser)
+
+    ok &= check(
+        "credentials typed in prose reach the crawler",
+        parsed.credentials.username == "standard_user"
+        and parsed.credentials.password == "secret_sauce",
+        f"got {parsed.credentials}",
+    )
+    ok &= check(
+        "the focus survives as steering",
+        parsed.focus == "checkout",
+        f"focus={parsed.focus!r}",
+    )
+    ok &= check(
+        "a statement becomes a claim, not part of the focus prose",
+        parsed.claims == ("an out-of-stock item can't be added to the cart",),
+        f"claims={parsed.claims}",
+    )
+    ok &= check(
+        "the raw text is kept verbatim whatever the model made of it",
+        parsed.raw == typed,
+    )
+    ok &= check(
+        "the model is shown the text it is meant to parse",
+        typed in parser.systems[0],
+    )
+
+    # The timeline is on screen during the demo. Everything else about this box
+    # is stored in the clear on purpose; the one line that gets screenshotted
+    # is not.
+    ok &= check(
+        "the password never appears in the line the timeline prints",
+        "secret_sauce" not in parsed.redacted and "standard_user" in parsed.redacted,
+        f"redacted={parsed.redacted!r}",
+    )
+
+    # Without a model there is nothing to tell a password from a sentence. The
+    # run must fall back to the environment rather than guess -- and must still
+    # be able to say what it ignored.
+    blind = parse(typed, None)
+    ok &= check(
+        "with no model nothing is invented, and the text is still kept",
+        blind.raw == typed
+        and not blind.credentials
+        and blind.focus is None
+        and blind.claims == (),
+        f"got {blind}",
+    )
+
+    class Chatty:
+        """Answers in prose and never calls the tool."""
+
+        name, model = "scripted:chatty", "none"
+
+        def turn(self, system, transcript, tool_defs):
+            return Turn(text="Sure! Here are the credentials I found:")
+
+    prose = parse(typed, Chatty())
+    ok &= check(
+        "a model that answers in prose yields nothing rather than a bad guess",
+        not prose.credentials and prose.claims == (),
+        f"got {prose}",
+    )
+
+    ok &= check(
+        "an empty box costs no model call",
+        parse("   ", Chatty()) == Context(raw=""),
+    )
+
+    # Measured, not imagined: a real run sat on "running" for minutes with two
+    # events on the timeline because this call was the first thing after the
+    # provider was loaded and the model was slow. A parse that fails must cost
+    # the context, not the run -- the crawl behind it needs no model at all.
+    class Broken:
+        name, model = "scripted:broken", "none"
+
+        def turn(self, system, transcript, tool_defs):
+            raise RuntimeError("429 rate limited")
+
+    ok &= check(
+        "a provider that fails costs the context, not the run",
+        parse(typed, Broken()) == Context(raw=typed),
+    )
+
+    # Those two empty results mean opposite things, and the timeline has to be
+    # able to say which. "We could not read your box" is a transient failure
+    # worth retrying; "we read it and there was nothing in it" is a note about
+    # what you typed. Reporting the second when the first happened sends the
+    # user to edit a box that was fine.
+    class Nothing:
+        name, model = "scripted:nothing", "none"
+
+        def turn(self, system, transcript, tool_defs):
+            return Turn(text="", calls=(ToolCall("1", "record_context", {}),))
+
+    ok &= check(
+        "a box the model read and found nothing in says it was read",
+        parse(typed, Nothing()).parsed is True,
+    )
+    ok &= check(
+        "a box the model never managed to read says it was not",
+        parse(typed, Broken()).parsed is False
+        and parse(typed, None).parsed is False,
+    )
+
+    # Precedence. The environment is how the demo machine has always been
+    # configured, and a box left empty must not blank it out; a box that was
+    # filled in must win, because it is the more recent thing a human said.
+    import os
+
+    from .context import credentials_for
+
+    before = {k: os.environ.get(k) for k in ("AIVAR_USERNAME", "AIVAR_PASSWORD")}
+    os.environ["AIVAR_USERNAME"] = "env-user"
+    os.environ["AIVAR_PASSWORD"] = "env-password"
+    try:
+        ok &= check(
+            "an empty box leaves the environment's credentials alone",
+            credentials_for(Context(raw="")).username == "env-user",
+        )
+        ok &= check(
+            "a box with no login in it also leaves them alone",
+            credentials_for(Context(raw="focus on checkout", focus="checkout")).username
+            == "env-user",
+        )
+        ok &= check(
+            "a login typed in the box beats the environment",
+            credentials_for(parsed).username == "standard_user"
+            and credentials_for(parsed).password == "secret_sauce",
+        )
+        # Half a pair is the interesting case: a username in the box and a
+        # password only in the environment must not silently combine into a
+        # login neither source ever described.
+        half = Context(raw="log in as someone", credentials=Credentials("box-user"))
+        ok &= check(
+            "a half-filled login does not borrow the other half from the environment",
+            credentials_for(half).username == "box-user"
+            and credentials_for(half).password is None,
+            f"got {credentials_for(half)}",
+        )
+    finally:
+        for key, value in before.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    # The four call sites in `explore.py` used to read the environment
+    # directly. Every one of them has to go through the context now, or the box
+    # is a form that changes nothing.
+    from app.routers import explore as explore_router
+
+    ok &= check(
+        "no stage of a run reads credentials behind the context's back",
+        "Credentials.from_env()" not in _source(explore_router, "def _explore"),
+        "explore.py still calls Credentials.from_env() directly",
+    )
+
+    # Parity again, and the same shape of bug as the synthesizer one: a
+    # capability wired into one walker and not the other.
+    #
+    # Measured on this workspace's artifacts directory: runs 3-13 wrote 3-9
+    # screenshots each, runs 14 onward wrote exactly one. What changed is that
+    # the console now crawls deterministically *first* and hands the map to the
+    # colony -- so the crawler discovers nearly every state, and the crawler was
+    # the call that had no camera. Every card on the map read "no capture".
+    ok &= check(
+        "every crawl the console starts is handed a camera",
+        _crawls_without_shot(explore_router) == [],
+        f"crawler.crawl called without shot= at line(s) "
+        f"{_crawls_without_shot(explore_router)}",
+    )
+    return ok
+
+
+def _crawls_without_shot(module) -> list[int]:
+    """Line numbers of `crawler.crawl(...)` calls given no `shot=`.
+
+    Parsed rather than grepped: the argument list spans a dozen lines and a
+    substring search for "shot" finds the one in the *next* call down.
+    """
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(module))
+    missing = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr == "crawl"):
+            continue
+        if not any(kw.arg == "shot" for kw in node.keywords):
+            missing.append(node.lineno)
+    return missing
+
+def _claim_checks() -> bool:
+    """A statement the user typed must end up with a verdict, or with a reason.
+
+    The temptation here is to let a model write a scenario for the claim. It
+    cannot: a `Scenario`'s `Expectation` is *measured* -- computed from the diff
+    between two states the crawl actually observed -- and that measurement is
+    the only reason `runner.py` can tell a moved button from a broken checkout.
+    An invented expectation is one nothing ever observed, so its failure would
+    be unclassifiable, on precisely the test the user cared most about.
+
+    So the model does what `critic.prioritise` does: it points at things it was
+    given, by index, and anything it invents is counted and dropped.
+    """
+    from .claims import attribute, gaps_for
+    from .generator import Scenario, Step
+    from .generator import Expectation
+
+    print("CLAIMS      the user's own sentence, given a verdict or a reason")
+    ok = True
+
+    def scenario(name: str) -> Scenario:
+        expect = Expectation(
+            moved=True, mutating=False, added=(), removed=(), to_key="b" * 16
+        )
+        return Scenario(
+            name=name,
+            target_url="http://localhost:3000/sut",
+            steps=(
+                Step(
+                    intent=name,
+                    action="button:Add to cart",
+                    from_key="a" * 16,
+                    fields=(),
+                    expect=expect,
+                ),
+            ),
+        )
+
+    plan = (
+        scenario("complete the sign-in form and submit it"),
+        scenario("add an out-of-stock item to the cart"),
+    )
+    claims = ("an out-of-stock item can't be added to the cart",)
+
+    class Attributor:
+        name, model = "scripted:attributor", "none"
+
+        def __init__(self, entries):
+            self.entries = entries
+            self.prompts: list[str] = []
+
+        def turn(self, system, transcript, tool_defs):
+            self.prompts.append(transcript.prompt)
+            return Turn(
+                text="",
+                calls=(ToolCall("1", "attribute", {"matches": self.entries}),),
+            )
+
+    good = Attributor([{"claim": 0, "scenarios": [1]}])
+    covered = attribute(claims, plan, good)
+    ok &= check(
+        "a claim is matched to the scenario that exercises it",
+        covered == {claims[0]: (1,)},
+        f"got {covered}",
+    )
+    ok &= check(
+        "the model is shown both the claims and the scenarios it may cite",
+        claims[0] in good.prompts[0] and plan[1].name in good.prompts[0],
+    )
+
+    # The extractive requirement, same as the critic's. A scenario index that
+    # does not exist is a scenario the model made up, and a claim "covered" by
+    # one is worse than an uncovered claim: it reports a pass nobody ran.
+    invented = attribute(claims, plan, Attributor([{"claim": 0, "scenarios": [7, -1]}]))
+    ok &= check(
+        "a cited scenario that does not exist is dropped, not trusted",
+        invented == {claims[0]: ()},
+        f"got {invented}",
+    )
+    ok &= check(
+        "a claim the model did not answer for is unmatched, not absent",
+        attribute(claims, plan, Attributor([])) == {claims[0]: ()},
+    )
+
+    class Chatty:
+        name, model = "scripted:chatty", "none"
+
+        def turn(self, system, transcript, tool_defs):
+            return Turn(text="Scenario 2 looks like a good match!")
+
+    ok &= check(
+        "prose naming a scenario is not an attribution",
+        attribute(claims, plan, Chatty()) == {claims[0]: ()},
+    )
+    ok &= check(
+        "with no model every claim is unmatched rather than guessed",
+        attribute(claims, plan, None) == {claims[0]: ()},
+    )
+    ok &= check(
+        "no claims means no model call",
+        attribute((), plan, Chatty()) == {},
+    )
+
+    # An unmatched claim is the honest outcome, and it has to be visible. A
+    # claim that quietly vanishes reports a green suite over the one question
+    # the user actually asked.
+    gaps = gaps_for(attribute(claims, plan, Attributor([])))
+    ok &= check(
+        "an unmatched claim becomes a gap",
+        len(gaps) == 1 and gaps[0].kind == "unmatched-claim",
+        f"got {gaps}",
+    )
+    ok &= check(
+        "the gap quotes the claim, so the report says what was asked",
+        claims[0] in gaps[0].why,
+        f"why={gaps[0].why!r}",
+    )
+    ok &= check(
+        "a claim with no citation carries no citation, rather than a fake one",
+        gaps[0].state_key == "" and gaps[0].action == "",
+        f"citation={gaps[0].citation}",
+    )
+    ok &= check(
+        "a matched claim is not also a gap",
+        gaps_for(covered) == (),
+    )
+
+    # `addressable` decides whether spending more budget is a decision or a
+    # loop. An unmatched claim is the one gap kind a *steered* re-exploration
+    # can close, because the claim itself is the steer.
+    from .critic import Gap
+    from .pipeline import addressable
+
+    ok &= check(
+        "another wave, aimed at the claim, is worth spending",
+        addressable(gaps, has_synthesizer=False) == gaps,
+        "an unmatched claim is not reachable by exploring again",
+    )
+    ok &= check(
+        "an unreachable action is still not worth another wave",
+        addressable(
+            (Gap(kind="unreachable-action", state_key="a", where="", action="x", why=""),),
+            has_synthesizer=True,
+        )
+        == (),
+    )
+
+    # `scenarios()` caps the suite and interleaves it for fairness across kinds
+    # of action, which is right for a suite nobody asked anything specific of.
+    # A claim is somebody asking something specific, so the scenario answering
+    # it must not be the one fairness dropped.
+    from .claims import claimed_by, with_claimed
+
+    capped = plan[:1]
+    ok &= check(
+        "a claim's scenario is added to a suite the cap had dropped it from",
+        with_claimed(capped, plan, {claims[0]: (1,)}) == (plan[0], plan[1]),
+        f"got {[s.name for s in with_claimed(capped, plan, {claims[0]: (1,)})]}",
+    )
+    ok &= check(
+        "a claim's scenario already in the suite is not run twice",
+        with_claimed(plan, plan, {claims[0]: (1,)}) == plan,
+    )
+    ok &= check(
+        "no claims leaves the suite exactly as the generator ranked it",
+        with_claimed(capped, plan, {}) == capped,
+    )
+
+    # The point of all of it: the sentence the user typed comes back with the
+    # verdict of the test that answered it.
+    ok &= check(
+        "a claim reports the verdict of the scenario that covered it",
+        claimed_by({claims[0]: (1,)}, plan) == {claims[0]: (plan[1].name,)},
+        f"got {claimed_by({claims[0]: (1,)}, plan)}",
+    )
+    ok &= check(
+        "an uncovered claim names no scenario rather than the nearest one",
+        claimed_by({claims[0]: ()}, plan) == {claims[0]: ()},
+    )
+
+    # Whether to spend a second wave. `pipeline.addressable` calls an unmatched
+    # claim explorable because the claim is itself the steer -- but only a model
+    # can be steered, and without one every claim is unmatched by definition.
+    # Retrying then is the loop `addressable` exists to prevent.
+    from .claims import steer
+
+    ok &= check(
+        "an uncovered claim is worth one more wave, aimed at it",
+        steer({claims[0]: ()}, good) == claims,
+    )
+    ok &= check(
+        "a covered claim does not buy another wave",
+        steer({claims[0]: (1,)}, good) == (),
+    )
+    ok &= check(
+        "with no model there is nothing to steer, so nothing to spend",
+        steer({claims[0]: ()}, None) == (),
+        "a model-free run would re-crawl for every claim it could never match",
     )
     return ok
 

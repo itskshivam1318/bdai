@@ -1,3 +1,5 @@
+import { activeKey, loadSettings, type ProviderSpec } from "./settings";
+
 // Base URL is injected per worktree so the browser bundle talks to the API of
 // the stack it was served from, not whatever happens to own port 8000.
 export const API_BASE =
@@ -5,11 +7,47 @@ export const API_BASE =
 
 export const WORKTREE = process.env.NEXT_PUBLIC_WORKTREE ?? "main";
 
+/**
+ * The caller's own model credentials, if Advanced holds any.
+ *
+ * Attached to every request rather than to the three that start model work: the
+ * browser has one `request()` and the server has one dependency reading these
+ * (`app/byok.py`), and a header nobody reads costs nothing. Deciding *here*
+ * which endpoints need a key would put that list in a second place, and the
+ * second place is the one that goes stale.
+ *
+ * Empty strings are omitted, not sent — an empty header is a header, and the
+ * server would have to tell it apart from an absent one.
+ */
+function byokHeaders(): Record<string, string> {
+  if (typeof window === "undefined") return {};
+  const settings = loadSettings();
+  // A model id belongs to exactly one provider, so an id with no provider
+  // beside it is not a preference we can honour — the server would pair it with
+  // whichever key its `.env` happens to hold and 404 on the first call. All
+  // three headers or none.
+  if (!settings.provider) return {};
+
+  const key = activeKey(settings);
+  const headers: Record<string, string> = {
+    "X-AIVAR-Provider": settings.provider,
+  };
+  if (key) headers["X-AIVAR-Key"] = key;
+  if (settings.model) headers["X-AIVAR-Model"] = settings.model;
+  return headers;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
-    headers: { "Content-Type": "application/json" },
     cache: "no-store",
     ...init,
+    // After the spread, not before: a caller passing `headers` would otherwise
+    // drop the content type and the keys along with it.
+    headers: {
+      "Content-Type": "application/json",
+      ...byokHeaders(),
+      ...init?.headers,
+    },
   });
   if (!res.ok) {
     // FastAPI puts the reason in `detail`, and for the chat endpoint that
@@ -32,6 +70,13 @@ export type TestSession = {
   id: number;
   target_url: string;
   name: string | null;
+  /**
+   * Whatever the tester typed beside the URL: who to log in as, what to focus
+   * on, statements they want checked. One box, sorted into fields per run by
+   * `agents/context.py` -- the browser never parses it and never should, since
+   * what it means depends on which model is answering.
+   */
+  context: string | null;
   created_at: string;
 };
 
@@ -240,17 +285,33 @@ export const artifactUrl = (path: string) => `${API_BASE}/artifacts/${path}`;
 export const api = {
   health: () => request<{ status: string; worktree: string }>("/health"),
 
+  /**
+   * Which providers this server can be pointed at, and which it already has a
+   * key for. The catalogue lives in `agents/llm/catalog.py`; fetching it is
+   * what stops the dialog offering a model the backend cannot construct.
+   */
+  listProviders: () =>
+    request<{ providers: ProviderSpec[] }>("/api/providers").then(
+      (body) => body.providers,
+    ),
+
   listSessions: () => request<SessionSummary[]>("/api/sessions"),
-  createSession: (target_url: string) =>
+  createSession: (target_url: string, context?: string) =>
     request<TestSession>("/api/sessions", {
       method: "POST",
-      body: JSON.stringify({ target_url }),
+      body: JSON.stringify({ target_url, context: context || null }),
     }),
   getSession: (id: number) => request<TestSession>(`/api/sessions/${id}`),
   renameSession: (id: number, name: string) =>
     request<TestSession>(`/api/sessions/${id}`, {
       method: "PATCH",
       body: JSON.stringify({ name }),
+    }),
+  /** Editable after the fact: a mistyped password should not cost the map. */
+  setSessionContext: (id: number, context: string) =>
+    request<TestSession>(`/api/sessions/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ context: context || null }),
     }),
   deleteSession: (id: number) =>
     request<void>(`/api/sessions/${id}`, { method: "DELETE" }),

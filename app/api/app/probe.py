@@ -16,6 +16,7 @@ import tempfile
 from fastapi.testclient import TestClient
 from sqlmodel import Session, SQLModel, create_engine
 
+from .db import _add_missing_columns as add_missing_columns
 from .db import get_session
 from .main import app
 from .models import AppState, Run, StateTransition, TestCase
@@ -152,7 +153,79 @@ def main() -> int:
             client.get("/api/runs/424242/map").status_code == 404,
         )
 
+        # The second input. It belongs to the session rather than the run: it
+        # is what you know about the app, and that does not change between two
+        # runs against it. Which also means it has to survive a re-run without
+        # being retyped, and has to be editable when the password has a typo.
+        created = client.post(
+            "/api/sessions",
+            json={
+                "target_url": "http://localhost:3000/sut",
+                "context": "log in as demo / hunter2",
+            },
+        ).json()
+        ok &= check(
+            "a session remembers the context typed beside its URL",
+            created.get("context") == "log in as demo / hunter2",
+            f"got {created.get('context')!r}",
+        )
+        ok &= check(
+            "a URL on its own is still a whole session",
+            client.post(
+                "/api/sessions", json={"target_url": "http://localhost:3000/sut"}
+            ).json()["context"]
+            is None,
+        )
+        patched = client.patch(
+            f"/api/sessions/{created['id']}",
+            json={"context": "log in as demo / hunter3"},
+        ).json()
+        ok &= check(
+            "a mistyped password can be fixed without a new session",
+            patched["context"] == "log in as demo / hunter3",
+            f"got {patched.get('context')!r}",
+        )
+        ok &= check(
+            "the fix is what a reload sees",
+            client.get(f"/api/sessions/{created['id']}").json()["context"]
+            == "log in as demo / hunter3",
+        )
+
         app.dependency_overrides.clear()
+
+    # A database that predates the context column must gain it rather than be
+    # deleted. Twenty minutes of crawled map is the thing `rm app.db` costs, and
+    # it is exactly what a demo is standing on.
+    with tempfile.TemporaryDirectory() as tmp:
+        old_shape = create_engine(f"sqlite:///{tmp}/old.db")
+        with old_shape.connect() as conn:
+            conn.exec_driver_sql(
+                "CREATE TABLE testsession (id INTEGER PRIMARY KEY, "
+                "target_url VARCHAR, name VARCHAR, created_at DATETIME)"
+            )
+            conn.exec_driver_sql(
+                "INSERT INTO testsession (target_url) VALUES ('http://old')"
+            )
+            conn.commit()
+
+        add_missing_columns(old_shape)
+
+        with old_shape.connect() as conn:
+            columns = {
+                row[1]
+                for row in conn.exec_driver_sql("PRAGMA table_info(testsession)")
+            }
+            surviving = list(conn.exec_driver_sql("SELECT target_url FROM testsession"))
+        ok &= check(
+            "an existing session table gains the context column",
+            "context" in columns,
+            f"columns were {sorted(columns)}",
+        )
+        ok &= check(
+            "and the sessions already in it are still there",
+            surviving == [("http://old",)],
+            f"got {surviving}",
+        )
 
     print()
     return 0 if ok else 1

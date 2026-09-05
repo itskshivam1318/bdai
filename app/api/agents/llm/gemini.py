@@ -24,13 +24,20 @@ import uuid
 
 from . import Exchange, Tool, ToolCall, Transcript, Turn
 
-DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+# `GEMINI_MODEL` is honoured by `llm.load` against the catalogue, which is the
+# same list the console's model select shows -- see `catalog.py`. This constant
+# is the fallback for constructing `Gemini` directly.
+from .catalog import BY_ID  # noqa: E402
+
+DEFAULT_MODEL = os.environ.get("GEMINI_MODEL") or BY_ID["google"].default_model
 
 
 class Gemini:
     name = "gemini"
 
-    def __init__(self, model: str = DEFAULT_MODEL, notify=None) -> None:
+    def __init__(
+        self, model: str | None = None, notify=None, api_key: str | None = None
+    ) -> None:
         # Called when a request is retried. Waiting silently for half a minute
         # is indistinguishable from hanging, and a UI watching an event stream
         # shows nothing at all -- so the wait has to announce itself.
@@ -43,11 +50,16 @@ class Gemini:
                 "uv add google-genai"
             ) from exc
 
-        key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        # Passed in by the console's Advanced panel, or the server's own.
+        key = (
+            api_key
+            or os.environ.get("GEMINI_API_KEY")
+            or os.environ.get("GOOGLE_API_KEY")
+        )
         if not key:
             raise RuntimeError("GEMINI_API_KEY is not set")
 
-        self.model = model
+        self.model = model or DEFAULT_MODEL
         self._genai = genai
         self._client = genai.Client(api_key=key)
 

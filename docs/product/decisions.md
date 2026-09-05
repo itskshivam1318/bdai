@@ -530,3 +530,180 @@ recorded in one is not visible in the other.
 **Evidence:** the two-variable override above, run against `app.config` directly.
 
 **Who:** shivam + Claude.
+
+---
+
+## 2026-09-05 09:15 — Bring your own key: a provider, a key, and a model that all mean the same thing on both sides
+
+The Advanced panel already existed and was a **prop**. It wrote two keys and a
+model into `localStorage`; nothing read them. `grep -rn loadSettings web/`
+returned one hit, its own definition. A demo where someone pastes a key, presses
+Save and watches the run use ours is worse than no panel, because it looks like
+it worked.
+
+**Four providers, and one of them is four.** `claude` and `google` are the two
+native SDKs. `openrouter` and `sarvam` are the same `OpenAICompat` class behind
+two base URLs -- which is why adding Sarvam cost a table row and a `key_env`
+rather than an integration.
+
+**The catalogue is one table, read by both sides.** `agents/llm/catalog.py`
+holds the providers, their key variables, their models and their cheap default;
+`load()` resolves against it and `GET /api/providers` serves it to the dialog.
+The alternative is a `MODELS` array in `SettingsDialog.tsx` next to an `if
+provider ==` ladder in `load()` -- two lists that drift, where the drift is
+invisible until someone picks a model the backend cannot build.
+
+That is not hypothetical. Writing the check "every provider's default model is
+one it lists" found the existing form of exactly this bug: `claude.py` carried
+`DEFAULT_MODEL = "claude-opus-5"` while the catalogue's cheap default was Haiku,
+so the dialog would have shown *Claude Haiku 4.5 (default)* over a run that
+called Opus -- a 38x cost difference, visible only in one line of the timeline.
+`DEFAULT_MODEL` in all three provider modules is now read from the catalogue.
+
+**Claude's default model changes: `claude-opus-5` -> `claude-haiku-4-5`.** This
+is a behaviour change to `make pipeline`, `make gaps` and anything else that
+calls `load()` with no model on an `ANTHROPIC_API_KEY`. It follows the cost
+argument this repo has already made twice and measured once: ~78 model calls per
+colony run, ~$3.42 on Opus against ~$0.09 on a cheap route. Opus is one select
+away and `ANTHROPIC_MODEL` is not consulted; pass `model=` to pin it.
+
+**Keys travel as request headers, not as body fields.** Three endpoints start
+model work -- explore, dispatch an ant, answer a chat -- and each already has a
+request model describing the *task*. Which key pays for it is not part of any of
+those questions. `X-AIVAR-Provider` / `-Key` / `-Model` are read by one
+dependency (`app/byok.py`) and attached by one `request()` in `lib/api.ts`, so
+the count of places that know about this is two.
+
+**A brought key is passed down the call, never exported.** Writing it to
+`os.environ` is the shorter fix and it is wrong: FastAPI runs `_explore` in a
+worker thread of one shared process, so two runs started a second apart would
+have the second person's key driving the first person's colony. `agents.probe`
+asserts the environment is untouched after `load()`.
+
+**A key with no provider is refused rather than guessed.** We cannot tell an
+Anthropic key from an OpenRouter one by looking at it, and guessing wrong spends
+someone's credit at the wrong vendor. Both layers refuse it -- the dependency
+with a 400 so the dialog hears about it, `load()` with a `ValueError` so a
+non-HTTP caller does too.
+
+**Nothing is stored.** No row, no log line, no `.env` write. `Choice.redacted`
+is what reaches an `Event`, because a timeline that prints a key is a timeline
+someone screenshots. The probe compares the served catalogue against the real
+environment and fails if any key's *contents* appear in it.
+
+**Checks:** 16 new in `agents.probe` under `BYOK` (153 PASS / 0 FAIL overall).
+Live, against the running stack: a bogus Sarvam key returns
+`invalid_api_key_error` from `api.sarvam.ai` -- which is also the evidence that
+its base URL and bearer auth are right; a bogus Claude key returns Anthropic's
+401; an unknown provider returns the 400 naming the four; no headers falls back
+to the server's OpenRouter key. In the browser, the dialog's saved state leaves
+as `X-AIVAR-Provider: sarvam` / `-Key` / `-Model` on the console's own poll.
+
+**Found while checking:** Custom model entry could not be opened. Choosing
+`Custom…` seeded the box with the currently selected id, which was a *listed*
+id, so a flag derived from "is this model unlisted" closed the box on the frame
+it opened. Custom-open is now its own state.
+
+**Who:** shivam + Claude.
+
+## The reply ceiling is per model, and a truncated reply says so
+
+**What was wrong.** `openai_compat.py` sent `max_tokens: 4096` on every request
+to every model, and `claude.py` hardcoded the same number. Against the models
+the catalogue offers that is 14% of what `qwen3-coder-next` will emit and 0.4%
+of `minimax-m3`. Nothing anywhere read `finish_reason`, so a reply that hit the
+ceiling arrived as a stump and was consumed as a finished answer -- which is why
+this presented as "the summaries feel shallow" rather than as a configuration
+error. The one call that suffers most is `finish`, the only call that returns
+every flow *and* the summary in a single reply.
+
+**Why 4096 was there.** A real 402: a paid route reserves the full `max_tokens`
+against the balance before it starts, so a nearly-empty account refuses a large
+request outright. The constant was lowered to route around a spent key and the
+comment above it said to raise it back "once credits allow" -- which no comment
+can ever do. A mitigation with no expiry is permanent.
+
+**The number now lives in `catalog.py`**, per model, beside the model. It is
+deliberately *not* the model's advertised cap: `max_tokens` plus the prompt must
+fit the context window and the provider errors rather than clamping, and the
+ceiling doubles as a per-call spend ceiling. 32768 leaves >120k of context
+headroom on every listed model against the largest transcript this repo has
+ever recorded (~8.4k tokens, measured across 466 files). DeepSeek's true cap of
+16384 is below that budget, so it wins; an uncatalogued model from the dialog's
+free-text box gets `FALLBACK_MAX_OUTPUT`, the lowest true cap we have seen.
+
+**`LLM_MAX_TOKENS` survives** as the override for the emergency that produced
+the original 4096 -- a spent key, where a low ceiling trades truncated replies
+for a run that happens at all. The 402 now names it in the error rather than
+leaving the raw provider body to be read as a bug in the request.
+
+**Checks:** 5 new in `agents.probe` under `BYOK` (154 PASS / 0 FAIL overall),
+including a stubbed `_post` that proves the request carries the model's own
+ceiling and that `finish_reason: "length"` produces a warning rather than a
+silent stump. Live against OpenRouter: `minimax-m3:free` returns `READY` at
+`max_tokens=32768`; the same route at `LLM_MAX_TOKENS=24` truncates mid-word and
+emits `the reply hit the 24-token ceiling and was cut off`.
+
+**Found while checking:** the key is out of credit, and this is the more urgent
+finding. `GET /api/v1/key` reports `limit_remaining: 9.80`, but that is the
+key's *spend cap*, not the balance -- the account affords **268 output tokens**,
+so on a paid route even the old 4096 was already 402ing. Free routes are not
+reserved against and take the full ceiling. Paid OpenRouter is down until it is
+topped up; `minimax/minimax-m3:free` is the working route.
+
+**Who:** shivam + Claude.
+
+---
+
+## 2026-09-05 10:00 — A document between states is a normal thing to meet, not a reason to end a run
+
+A console run of `practicetestautomation.com/practice-test-login/` ended in
+`error` after five states:
+
+    Locator.aria_snapshot: Selector "body" does not match any element
+
+**Root cause, reproduced.** That site's "AI Workshop" link leaves for
+`luma.com`. While a cross-origin document is committing there is no `body` to
+snapshot, and `Observer.observe()` assumed one. Clicking that link and polling
+`body` reproduced the empty window **3 times in 6 attempts**. It is not about
+content type -- every destination on that site serves `text/html` with a body
+once settled; it is about *when* we look.
+
+**Two defects compose, and only one was fixed.**
+
+`crawler.py` calls `observer.observe()` at line 279 and `_same_origin` at line
+282. The rule that refuses off-site destinations is correct and cannot fire,
+because observing the foreign page raises first. A correct policy one line too
+late is indistinguishable from no policy.
+
+The fix is in `observe()`, not in the ordering. It now waits for a `body` on the
+same patience budget it already spends on instability, and returns an *empty*
+Observation if none arrives -- which the crawler's origin check then refuses on
+the very next line. The ordering was deliberately left alone: moving the origin
+test above `observe()` would save one settle per off-site link, but it reads
+`page.url` before navigation has necessarily committed, and a false refusal
+silently drops a legitimate state from the map. That is a worse failure than the
+one being fixed. Observing and discarding is always correct.
+
+This follows the rule `observe()` already stated for its stability loop:
+returning without agreement "is not a failure and is not raised". A page between
+documents is the same kind of fact.
+
+**Measured, same URL, same budget:** before, 5 states / 5 transitions / `error`.
+After, 15 states / 36 transitions / 8 scenarios / `failed` -- 5 passed, 2 defect,
+1 escalate, 1 gap, 8 rows persisted. `failed` is a verdict; `error` was a crash.
+
+**Checks:** 5 new in `agents.probe` under `NAVIGATION`, offline and
+deterministic -- the bodyless document is built by removing the element rather
+than by racing a real navigation, and one check asserts the reproduction really
+reproduced so the rest cannot pass vacuously. 207 PASS / 0 FAIL overall.
+
+**Also corrected:** the provider catalogue shipped `minimax/m3:free`, which
+OpenRouter answers with *"is not a valid model ID"*. The real id is
+`minimax/minimax-m3:free`, verified against `GET /openrouter/api/v1/models`.
+This is the drift the catalogue exists to prevent, in the catalogue itself --
+the check that would have caught it must compare against the live model list,
+and does not exist, because the probe is offline by design. Left as a known gap
+rather than making `make probe` need the internet.
+
+**Who:** shivam + Claude.

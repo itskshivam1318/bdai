@@ -14,23 +14,39 @@ import os
 
 from . import Exchange, Tool, ToolCall, Transcript, Turn
 
-# Default per the Anthropic API guidance bundled with this repo's tooling.
-# Overridable because the ants are worker threads and a cheaper model may be
-# the right call for a long crawl -- but that is a decision to make with a
-# measurement, not a default to assume.
-DEFAULT_MODEL = "claude-opus-5"
+# One answer, and it lives in the catalogue that the console's model select is
+# also drawn from -- see `catalog.py`. It was `claude-opus-5` here while the
+# dialog offered something else, which is a disagreement a run reports only in
+# the one line naming the model it actually used.
+#
+# The measurement that settles which: a colony run is ~78 model calls, ~$3.42
+# on Opus against ~$0.09 on a cheap route. Opus is still one option away.
+from .catalog import BY_ID, max_output_for  # noqa: E402
+
+DEFAULT_MODEL = BY_ID["claude"].default_model
 
 
 class Claude:
     name = "claude"
 
-    def __init__(self, model: str = DEFAULT_MODEL) -> None:
+    def __init__(self, model: str | None = None, api_key: str | None = None) -> None:
         import anthropic
 
-        if not os.environ.get("ANTHROPIC_API_KEY"):
+        # A key passed in comes from the console's Advanced panel and belongs to
+        # this run only, so it is handed to the client rather than exported --
+        # see the note in `llm.load`. Absent one we fall back to the server's.
+        key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+        if not key:
             raise RuntimeError("ANTHROPIC_API_KEY is not set")
-        self.model = model
-        self._client = anthropic.Anthropic()
+        self.model = model or DEFAULT_MODEL
+        # Anthropic *requires* `max_tokens`, so this cannot be omitted the way
+        # a chat-completions call could; the number comes from the same table
+        # the OpenRouter path reads, so "how long may one reply be" has one
+        # answer per model rather than one per provider class. See
+        # `openai_compat.MAX_TOKENS_ENV` for why the override exists.
+        override = os.environ.get("LLM_MAX_TOKENS")
+        self.max_tokens = int(override) if override else max_output_for(self.model)
+        self._client = anthropic.Anthropic(api_key=key)
 
     def _messages(self, transcript: Transcript) -> list[dict]:
         """Neutral transcript -> Anthropic's message shape.
@@ -84,7 +100,7 @@ class Claude:
     ) -> Turn:
         response = self._client.messages.create(
             model=self.model,
-            max_tokens=4096,
+            max_tokens=self.max_tokens,
             system=system,
             thinking={"type": "adaptive"},
             tools=[

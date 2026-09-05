@@ -77,7 +77,11 @@ from .runner import run as replay
 #                           less. Closing it is a change to `normalize()`.
 #   unreachable-action      an empty cell of the state table. You cannot click
 #                           a control that is not rendered.
-_EXPLORABLE = {"untaken-action", "unexercised-partition"}
+#   unmatched-claim         the user asked for something the suite does not
+#                           test. Explorable in a way most kinds are not: the
+#                           claim is itself the steer for the next wave, so the
+#                           second attempt is aimed rather than merely longer.
+_EXPLORABLE = {"untaken-action", "unexercised-partition", "unmatched-claim"}
 
 
 @dataclass(frozen=True)

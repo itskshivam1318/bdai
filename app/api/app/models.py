@@ -29,6 +29,23 @@ class TestSession(SQLModel, table=True):
     target_url: str
     # Null until someone renames it; the UI shows "Untitled session".
     name: Optional[str] = None
+    # What the tester typed beside the URL, verbatim: credentials, focus, and
+    # statements they want checked, all in one box. Parsed per run by
+    # `agents.context.parse` rather than on the way in, because the parse needs
+    # a model and the model is chosen at explore time, not at session creation.
+    #
+    # Stored as typed, including passwords, and that is a decision rather than
+    # an oversight -- this is a hackathon tool pointed at test accounts, and
+    # encrypting one column while the rest of the row is plaintext would claim a
+    # posture nothing here has.
+    #
+    # It is deliberately *not* justified by "the snapshot leaks it anyway".
+    # That was true when this column was added and is being fixed on
+    # `work/agent-forensics` (cac872e redacts credentials inside `observe()`, so
+    # they stop reaching `StateObservation` at all). Once that lands this column
+    # is the one place a password is kept on purpose -- which is the thing to
+    # know before anyone points this at something real.
+    context: Optional[str] = None
     created_at: datetime = Field(default_factory=utcnow)
 
 

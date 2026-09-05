@@ -34,18 +34,24 @@ def init_db() -> None:
 # app.db` is still the tool for that.
 _ADDED_COLUMNS: dict[str, list[tuple[str, str]]] = {
     "chatmessage": [("thread_id", "INTEGER")],
+    "testsession": [("context", "TEXT")],
 }
 
 
-def _add_missing_columns() -> None:
+def _add_missing_columns(target=None) -> None:
     """The narrowest thing that deserves the name migration.
 
     A hackathon database is disposable right up until it holds the map of a
     twenty-minute crawl, and then deleting it to add a nullable column costs the
     demo. This adds the column instead, and does nothing at all on a fresh
     database where `create_all` has already put it there.
+
+    `target` exists so `app.probe` can point this at a deliberately old-shaped
+    database and watch the column appear. Production callers pass nothing and
+    get the module engine, which is the only one this should ever touch by
+    default.
     """
-    with engine.connect() as conn:
+    with (target or engine).connect() as conn:
         for table, columns in _ADDED_COLUMNS.items():
             existing = {
                 row[1]

@@ -1,6 +1,6 @@
 """Bounded exploration: walk an app and build a behavioural model of it.
 
-Seven modules. The five that build the map call no model at all:
+Eight modules. The six that build the map call no model at all:
 
     observer.py   live page   -> Observation (a11y tree + network + elements)
     statekey.py   Observation -> a stable identity for "which state is this?"

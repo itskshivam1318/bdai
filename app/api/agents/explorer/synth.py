@@ -137,9 +137,19 @@ class Synthesizer:
     decided to type and overrule it by editing the file.
     """
 
-    def __init__(self, cache_path: Path | None = None, model: str = MODEL) -> None:
+    def __init__(
+        self,
+        cache_path: Path | None = None,
+        model: str = MODEL,
+        api_key: str | None = None,
+    ) -> None:
         self.model = model
         self.cache_path = cache_path
+        # Anthropic-only, so this is set only when the caller's chosen provider
+        # *is* Claude. A run brought here on an OpenRouter key falls back to the
+        # mutation table and prints "PAYLOADS n from fallback", which is the
+        # honest outcome -- see the module docstring.
+        self.api_key = api_key
         self._cache: dict[str, dict] = {}
         self._client = None
 
@@ -156,11 +166,12 @@ class Synthesizer:
         than an abort.
         """
         if self._client is None:
-            if not os.environ.get("ANTHROPIC_API_KEY"):
+            key = self.api_key or os.environ.get("ANTHROPIC_API_KEY")
+            if not key:
                 return None
             from anthropic import Anthropic
 
-            self._client = Anthropic()
+            self._client = Anthropic(api_key=key)
 
         listing = "\n".join(f"  - {role} {name!r}" for role, name in fields)
 

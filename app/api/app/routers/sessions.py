@@ -77,7 +77,7 @@ def update_session(
     if row is None:
         raise HTTPException(404, "session not found")
     for key, value in patch.items():
-        if key in {"name", "target_url"}:
+        if key in {"name", "target_url", "context"}:
             setattr(row, key, value)
     session.add(row)
     session.commit()

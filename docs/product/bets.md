@@ -264,3 +264,29 @@ a second, separable step — and unnecessary until the reasons are visible.
 organiser.
 
 **Decision:** PENDING
+
+## Should a long transcript be summarised before it is sent?
+
+**No, and there is a number that says when to revisit.** Measured across all 466
+recorded transcripts in `app/api/artifacts/transcripts/`, the largest prompt
+this repo has ever sent is ~8,365 tokens. Against `qwen3-coder-next`'s 262,144
+context that is 3.2%; against `minimax-m3`'s 1,048,576 it is 0.8%. Summarisation
+is compression for a container that is 97% empty.
+
+The cost of adding it anyway is asymmetric. Summarisation is lossy, and what it
+would drop first is a11y-snapshot detail -- the exact material an ant uses to
+choose its next locator. That is a quality regression with no observable check
+capable of catching it, which is the failure this repo's third operating
+principle exists to prevent. A run would not fail; it would quietly get worse.
+
+**Revisit when** a recorded prompt crosses ~50% of the target model's context.
+The cheap precursor is measurement, not compression: every chat-completions
+response carries a `usage` block and nothing reads it. Recording
+`usage.prompt_tokens` per call turns "should we summarise" from an argument into
+a graph. That is a separable step and it is the one to do first.
+
+**Timebox:** 20 minutes for the `usage` recording. Summarisation itself: not
+scheduled.
+
+**Decision:** NO -- measure first. See "The reply ceiling is per model" in
+`decisions.md` for why the ceiling, not the context, was the actual limit.

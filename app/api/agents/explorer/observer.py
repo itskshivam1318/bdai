@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
+from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page
 
 from .noise import is_foreign
@@ -272,23 +273,85 @@ class Observer:
         observing it unstably. The instability then shows up where it should --
         as a nondeterministic edge in the map.
         """
-        self.page.wait_for_timeout(settle_ms)
-        snapshot = self.page.locator("body").aria_snapshot(mode="ai")
-
         deadline = time.monotonic() + (patience_ms / 1000)
+
+        self.page.wait_for_timeout(settle_ms)
+        snapshot = self._snapshot()
+
+        # A document that is still committing has no `body` yet. Wait for one
+        # on the same patience budget as instability, since it is the same
+        # question -- has this page finished becoming itself?
+        while snapshot is None and time.monotonic() < deadline:
+            self.page.wait_for_timeout(settle_ms)
+            snapshot = self._snapshot()
+
+        if snapshot is None:
+            # Still nothing to read. Report the page as empty rather than
+            # raising: an explorer meets documents between states as a matter of
+            # course -- a click that leaves the site, a redirect mid-commit --
+            # and one of them must not end a crawl that has already mapped
+            # everything before it. Measured 2026-09-05 on
+            # practicetestautomation.com, whose "AI Workshop" link leaves for
+            # luma.com: five states mapped, then the run died `error`.
+            #
+            # Empty is also the honest answer. `elements=()` is what the caller
+            # already reads as "nothing to act on here", and the crawler's
+            # origin check refuses the URL immediately afterwards.
+            self._recording = False
+            return self._observation("")
+
         while time.monotonic() < deadline:
             self.page.wait_for_timeout(settle_ms)
-            again = self.page.locator("body").aria_snapshot(mode="ai")
-            if state_key(again) == state_key(snapshot):
+            again = self._snapshot()
+            if again is None or state_key(again) == state_key(snapshot):
                 break
             snapshot = again
 
         self._recording = False
 
+        return self._observation(snapshot)
+
+    def _observation(self, snapshot: str) -> Observation:
+        """The one place an Observation is built.
+
+        Both return paths in `observe` come through here, and that is the point
+        rather than a tidiness preference: an Observation carries the page's
+        text, its URL and its network events, and anything that has to be true
+        of all three -- redacting typed credentials out of them, say -- is a
+        property of *this* function instead of a rule each return site has to
+        remember. Two construction sites that can drift is the shape of the
+        next bug; there is one, so "no Observation exists without X" is a claim
+        about six lines.
+
+        An empty `snapshot` is the bodyless page and parses to no elements,
+        which is the honest reading: nothing was there to act on.
+        """
         return Observation(
             url=self.page.url,
-            title=self.page.title(),
+            title=self._title() if snapshot else "",
             snapshot=snapshot,
-            elements=parse_snapshot(snapshot),
+            elements=parse_snapshot(snapshot) if snapshot else (),
             network=tuple(self._buffer),
         )
+
+    def _snapshot(self) -> str | None:
+        """The page's aria snapshot, or None if there is no document to read.
+
+        `body` is absent while a document commits, and Playwright answers that
+        with `Locator.aria_snapshot: Selector "body" does not match any
+        element`. That is a state of the world, not a fault, so it is returned
+        rather than raised -- see `observe`.
+        """
+        try:
+            return self.page.locator("body").aria_snapshot(mode="ai")
+        except PlaywrightError:
+            return None
+
+    def _title(self) -> str:
+        """The title, or empty. Reading it evaluates script in the page, which
+        a document being torn down refuses -- and a missing title must not cost
+        us a snapshot we already took."""
+        try:
+            return self.page.title()
+        except PlaywrightError:
+            return ""

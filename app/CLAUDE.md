@@ -18,6 +18,12 @@ app/
 │   ├── agents/generator.py map path → scenario → runnable .spec.ts
 │   ├── agents/runner.py    execute a scenario; heal, or report a defect, or escalate
 │   ├── agents/orchestrator.py  the *exploration* colony — ants, not the pipeline
+│   ├── agents/ant.py       one ant: land, act a few times, report, die
+│   ├── agents/tools.py     what an ant and the orchestrator may see and do
+│   ├── agents/context.py   the free-text box → credentials + focus + claims
+│   ├── agents/claims.py    a typed claim → the tests that already cover it
+│   ├── agents/prompts/     ant, orchestrator, critic, analyst — the tunable part
+│   ├── agents/llm/         one tool-calling loop, four providers, one catalogue
 │   ├── agent_mcp/          MCP server — the pipeline, for an external coding agent
 │   └── smoke_run.py        walking skeleton, superseded by `make loop`. See below
 ├── web/                frontend — Next.js 16 + React 19 + Tailwind v4
@@ -88,8 +94,9 @@ behavioural model, `agents/explorer/worldmap.py`:
 | Generator | a path through the graph compiles to a test |
 | Healer | re-observe, compare state keys, and the failure classifies itself |
 
-Read `agents/explorer/__init__.py` first — it explains the four modules and why
-none of them calls a model. Then `worldmap.py`, which is the contract.
+Read `agents/explorer/__init__.py` first — it explains the eight modules and
+why only one of them (`synth.py`) calls a model. Then `worldmap.py`, which is
+the contract.
 
 Two entry points, both printing evidence rather than passing silently:
 
@@ -133,6 +140,21 @@ It is loaded in the package rather than in one entry point because there are
 four of them (the API background task, `explorer.crawler`, `probe.py`,
 `smoke_run.py`) and all four read these out of `os.environ`.
 
+**There are two ways in, and the catalogue is the same one.**
+`agents/llm/catalog.py` lists every provider, its key variable, its models and
+its cheap default. `llm.load()` resolves against it and `GET /api/providers`
+serves it to the console's **Advanced** panel, so a model the dialog offers is a
+model the backend can build. Add a provider there and both sides gain it; there
+is no list of models in the frontend.
+
+A key typed into Advanced is held in `localStorage` and sent as
+`X-AIVAR-Provider` / `X-AIVAR-Key` / `X-AIVAR-Model` on every request
+(`web/lib/api.ts`), read by one dependency (`app/byok.py`), and passed down to
+`load(api_key=...)`. It is never written to `os.environ` -- the API serves every
+run from one process, so an exported key would be every concurrent run's key --
+and never stored. Absent those headers the server's own `.env` is used, which is
+how the demo machine has always worked.
+
 ```bash
 OPENROUTER_API_KEY                  # probed FIRST by llm.load(), on cost. One
                                     # colony run is ~78 model calls: measured
@@ -143,6 +165,10 @@ OPENROUTER_API_KEY                  # probed FIRST by llm.load(), on cost. One
                                     # OPENROUTER_BASE_URL, which repoints the
                                     # same OpenAICompat class at DeepSeek,
                                     # Groq, Cerebras or a local Ollama
+SARVAM_API_KEY                      # Sarvam AI, which is OpenAI-compatible, so
+                                    # it is the same OpenAICompat class at
+                                    # https://api.sarvam.ai/v1. Default model
+                                    # sarvam-m
 ANTHROPIC_API_KEY / GEMINI_API_KEY  # llm.load() picks a provider by whichever
                                     # is present. With neither, a console run
                                     # degrades to `explorer.crawler` — a real
@@ -153,7 +179,11 @@ ANTHROPIC_API_KEY / GEMINI_API_KEY  # llm.load() picks a provider by whichever
                                     # static mutation table that knows nothing
                                     # about the app, and the crawl prints
                                     # "PAYLOADS n from fallback" so a degraded
-                                    # run never looks like a good one
+                                    # run never looks like a good one. Claude's
+                                    # default model is `claude-haiku-4-5` and
+                                    # comes from the catalogue, not from
+                                    # claude.py — changed 2026-09-05, see
+                                    # decisions.md; Opus is one select away
 AIVAR_USERNAME / AIVAR_PASSWORD     # optional. forms.Credentials — without
                                     # these, any login wall stops the crawl at
                                     # one state
@@ -163,26 +193,25 @@ A run that ends in `error` puts its reason in `run.summary`, and the console's
 status label (`run 2 · error ⓘ`) discloses it on click. If a failure is ever
 invisible in the UI again, that path is what to fix — not the canvas.
 
-<!-- TODO(shivam): the handoff contract is now half-settled, and the half that
-     is settled is the half that was contentious. Selectors vs intent went to
-     intent: a plan step carries an `Element.descriptor` (`button:Sign in`),
-     resolved live by `crawler._locate`, which is the same resolution the
-     Generator and Healer use. Healing is re-resolution, as
-     `../docs/product/thesis.md` argued — but grounded in a state key that was
-     actually observed, rather than in a model's belief.
+The handoff contract is settled, both halves. Selectors vs intent went to
+intent: a plan step carries an `Element.descriptor` (`button:Sign in`), resolved
+live against the page by the same code the Generator and the Healer use, so
+healing is re-resolution grounded in a state key that was actually observed
+rather than in a model's belief.
 
-     What is still yours, and still ~10 lines: given a `Transition`, what makes
-     it worth a test? QA Wolf's rule is that a flow must describe what a user
-     *accomplishes* — it explicitly rejects "Display Search Dropdown". Right now
-     `WorldMap.transitions` contains every edge the crawler walked, including
-     `link:v2 -> v2` and `textbox:Email stays`. Something has to filter that,
-     and the filter decides what the whole test suite looks like.
+The other half — *given a `Transition`, what makes it worth a test?* — is
+`worldmap.is_flow()`. Three structural signals, no knowledge of what an action
+string means: `mutating` (a non-GET fired, so the user accomplished something —
+kept even as a self-loop), a self-loop with nothing fired (`textbox:Email
+stays`, which asserts nothing), and whether the edge is the one that *discovered*
+its destination (a second route into a known state re-tests a screen the suite
+already covers). Before it existed the Generator compiled every recorded edge,
+and a saucedemo crawl produced "activate the link" beside the login flow with
+six sibling product links as six separate tests.
 
-     Candidate signals, all already recorded on the objects: `mutating` (a
-     POST fired), `self_loop` (it stayed put), whether the destination state is
-     otherwise unreachable, and path length from the entry. A function
-     `is_flow(map, transition) -> bool` in `worldmap.py` settles it for every
-     packet after it. -->
+It is deliberately not the same question as `frontier()`: an edge can be highly
+informative to the *map* and worthless as a *test*. Modelling and testing are
+different jobs.
 
 ## The MCP server
 
@@ -380,7 +409,7 @@ From here or from the repo root; `make` with no arguments lists every target.
 make setup     # first run only: npm install, uv sync, playwright install
 make dev       # both servers — web :3000, api :8000
 make pipeline  # the whole claim: URL in, test quality report out
-make probe     # 115 observable checks. No API key, no quota
+make probe     # 176 observable checks. No API key, no quota
 make gaps      # crawl an app and rank what the crawl did not cover
 make specs     # write generated .spec.ts, then run them with Playwright
 make check     # typecheck + lint — run before handing work off

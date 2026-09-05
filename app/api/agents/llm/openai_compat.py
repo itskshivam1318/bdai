@@ -28,8 +28,28 @@ from . import Exchange, Tool, ToolCall, Transcript, Turn
 # The colony is ~78 model calls per run and almost all of them are mechanical
 # click-and-observe, so per-token cost dominates the bill far more than the
 # marginal quality of any single decision. Override per run; see `load()`.
-DEFAULT_MODEL = "qwen/qwen3-coder-next"
-DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
+#
+# Both constants come from the catalogue, so the console's OpenRouter select and
+# this class cannot disagree about what "default" means -- see `catalog.py`.
+from .catalog import BY_ID, max_output_for  # noqa: E402
+
+DEFAULT_MODEL = BY_ID["openrouter"].default_model
+
+# Ceiling on one reply, resolved per model in `__init__` -- see `catalog.py`,
+# which holds the number and the arithmetic behind it. It was a flat 4096 here,
+# which is 14% of what the default model will emit and 2% of what the free one
+# will, and a long `finish` -- the one call that returns every flow and the
+# summary -- was being cut off inside that.
+#
+# `LLM_MAX_TOKENS` overrides the catalogue for every model at once, and exists
+# for one specific emergency: a provider reserves the full `max_tokens` against
+# the balance *before* it starts, so a nearly-empty account 402s a large request
+# outright ("requires more credits, or fewer max_tokens. You requested up to
+# 32768 tokens, but can only afford 268"). Setting it low trades truncated
+# replies for a run that happens at all. Prefer topping up, or a `:free` route,
+# which is not reserved against and takes the full ceiling.
+MAX_TOKENS_ENV = "LLM_MAX_TOKENS"
+DEFAULT_BASE_URL = BY_ID["openrouter"].base_url or "https://openrouter.ai/api/v1"
 
 # 429 and 5xx are weather; a colony making hundreds of calls will meet them.
 # 400 is our bug, and retrying it hides the mistake while spending the clock.
@@ -48,15 +68,32 @@ class OpenAICompat:
         api_key: str | None = None,
         notify=None,
         timeout: float = 120.0,
+        key_env: str = "OPENROUTER_API_KEY",
+        name: str | None = None,
     ) -> None:
         import httpx
 
-        key = api_key or os.environ.get("OPENROUTER_API_KEY")
+        # `key_env` is named rather than assumed because this one class serves
+        # every OpenAI-compatible endpoint -- OpenRouter and Sarvam among them --
+        # and telling someone with a Sarvam key that "OPENROUTER_API_KEY is not
+        # set" sends them to fix the wrong variable.
+        key = api_key or os.environ.get(key_env)
         if not key:
-            raise RuntimeError("OPENROUTER_API_KEY is not set")
+            raise RuntimeError(f"{key_env} is not set")
 
+        # Shadows the class attribute so the console's "model: openrouter /
+        # qwen3-coder-next" line names the endpoint the key belongs to rather
+        # than the wire format it happens to speak.
+        self.name = name or self.name
         self.model = model
         self.base_url = base_url.rstrip("/")
+        # Per model, not per class: this one object serves DeepSeek at 16384
+        # and MiniMax at 32768, and the difference between them is a 400 rather
+        # than a clamp. The env override is read here rather than at import so
+        # that a `.env` loaded after this module -- which is every entry point
+        # except `probe.py` -- still takes effect.
+        override = os.environ.get(MAX_TOKENS_ENV)
+        self.max_tokens = int(override) if override else max_output_for(model)
         self._notify = notify or (lambda level, message: None)
         self._client = httpx.Client(
             base_url=self.base_url,
@@ -207,8 +244,21 @@ class OpenAICompat:
 
             body = response.text[:400]
             if response.status_code not in RETRY_STATUSES or attempt == 4:
+                # 402 is the credit reservation, and its message names the
+                # number that would have worked ("can only afford 268"). It is
+                # not retryable and it is not a bug in the request, so say what
+                # to turn rather than leaving the raw body to be read as one.
+                hint = ""
+                if response.status_code == 402:
+                    hint = (
+                        f" -- the ceiling is {self.max_tokens} tokens; set "
+                        f"{MAX_TOKENS_ENV} below the affordable number above to "
+                        "trade truncated replies for a run, or use a `:free` "
+                        "route, which is not reserved against"
+                    )
                 raise RuntimeError(
-                    f"{self.model}: {response.status_code} from the provider: {body}"
+                    f"{self.model}: {response.status_code} from the provider: "
+                    f"{body}{hint}"
                 )
 
             if response.status_code == 429 and (
@@ -237,7 +287,7 @@ class OpenAICompat:
         body = self._post(
             {
                 "model": self.model,
-                "max_tokens": 4096,
+                "max_tokens": self.max_tokens,
                 "messages": self._messages(system, transcript),
                 "tools": self._tools(tools),
                 "tool_choice": "auto",
@@ -253,7 +303,24 @@ class OpenAICompat:
                 message = message.get("message", message)
             raise RuntimeError(f"{self.model}: {message}")
 
-        message = body["choices"][0]["message"]
+        choice = body["choices"][0]
+        message = choice["message"]
+
+        # Nothing read `finish_reason` before this, which is what let a ceiling
+        # set too low present as a quality problem instead of a config one: the
+        # model stopped mid-sentence, `content` was a stump, and the pipeline
+        # consumed the stump as a finished answer. A cut-off `tool_calls`
+        # payload is worse -- `_arguments` sees truncated JSON and yields {}.
+        # Warned rather than raised so one long `finish` cannot kill a colony
+        # run that is otherwise complete; the console shows it beside the
+        # retry warnings.
+        if choice.get("finish_reason") == "length":
+            self._notify(
+                "warn",
+                f"{self.model}: the reply hit the {self.max_tokens}-token "
+                f"ceiling and was cut off -- raise it in catalog.py, or set "
+                f"{MAX_TOKENS_ENV} higher",
+            )
 
         calls = tuple(
             ToolCall(

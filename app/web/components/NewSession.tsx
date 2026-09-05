@@ -13,6 +13,11 @@ function normalise(raw: string): string {
 export default function NewSession() {
   const router = useRouter();
   const [url, setUrl] = useState("");
+  const [context, setContext] = useState("");
+  // Closed by default, and that is the claim being made: a URL is the whole
+  // required input. A second box sitting open beside the first would say the
+  // opposite before anyone had read a word.
+  const [showContext, setShowContext] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -23,7 +28,7 @@ export default function NewSession() {
     setBusy(true);
     setError(null);
     try {
-      const session = await api.createSession(target);
+      const session = await api.createSession(target, context.trim());
       router.push(`/s/${session.id}`);
     } catch {
       setError("Couldn't reach the API. Is it running on port 8000?");
@@ -72,6 +77,49 @@ export default function NewSession() {
               {busy ? "Starting" : "Start"}
             </button>
           </div>
+
+          {/*
+            One box, not three. Nobody thinks "credentials, focus, claims" —
+            they think of what they would tell a colleague handing over the app,
+            and a model sorts that into fields at run time. See
+            `api/agents/context.py`.
+          */}
+          {showContext ? (
+            <div className="mt-5">
+              <label
+                htmlFor="context"
+                className="text-xs uppercase tracking-wide text-muted"
+              >
+                Anything else we should know
+              </label>
+              <textarea
+                id="context"
+                value={context}
+                onChange={(e) => setContext(e.target.value)}
+                rows={4}
+                autoFocus
+                disabled={busy}
+                placeholder={
+                  "Log in as standard_user / secret_sauce.\n" +
+                  "Focus on checkout.\n" +
+                  "Check that an out-of-stock item can't be added to the cart."
+                }
+                className="mt-2 w-full resize-y rounded-md border border-rule bg-paper px-3 py-2 text-sm leading-relaxed outline-none focus:border-ink placeholder:text-muted/60"
+              />
+              <p className="mt-2 text-xs leading-relaxed text-muted">
+                Credentials are typed into the app under test and stored as
+                written — treat this like any other test account.
+              </p>
+            </div>
+          ) : (
+            <button
+              type="button"
+              onClick={() => setShowContext(true)}
+              className="mt-4 text-sm text-muted underline decoration-rule underline-offset-4 hover:text-ink"
+            >
+              Add context — a login, what to focus on, something to check
+            </button>
+          )}
         </form>
 
         {error && <p className="mt-3 text-sm text-fault">{error}</p>}
