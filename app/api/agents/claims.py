@@ -206,14 +206,23 @@ def with_claimed(plan: tuple, considered: tuple, matched: dict[str, tuple[int, .
     that answers it must not be the one fairness discarded. Appended rather than
     promoted: the generator's ranking is still the ranking, and a claim adds to
     the suite rather than reordering it.
+
+    **Identity is the scenario, not its name.** `intent_of` names a scenario
+    from its action grammar, so the generator emits the same name twice
+    routinely -- one crawl produced two `complete the Submit form and submit it`
+    landing on different pages. De-duplicating by name meant a claim needing the
+    twin the cap dropped found its namesake already present and was never added,
+    leaving the suite without the scenario the report goes on to say answers the
+    claim. `Scenario` is a frozen dataclass of tuples, so the object itself is
+    the identity and comparing it needs nothing new.
     """
-    names = {scenario.name for scenario in plan}
+    seen = set(plan)
     extra = []
     for cites in matched.values():
         for index in cites:
             scenario = considered[index]
-            if scenario.name not in names:
-                names.add(scenario.name)
+            if scenario not in seen:
+                seen.add(scenario)
                 extra.append(scenario)
     return tuple(plan) + tuple(extra)
 
