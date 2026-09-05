@@ -413,6 +413,7 @@ def run(
     synthesizer=None,
     world: WorldMap | None = None,
     filed_as: str = "",
+    experiments: list[str] | None = None,
 ) -> Exploration:
     """Explore `entry_url` until the orchestrator is satisfied or the budget ends.
 
@@ -456,6 +457,12 @@ def run(
     world = world or WorldMap()
     world.actions_of = lambda obs: forms.available_actions(page, obs)
     result = Exploration(world=world)
+    # What was already run against this app before the colony started -- on a
+    # second run, the kept suite's verdicts. Seeded into the same list the
+    # colony's own generator and healer dispatches append to, so the first
+    # brief already says which saved tests failed and where, and the first
+    # wave can be aimed at that region rather than at the untried count.
+    result.experiments = list(experiments or ())
 
     observer = Observer(page)
     observer.start_window()
@@ -517,6 +524,7 @@ def run(
             waves_left=budget.max_waves,
             ants_left=budget.max_ants,
             behaviour=result.behaviour,
+            results=result.experiments,
             credentials=credentials,
         )
     )

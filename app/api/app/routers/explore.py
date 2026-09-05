@@ -493,6 +493,45 @@ def _explore(
                         "handing to the colony",
                         surface="explore",
                     )
+                    # A second run in this session has a kept suite. Replay it
+                    # now, before the colony, as a dry run: the verdicts go into
+                    # the orchestrator's first brief as experiments, so the
+                    # ants are sent where the saved tests failed rather than
+                    # where the untried count is highest. `regression.keep`
+                    # below still does the real replay -- healing, rescue,
+                    # re-verification -- and this pass writes nothing.
+                    prior: list[str] = []
+                    suite_dir = regression.directory_for(
+                        target_url, session_uid=session_uid
+                    )
+                    existing = regression.current(suite_dir)
+                    if existing is not None:
+                        emit(
+                            "info",
+                            f"replaying {existing.label} before the colony, so "
+                            "the ants are sent where the saved tests failed",
+                            surface="suite",
+                        )
+                        try:
+                            dry = regression.verify(
+                                page, suite_dir, target_url=target_url,
+                                credentials=credentials, apply=False,
+                                rescue=False, reverify=False,
+                                synthesizer=synthesizer,
+                                on_event=lambda level, message: emit(
+                                    level, message, surface="suite"
+                                ),
+                            )
+                            prior = regression.prior_experiments(dry)
+                            for line in prior:
+                                emit("decision", line, surface="suite")
+                        except Exception as exc:
+                            emit(
+                                "warn",
+                                f"could not replay {existing.label} first: "
+                                f"{type(exc).__name__}: {exc}",
+                                surface="suite",
+                            )
                     result = orchestrator.run(
                         page,
                         target_url,
@@ -500,6 +539,7 @@ def _explore(
                         world=seed,
                         synthesizer=synthesizer,
                         intent=intent,
+                        experiments=prior,
                         budget=orchestrator.Budget(
                             max_waves=body.max_waves,
                             max_ants=body.max_ants,

@@ -313,6 +313,50 @@ def run(
     # and -- since it can dispatch a generator and a healer as well as an ant
     # -- the decision of when to stop looking and start testing. That decision
     # used to be made here, by the order these stages are written in.
+    # --- what the kept suite says, before anyone is sent anywhere --------
+    #
+    # A second run has a past: a suite recorded against this URL last time.
+    # Replaying it here, as a dry run, is what tells the colony *where the app
+    # moved* -- and that is the one fact the diagram says the orchestrator
+    # dispatches on and the code never gave it. `_keep` below still does the
+    # real replay, with healing, rescue and re-verification; this pass writes
+    # nothing and only reads the verdicts.
+    prior: list[str] = []
+    if keep_suite and provider is not None:
+        from . import regression
+
+        directory = suite_root or regression.directory_for(target_url)
+        existing = regression.current(directory)
+        if existing is not None:
+            emit("info", f"replaying {existing.label} before the colony, so "
+                 "the ants are sent where the saved tests failed", "suite")
+            try:
+                dry = regression.verify(
+                    page, directory, target_url=target_url,
+                    credentials=credentials, apply=False, rescue=False,
+                    reverify=False, synthesizer=synthesizer,
+                    on_event=lambda l, m: emit(l, m, _surface_for(l, m)),
+                )
+                prior = regression.prior_experiments(dry)
+            except Exception as exc:
+                # The colony can still run blind, as it always did. Losing
+                # this pass must not lose the run.
+                emit("warn", f"could not replay {existing.label} first: "
+                     f"{type(exc).__name__}: {exc}", "suite")
+            if prior:
+                announce(
+                    pipe.decide(
+                        "prior", f"{existing.label}: {len(prior)} finding(s) "
+                        "handed to the colony",
+                        "the saved suite was replayed before exploring, so the "
+                        "orchestrator's first wave knows which recorded tests "
+                        "failed and at which state, and can send ants there",
+                        version=existing.label,
+                        **_counts(dry.results),
+                    ),
+                    surface="suite",
+                )
+
     if provider is not None and len(world.states) >= 1:
         from .orchestrator import Budget as ColonyBudget
         from .orchestrator import run as colony
@@ -327,6 +371,7 @@ def run(
             credentials=credentials,
             synthesizer=synthesizer,
             world=world,
+            experiments=prior,
             on_event=lambda level, message: emit(level, message, "plan"),
         )
         world = exploration.world

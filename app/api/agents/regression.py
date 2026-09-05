@@ -944,6 +944,59 @@ def verify(
     return report
 
 
+# ---------------------------------------------------------- prior verdicts
+
+
+def prior_experiments(report: "Report") -> list[str]:
+    """The kept suite's replay, as lines the orchestrator's brief can carry.
+
+    On a second run the colony used to start blind: the crawl ran, the colony
+    ran, and only then was the saved suite replayed -- so the one fact that
+    says *where the app moved* reached nobody who could send an ant there.
+    These lines go into `orchestrator.run(experiments=...)`, the same list a
+    healer dispatch appends to, so "the saved test at [state] failed" reads to
+    the orchestrator exactly like an experiment it ran itself.
+
+    One line per non-passing scenario, naming the state the failing step was
+    taken from, because that state is what a dispatch assignment names. A
+    passing suite is one line: it is still worth knowing that nothing moved.
+    """
+    if not report.results:
+        return []
+    lines: list[str] = []
+    for result in report.results:
+        if result.verdict == runner.PASSED:
+            continue
+        failed = next(
+            (s for s in result.steps if s.verdict != runner.PASSED),
+            result.steps[-1] if result.steps else None,
+        )
+        where = failed.step.from_key[:8] if failed else "?"
+        what = f"{failed.step.intent} ({failed.step.action})" if failed else ""
+        lines.append(
+            f"kept suite {report.replayed.label if report.replayed else ''}: "
+            f"{result.scenario.name!r} replayed as {result.verdict.upper()} at "
+            f"[{where}] on {what} -- "
+            + (
+                "the control was repaired; check the region still behaves"
+                if result.verdict == runner.HEALED
+                else "the control resolved and the app behaved differently; a "
+                "DEFECT here is not something an ant can repair, but an ant "
+                "can tell you what the region does now"
+                if result.verdict == runner.DEFECT
+                else "nothing on the page plays the recorded part; the region "
+                "has moved and needs re-exploring"
+            )
+        )
+    if not lines:
+        label = report.replayed.label if report.replayed else "the kept suite"
+        lines.append(
+            f"kept suite {label}: all {len(report.results)} scenario(s) "
+            "replayed as PASSED -- the app has not moved where it is tested"
+        )
+    return lines
+
+
 # ------------------------------------------------------------------- keeping
 
 
