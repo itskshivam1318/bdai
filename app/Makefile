@@ -40,15 +40,8 @@ setup: ## Install all dependencies (first run only)
 	cd api && uv run playwright install chromium
 	@$(MAKE) --no-print-directory hooks
 
-hooks: ## Point git at .githooks (config is shared by every worktree; the path is not)
-	@test -x ../.githooks/pre-commit || { \
-	  echo "no ../.githooks/pre-commit on this branch -- NOT enabling."; \
-	  echo "core.hooksPath is relative and lives in the shared config, so"; \
-	  echo "setting it from a branch without the file points git at nothing"; \
-	  echo "and git runs no hook, silently. Merge the branch that has it."; \
-	  exit 1; }
-	@git -C .. config core.hooksPath .githooks
-	@echo "core.hooksPath = .githooks -- commits now typecheck the staged tree"
+hooks: ## Install the pre-commit check into the shared hooks dir (covers every worktree)
+	@../.githooks/install.sh
 
 dev: ## Run the full stack (web + api)
 	./scripts/dev.sh

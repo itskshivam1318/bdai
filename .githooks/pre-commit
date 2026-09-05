@@ -37,6 +37,20 @@ mkdir -p "$TREE"
 git checkout-index -a -f --prefix="$TREE/"
 
 status=0
+# Claiming "sound" after skipping a check is the same silent-pass this hook
+# exists to stop, one level in. Track it and say the weaker, true thing.
+skipped=0
+
+if [ -n "$WEB" ] && [ ! -d "$ROOT/app/web/node_modules" ]; then
+  # This worktree has never run `make setup`, so there is nothing to typecheck
+  # against. Say so and let the commit through: refusing here would block a
+  # worktree for a reason that has nothing to do with its commit, and a guard
+  # that cries wolf is a guard someone turns off.
+  echo "pre-commit: no app/web/node_modules here -- SKIPPING the web check."
+  echo "            run 'cd app && make setup' in this worktree to enable it."
+  WEB=""
+  skipped=1
+fi
 
 if [ -n "$WEB" ]; then
   # node_modules is not in the index. `cp -c` clones copy-on-write on APFS --
@@ -81,9 +95,20 @@ if [ -n "$API" ] && [ $status -eq 0 ]; then
   # this check silently passed on a deliberately broken index until it ran from
   # the right place. The venv's interpreter is addressed absolutely, so it does
   # not care where it is invoked from.
-  echo "pre-commit: importing the staged API…"
   PY_BIN="$ROOT/app/api/.venv/bin/python"
-  [ -x "$PY_BIN" ] || PY_BIN="python3"
+  if [ ! -x "$PY_BIN" ]; then
+    # Same reasoning as the web half: no venv in this worktree means no way to
+    # tell a real import error from an absent dependency, and guessing wrong
+    # blocks a commit for the wrong reason.
+    echo "pre-commit: no app/api/.venv here -- SKIPPING the API check."
+    echo "            run 'cd app && make setup' in this worktree to enable it."
+    API=""
+    skipped=1
+  fi
+fi
+
+if [ -n "$API" ] && [ $status -eq 0 ]; then
+  echo "pre-commit: importing the staged API…"
   if ! ( cd "$TREE/app/api" && "$PY_BIN" -c "import app.main" ); then
     echo
     echo "REFUSED: the staged API does not import."
@@ -92,5 +117,11 @@ if [ -n "$API" ] && [ $status -eq 0 ]; then
   fi
 fi
 
-[ $status -eq 0 ] && echo "pre-commit: staged tree is sound."
+if [ $status -eq 0 ]; then
+  if [ $skipped -eq 1 ]; then
+    echo "pre-commit: what could be checked passed -- NOT a clean bill of health."
+  else
+    echo "pre-commit: staged tree is sound."
+  fi
+fi
 exit $status

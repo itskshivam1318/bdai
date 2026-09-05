@@ -326,12 +326,24 @@ materialises the staged tree and typechecks *that*. Enable it with `make hooks`
 (`make setup` does); bypass with `--no-verify` only for a WIP commit you intend
 to amend.
 
-`core.hooksPath` lives in the **shared** config, so every worktree inherits the
-setting -- but the path is relative, and `.githooks/` only exists on branches
-that carry it. Point git at a directory that is not there and it runs no hook
-and says nothing, which is the one failure a guard must not have. `make hooks`
-therefore refuses to enable itself from a branch without the file; a worktree on
-an older branch is unprotected until it merges one that has it.
+It installs into the **shared** hooks directory (`$(git rev-parse
+--git-common-dir)/hooks`), not via `core.hooksPath`. That setting is written to
+the shared config so every worktree inherits it, but the path is relative and
+git resolves it against the *invoking* worktree -- so a worktree on a branch
+without `.githooks/` got the setting, found nothing, ran no hook and said
+nothing. Measured: two worktrees were in exactly that state. The shared
+directory is consulted by every worktree by construction and no branch can take
+it away.
+
+What lands there is a shim: it prefers `<worktree>/.githooks/pre-commit` so the
+version-controlled hook stays the source of truth, and falls back to a snapshot
+beside it on branches that have no such file. Edit `.githooks/pre-commit`, then
+`make hooks` to refresh the snapshot.
+
+A worktree that has never run `make setup` has no `node_modules` or `.venv`, so
+the hook **says which check it skipped and does not claim the tree is sound**.
+Refusing there would block a commit for a reason unrelated to it, and a guard
+that cries wolf is a guard someone turns off.
 
 **Widget config lives in local state**, not on the xyflow node's `data`.
 Mutating `data` is a lint error and causes stale renders; `WidgetNode` holds
