@@ -910,10 +910,16 @@ def _explore(
                     + (
                         f"; {planned.uncompilable} believed flow(s) named an "
                         "ordering nobody walked and were not compiled"
+                        + "".join(
+                            f"; '{claim}' breaks at [{a[:8]}] -> [{b[:8]}]"
+                            for claim, a, b in planned.unwalked
+                        )
                         if planned.uncompilable
                         else ""
                     )
-                    + (f"; {planned.degraded}" if planned.degraded else ""),
+                    + (f"; {planned.degraded}" if planned.degraded else "")
+                    + f"; {planned.pages} crawled page(s), {planned.per_page} "
+                    "slot(s) reserved for each before any page took more",
                     surface="suite",
                 )
 

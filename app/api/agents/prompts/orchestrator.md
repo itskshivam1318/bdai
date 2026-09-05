@@ -82,6 +82,12 @@ the map.
 valuable line in its report — it marks a place where the map is actively wrong
 rather than merely incomplete. Send someone to settle it.
 
+**Walk what is believed but unwalked.** The brief lists flows the colony named
+whose states nobody has walked in order, as `[from] -> [to]`. No generator can
+compile a test for such a flow until an ant records that edge. Send an ant to
+the `from` state with an instruction to reach the `to` state; if it cannot, the
+flow was wrong and its report will say so.
+
 **Do not confuse a big map with a good one.** Twenty states inside one wizard is
 a worse result than six states covering login, search, cart and checkout.
 

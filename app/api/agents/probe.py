@@ -835,6 +835,47 @@ def _flow_checks() -> bool:
                                     cites=("a" * 16,))) is None,
     )
 
+    # An uncompilable flow is the model's most specific steer -- "I believe A
+    # leads to C and nobody has checked" -- and counting it throws that away.
+    # The pair has to be named, and it has to reach the orchestrator's brief,
+    # or the colony cannot send an ant to walk it.
+    from .behavior import BehaviorModel
+    from .generator import unwalked as first_unwalked
+    from .planner import plan
+    from .tools import brief
+
+    ok &= check(
+        "the first unwalked pair of a believed flow is named",
+        first_unwalked(world, unwalked) == ("a" * 16, "c" * 16),
+        f"got {first_unwalked(world, unwalked)!r}",
+    )
+    ok &= check(
+        "a flow the crawler walked has no unwalked pair",
+        first_unwalked(world, walked) is None,
+    )
+    model = BehaviorModel(hypotheses=(walked, unwalked))
+    planned = plan(world, model, source="behaviour")
+    ok &= check(
+        "the plan carries the unwalked pair, not only a count",
+        planned.unwalked == ((unwalked.claim, "a" * 16, "c" * 16),),
+        f"got {planned.unwalked!r}",
+    )
+    rendered = planned.render()
+    ok &= check(
+        "the plan names where a believed flow breaks",
+        "a" * 8 in rendered and "c" * 8 in rendered and "unwalked" in rendered,
+    )
+    briefed = brief(world, waves_left=1, ants_left=1, behaviour=model)
+    ok &= check(
+        "the orchestrator's brief names the unwalked pair as a place to send an ant",
+        "unwalked" in briefed and f"[{'a' * 8}] -> [{'c' * 8}]" in briefed,
+        "the steer stayed inside the planner and never reached dispatch",
+    )
+    ok &= check(
+        "a fully walked flow is not offered as a place to send an ant",
+        f"[{'a' * 8}] -> [{'b' * 8}]" not in briefed,
+    )
+
     return ok
 
 
@@ -1283,6 +1324,8 @@ def main() -> int:
     ok &= _worker_checks()
     ok &= _seeding_checks()
     ok &= _interleave_checks()
+    ok &= _per_page_checks()
+    ok &= _frontier_order_checks()
     ok &= _ceiling_checks()
     print()
     ok &= _surface_checks()
@@ -4340,6 +4383,180 @@ def _seeding_checks() -> bool:
         behaviour_for(empty, provider=object(), given=None,
                       synthesise=synth).hypotheses == () and calls == [],
         "there is nothing to interpret",
+    )
+    return ok
+
+
+def _pages_world():
+    """Three pages: a login page offering eight distinct behaviours and two
+    pages behind it offering two each. Every edge discovers a fresh state so
+    `is_flow` keeps it. Returns the map and the page of every state key.
+    """
+    from dataclasses import replace
+
+    pages = {
+        "login": "/login", "L2": "/login", "L3": "/login", "L4": "/login",
+        "L5": "/login", "L6": "/login", "L7": "/login", "L8": "/login",
+        "dash": "/dashboard", "D2": "/dashboard", "D3": "/dashboard",
+        "exec": "/executions", "E2": "/executions", "E3": "/executions",
+    }
+    edges = [
+        ("login", "submit[valid]:button:Sign in", "dash", True),
+        ("login", "submit[invalid]:button:Sign in", "L2", True),
+        ("login", "submit[empty]:button:Sign in", "L3", False),
+        ("login", "button:Show password", "L4", False),
+        ("login", "link:Back to home", "L5", False),
+        ("L2", "submit[valid]:button:Sign in", "exec", True),
+        ("L2", "submit[invalid]:button:Sign in", "L6", False),
+        ("L2", "submit[empty]:button:Sign in", "L7", True),
+        ("L3", "button:Hide password", "L8", True),
+        ("dash", "link:Datasets", "D2", False),
+        ("dash", "button:New agentflow", "D3", True),
+        ("exec", "link:Filter", "E2", False),
+        ("exec", "button:Refresh", "E3", True),
+    ]
+    world = _map_of(edges)
+    world.entry_key = "login"
+    for key, node in list(world.states.items()):
+        world.states[key] = replace(
+            node, url=f"http://sut{pages[key]}", evidence=(0,)
+        )
+    return world, pages
+
+
+def _per_page_checks() -> bool:
+    """The suite reaches every crawled page, not just the one nearest the entry.
+
+    Measured 2026-09-05 on a Velogent run: 26 states across ten URL paths, and
+    every one of 23 scenarios terminated on the login page or its landing.
+    `interleave` rotates across *kinds* of action, and a login page supplies
+    every kind -- three submit partitions, a button, a link -- so it filled the
+    suite by itself. Pages are the fairness unit a tester actually thinks in;
+    kinds are the tie-break within one.
+
+    Two halves, checked apart: the generator's `by_page` spends whatever share
+    it is handed, and the planner's `share` decides that share from the map --
+    so a new map gets a new number, and nobody hardcodes two.
+    """
+    from .generator import scenarios
+    from .planner import plan, share
+
+    print("PER-PAGE    the planner spreads the suite across every crawled page")
+    ok = True
+    world, pages = _pages_world()
+
+    def by_page(plan_) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for scenario in plan_:
+            page = pages[scenario.terminal.from_key]
+            counts[page] = counts.get(page, 0) + 1
+        return counts
+
+    # The mechanism, handed a share.
+    six = by_page(scenarios(world, limit=6, per_page=2))
+    ok &= check(
+        "generator: six slots, three pages, two each",
+        six == {"/login": 2, "/dashboard": 2, "/executions": 2},
+        f"{six} -- the login page crowded the others out",
+    )
+    four = by_page(scenarios(world, limit=4, per_page=2))
+    ok &= check(
+        "generator: no page takes its second slot before every page has one",
+        four.get("/dashboard") == 1 and four.get("/executions") == 1,
+        f"{four}",
+    )
+    eight = by_page(scenarios(world, limit=8, per_page=2))
+    ok &= check(
+        "generator: slots left after every page has its share go by kind",
+        sum(eight.values()) == 8 and eight["/login"] == 4,
+        f"{eight}",
+    )
+    none = by_page(scenarios(world, limit=6, per_page=0))
+    ok &= check(
+        "generator: zero reserves nothing -- the old kind-rotation, unchanged",
+        none == {"/login": 6},
+        f"{none}",
+    )
+
+    # The policy, derived from the map.
+    ok &= check(
+        "planner: the share is the limit spread over the pages the crawl reached",
+        share(world, 6) == (3, 2) and share(world, 24) == (3, 8)
+        and share(world, 2) == (3, 1),
+        f"{share(world, 6)} {share(world, 24)} {share(world, 2)}",
+    )
+    planned = plan(world, source="map", limit=6)
+    ok &= check(
+        "planner: a plan spreads by that share and records the decision",
+        by_page(planned.scenarios) == {"/login": 2, "/dashboard": 2, "/executions": 2}
+        and planned.pages == 3 and planned.per_page == 2,
+        f"{by_page(planned.scenarios)} pages={planned.pages} per_page={planned.per_page}",
+    )
+    return ok
+
+
+def _frontier_order_checks() -> bool:
+    """Which untaken action the crawler takes next, and why it is not the login
+    form's ninth variant.
+
+    Measured 2026-09-05 on a Velogent run: the crawl reached the dashboard,
+    executions and human-tasks pages, each offering 25 actions, and took one to
+    six on each -- roughly 30 of its 58 actions went to permutations of the
+    login form. Two rules did it together. "Exhaust where we are standing" let
+    every error state re-submit the same form for one click, and breadth-first
+    kept pulling the crawl back to the depth-1 login variants, of which each
+    submit minted another. Ties then fell to list order, and on every page
+    behind the login the first untaken action was the logo link.
+
+    The rule under test: an action *string* never taken anywhere on the map
+    outranks one already taken from another state, ahead of locality and
+    depth. The form's three partitions are still taken first, once; its tenth
+    repeat waits behind the dashboard's first link.
+    """
+    from .explorer.crawler import priority
+
+    print("FRONTIER    a page never seen beats a form seen nine times")
+    ok = True
+
+    routes = {"entry": (), "err": ("submit[invalid]:button:Sign in",),
+              "dash": ("submit[valid]:button:Sign in",),
+              "deep": ("submit[valid]:button:Sign in", "link:Datasets")}
+    taken = {"submit[invalid]:button:Sign in", "submit[valid]:button:Sign in",
+             "submit[empty]:button:Sign in", "link:Velogent Velogent"}
+
+    def first(here, *edges):
+        return min(edges, key=lambda e: priority(e, here, routes, taken))
+
+    ok &= check(
+        "a novel link on a deeper page beats a repeated submit where we stand",
+        first("err", ("err", "submit[empty]:button:Sign in"), ("dash", "link:Datasets"))
+        == ("dash", "link:Datasets"),
+    )
+    ok &= check(
+        "among novel actions, where we stand still comes first",
+        first("dash", ("dash", "link:Datasets"), ("entry", "button:Show password"))
+        == ("dash", "link:Datasets"),
+    )
+    ok &= check(
+        "among novel actions elsewhere, shallower still comes first",
+        first("err", ("deep", "button:New"), ("entry", "button:Show password"))
+        == ("entry", "button:Show password"),
+    )
+    ok &= check(
+        "a form's rejected partitions still go before the one that succeeds",
+        first("entry", ("entry", "submit[valid]:button:Go"), ("entry", "submit[empty]:button:Go"),
+              ("entry", "link:About"))
+        == ("entry", "submit[empty]:button:Go"),
+    )
+    ok &= check(
+        "the logo link, once taken anywhere, waits behind a page's own links",
+        first("dash", ("dash", "link:Velogent Velogent"), ("dash", "link:Datasets"))
+        == ("dash", "link:Datasets"),
+    )
+    ok &= check(
+        "with nothing novel left, the old order stands: here, then depth",
+        first("err", ("err", "submit[empty]:button:Sign in"), ("dash", "link:Velogent Velogent"))
+        == ("err", "submit[empty]:button:Sign in"),
     )
     return ok
 

@@ -446,6 +446,29 @@ def brief(
             lines.append(f"  {behaviour.summary}")
         lines += [h.render() for h in behaviour.hypotheses]
 
+        # A believed flow the generator cannot compile because one pair of its
+        # states has no recorded edge. The model's most specific steer: it
+        # names where to stand and where to try to get to. Offered here so the
+        # orchestrator can send an ant at it; the planner counts the same
+        # flows as `uncompilable` and this is what turns the count into work.
+        from .generator import unwalked
+
+        gaps = [
+            (h, pair)
+            for h in behaviour.of_kind("flow")
+            if (pair := unwalked(world, h)) is not None
+        ]
+        if gaps:
+            lines += [
+                "",
+                "believed but unwalked -- a flow the colony named that no "
+                "ant has walked end to end. Send an ant to the first state "
+                "with an instruction to reach the second; a test can only be "
+                "compiled for the flow once that edge is recorded:",
+            ]
+            for h, (from_key, to_key) in gaps:
+                lines.append(f"  [{from_key[:8]}] -> [{to_key[:8]}]  {h.claim}")
+
     # What has already been executed. Without this the orchestrator cannot tell
     # a hypothesis nobody tested from one a test already settled, and it
     # re-dispatches work that is done -- the same failure the `perished` list

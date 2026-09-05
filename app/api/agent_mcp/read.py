@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from sqlmodel import Session, select
 
-from agents import generator, runner
+from agents import generator, planner, runner
 from agents.explorer import store
 from agents.explorer.worldmap import WorldMap
 from app.db import engine
@@ -89,7 +89,9 @@ def map_of(run_id: int, include_snapshots: bool = False) -> dict:
     added answer.
     """
     world = world_of(run_id)
-    scenarios = generator.scenarios(world, limit=SCENARIO_LIMIT)
+    scenarios = generator.scenarios(
+        world, limit=SCENARIO_LIMIT, per_page=planner.share(world, SCENARIO_LIMIT)[1]
+    )
 
     return {
         "run_id": run_id,
@@ -191,7 +193,9 @@ def impact_of(run_id: int, names: list[str]) -> dict:
     affected when you delete that heading, even though it never acts on it.
     """
     world = world_of(run_id)
-    scenarios = generator.scenarios(world, limit=SCENARIO_LIMIT)
+    scenarios = generator.scenarios(
+        world, limit=SCENARIO_LIMIT, per_page=planner.share(world, SCENARIO_LIMIT)[1]
+    )
 
     affected, observing = [], []
     for scenario in scenarios:

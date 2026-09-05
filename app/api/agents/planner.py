@@ -42,7 +42,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-from .generator import Scenario, from_flow, scenarios
+from .generator import Scenario, from_flow, scenarios, page_of, unwalked
 
 # The two world models a plan can be built from. `behaviour` is a superset:
 # it starts with the believed flows and then fills from the map.
@@ -68,10 +68,18 @@ class Plan:
     from_map: int = 0
     # Believed flows the map could not back, so nothing was compiled for them.
     uncompilable: int = 0
+    # Of those, the ones that broke on a pair nobody walked: (claim, from_key,
+    # to_key). Where the colony should send an ant next -- `tools.brief` offers
+    # the same pairs to the orchestrator.
+    unwalked: tuple[tuple[str, str, str], ...] = ()
     # Set when the plan was narrowed to one state key.
     node: str = ""
     # Why the requested source was not the source used, if it was not.
     degraded: str = ""
+    # How the limit was spread: distinct URL paths the crawl reached, and the
+    # slots reserved for each before any page took more. See `share`.
+    pages: int = 0
+    per_page: int = 0
 
     def __len__(self) -> int:
         return len(self.scenarios)
@@ -121,11 +129,35 @@ class Plan:
                 f"            {self.uncompilable} believed flow(s) named an "
                 "ordering nobody walked and were not compiled"
             )
+        for claim, from_key, to_key in self.unwalked:
+            lines.append(
+                f"            unwalked: [{from_key[:8]}] -> [{to_key[:8]}]  {claim}"
+            )
         for scenario in self.scenarios:
             lines.append(
                 f"  [{scenario.node[:8]}] {scenario.name}  ({scenario.origin})"
             )
         return "\n".join(lines)
+
+
+
+def share(world, limit: int) -> tuple[int, int]:
+    """How many crawled pages there are, and how many slots each is owed.
+
+    The Planner's allocation decision, derived from the map on every run and
+    never a constant: the limit divided evenly across the distinct URL paths
+    the crawl reached, never below one. Ten pages under a 24-scenario cap get
+    two each; three pages under eight get two; one page gets the whole suite.
+
+    Measured 2026-09-05 on a Velogent run before this existed: 26 states over
+    ten paths, and all 23 scenarios terminated on the login page, because the
+    generator's kind-rotation was the only fairness rule and a login page
+    offers every kind of action there is. The generator's `by_page` is the
+    mechanism that spends this; the number is decided here, where the map is
+    read as a whole.
+    """
+    pages = len({page_of(world, key) for key in world.states})
+    return pages, max(1, limit // max(pages, 1))
 
 
 def source_from_env(default: str = DEFAULT_SOURCE) -> str:
@@ -148,6 +180,7 @@ def plan(
     limit: int = 8,
     node: str = "",
     only: set[tuple[str, str]] | None = None,
+    per_page: int | None = None,
 ) -> Plan:
     """What to test, best first, capped at `limit`.
 
@@ -168,6 +201,7 @@ def plan(
 
     believed: list[Scenario] = []
     uncompilable = 0
+    missing: list[tuple[str, str, str]] = []
     degraded = ""
 
     if source == "behaviour":
@@ -193,10 +227,18 @@ def plan(
             scenario = from_flow(world, hypothesis)
             if scenario is None:
                 uncompilable += 1
+                pair = unwalked(world, hypothesis)
+                if pair is not None:
+                    missing.append((hypothesis.claim, *pair))
                 continue
             believed.append(scenario)
 
-    computed = list(scenarios(world, limit=max(limit, 8), only=only))
+    pages, owed = share(world, limit)
+    if per_page is None:
+        per_page = owed
+    computed = list(
+        scenarios(world, limit=max(limit, 8), only=only, per_page=per_page)
+    )
 
     # Deduplicated on the action sequence, not the name: a believed flow and a
     # computed scenario can walk the same edges under different names, and
@@ -228,8 +270,11 @@ def plan(
         from_behaviour=sum(1 for s in chosen if s.origin.startswith("behaviour")),
         from_map=sum(1 for s in chosen if not s.origin.startswith("behaviour")),
         uncompilable=uncompilable,
+        unwalked=tuple(missing),
         node=node,
         degraded=degraded,
+        pages=pages,
+        per_page=per_page,
     )
 
 

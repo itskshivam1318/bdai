@@ -595,14 +595,22 @@ def run(
             + (
                 f"; {planned.uncompilable} believed flow(s) named an ordering "
                 "nobody walked and were not compiled"
+                + "".join(
+                    f"; '{claim}' breaks at [{a[:8]}] -> [{b[:8]}]"
+                    for claim, a, b in planned.unwalked
+                )
                 if planned.uncompilable
                 else ""
             )
-            + (f"; {planned.degraded}" if planned.degraded else ""),
+            + (f"; {planned.degraded}" if planned.degraded else "")
+            + f"; {planned.pages} crawled page(s), {planned.per_page} slot(s) "
+            "reserved for each before any page took more",
             source=planned.source,
             scenarios=len(pipe.plan),
             from_behaviour=planned.from_behaviour,
             uncompilable=planned.uncompilable,
+            pages=planned.pages,
+            per_page=planned.per_page,
             nodes=len(planned.nodes),
             unhappy=planned.unhappy,
         ),

@@ -378,8 +378,17 @@ def _shape(lines: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(sorted(roles))
 
 
-def _equivalence(from_key: str, action: str, expect: Expectation) -> tuple:
+def _equivalence(
+    from_key: str, action: str, expect: Expectation, page: str = "/"
+) -> tuple:
     """Which edges are the same behaviour, and so want one test between them.
+
+    `page` is in the class where `from_key` is not, for the reason below: the
+    variants of one form share a URL path, so they still collapse, while a
+    link on the dashboard stops being "the same behaviour" as a link on the
+    login page just because both moved and neither fired a request. Measured
+    2026-09-05 on a fixture of three pages: without it every dashboard edge
+    lost its class to a shallower login edge before allocation began.
 
     Standard equivalence partitioning: six `link:Sauce Labs <product>` edges out
     of the inventory page are one class, and testing a representative is the
@@ -400,6 +409,7 @@ def _equivalence(from_key: str, action: str, expect: Expectation) -> tuple:
     kind = f"submit[{form.group('mode')}]" if form else action.partition(":")[0]
     return (
         kind,
+        page,
         expect.moved,
         expect.mutating,
         _shape(expect.added),
@@ -513,12 +523,50 @@ def from_flow(world: WorldMap, hypothesis) -> Scenario | None:
     )
 
 
+def unwalked(world: WorldMap, hypothesis) -> tuple[str, str] | None:
+    """The first consecutive pair of a believed flow that no transition backs.
+
+    `from_flow` refuses such a flow, and rightly. But the refusal is also the
+    most specific steer the semantic layer produces -- "I believe A leads to C
+    and nobody has checked" -- and a count of refusals throws it away at the
+    one point an ant could act on it. This names the pair so `tools.brief` can
+    offer it as a dispatch target. The ant walks it or fails to; either way
+    the map decides, and the next plan compiles from what was recorded.
+
+    None for a non-flow, a flow citing fewer than two states, or a flow every
+    pair of which the crawler walked -- including one `from_flow` still
+    refuses for another reason (an edge that cannot be typed, an effect that
+    cannot be asserted), because walking it again would not change that.
+    """
+    if getattr(hypothesis, "kind", "") != "flow":
+        return None
+    path = hypothesis.states
+    if len(path) < 2:
+        return None
+    for from_key, to_key in zip(path, path[1:]):
+        walked = any(
+            key == from_key and any(t.to_key == to_key for t in taken)
+            for (key, _), taken in world.transitions.items()
+        )
+        if not walked:
+            return (from_key, to_key)
+    return None
+
+
 def scenarios(
     world: WorldMap,
     limit: int = 8,
     only: set[tuple[str, str]] | None = None,
+    per_page: int = 0,
 ) -> tuple[Scenario, ...]:
     """Every recorded edge, as a runnable scenario. Best first, capped.
+
+    `per_page` slots are reserved for every crawled page before any page takes
+    more -- see `by_page`. A page is the URL path of the state the terminal
+    action is taken from: the login form is ten states and one page. Zero
+    reserves nothing. The *number* is the Planner's decision, not this
+    module's: `planner.share` derives it from the map and the limit on every
+    run, and `planner.plan` records what it chose. This is the mechanism.
 
     One scenario per distinct terminal action rather than per destination
     state: two actions landing in the same place are still two behaviours, and
@@ -575,7 +623,7 @@ def scenarios(
             # Rank: informative terminal action, then a moving edge over a
             # self-loop, then the shortest route that gets there.
             rank = (_terminal_rank(action), 0 if expect.moved else 1, len(route))
-            klass = _equivalence(from_key, action, expect)
+            klass = _equivalence(from_key, action, expect, page_of(world, from_key))
             existing = best.get(klass)
             if existing is None or rank < existing[0]:
                 best[klass] = (
@@ -591,13 +639,64 @@ def scenarios(
                 )
 
     # Rank first, then allocate. Sorting decides which scenario represents a
-    # kind; `interleave` decides how many slots a kind may have. Doing only the
-    # first is what let one form fill an entire suite -- see `interleave`.
+    # kind; `by_page` then `interleave` decide how many slots a page and a kind
+    # may have. Ranking alone let one form fill an entire suite -- see
+    # `interleave` -- and kind-rotation alone let one *page* do it, because a
+    # login page offers every kind there is -- see `by_page`.
     ordered = sorted(best.items(), key=lambda item: item[1][0])
+    picked = by_page(
+        world, [scenario for _, (_, scenario) in ordered], per_page, limit
+    )
+    left = {id(s) for s in picked}
     groups: dict[str, list[Scenario]] = {}
     for klass, (_, scenario) in ordered:
-        groups.setdefault(klass[0], []).append(scenario)
-    return tuple(interleave(groups, limit))
+        if id(scenario) not in left:
+            groups.setdefault(klass[0], []).append(scenario)
+    return tuple(picked + interleave(groups, limit - len(picked)))
+
+
+def page_of(world: WorldMap, key: str) -> str:
+    """The URL path a state was first seen at. Descriptive, never identity --
+    `StateNode.url` says so -- which is exactly what makes it the right unit
+    for *fairness*: the ten states a login form passes through are one page to
+    the tester reading the suite, and a suite with ten login tests and none
+    for the dashboard has tested one page.
+    """
+    return urlparse(world.states[key].url).path or "/"
+
+
+def by_page(
+    world: WorldMap, ranked: list[Scenario], per_page: int, limit: int
+) -> list[Scenario]:
+    """Reserve `per_page` slots for every page before any page takes a third.
+
+    Measured 2026-09-05 on a Velogent run: 26 states over ten URL paths, and
+    all 23 scenarios terminated on the login page or its landing. `interleave`
+    rotates across kinds of action, and the login page supplies every kind --
+    three submit partitions, a button, a link -- so kind-fairness handed it the
+    whole suite while the dashboard, executions and human-tasks pages, each
+    offering 25 actions, got nothing.
+
+    Round-robin across pages, best-ranked first within each, one slot per page
+    per round: no page gets its second before every page has its first, so a
+    limit smaller than pages x `per_page` still spreads. Whatever `limit` has
+    left over is `interleave`'s to allocate by kind, as before.
+
+    `ranked` must be best-first; `scenarios()` sorts before calling.
+    """
+    queues: dict[str, list[Scenario]] = {}
+    for scenario in ranked:
+        queues.setdefault(page_of(world, scenario.terminal.from_key), []).append(
+            scenario
+        )
+    picked: list[Scenario] = []
+    for _ in range(max(per_page, 0)):
+        for page in list(queues):
+            if len(picked) >= limit:
+                return picked
+            if queues[page]:
+                picked.append(queues[page].pop(0))
+    return picked
 
 
 # --- artifacts -----------------------------------------------------------

@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from sqlmodel import Session
 
-from agents import generator, runner
+from agents import generator, planner, runner
 from agents.explorer import store
 from agents.explorer.forms import Credentials
 from app.db import engine
@@ -44,7 +44,9 @@ def scenarios_for(run_id: int, limit: int = 8) -> tuple[generator.Scenario, ...]
     """Every runnable scenario the baseline run's map supports."""
     with Session(engine) as db:
         world = store.load(run_id, db)
-    return generator.scenarios(world, limit=limit)
+    return generator.scenarios(
+        world, limit=limit, per_page=planner.share(world, limit)[1]
+    )
 
 
 def verify(
