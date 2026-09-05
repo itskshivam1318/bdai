@@ -390,6 +390,23 @@ def _suite_download() -> bool:
                 f"got {names}",
             )
 
+            # The specs `fill()` a literal username and password, because a
+            # suite that cannot log in is not runnable standalone -- which is
+            # the whole claim of the download. That is a defensible trade and
+            # an indefensible surprise, so the archive has to say it out loud.
+            # The redaction seam covers what was *observed*; nothing about it
+            # covers what was deliberately written into an exported test.
+            readme = ""
+            if archive.status_code == 200:
+                with zipfile.ZipFile(io.BytesIO(archive.content)) as opened:
+                    readme = opened.read("README.md").decode("utf-8")
+            ok &= check(
+                "the archive says it carries the credentials it recorded with",
+                "AIVAR_PASSWORD" in readme and "carrying a credential" in readme,
+                "a judge unzipping this finds a password and no warning that "
+                "it is one",
+            )
+
             ok &= check(
                 "one spec can be downloaded on its own",
                 client.get(

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import sys
 from pathlib import Path
 
@@ -2247,6 +2248,14 @@ def main() -> int:
         # The console's chat reads this one. It has no tool loop to fail
         # loudly, so a broken prompt would show up only as a vague answer.
         ("analyst", "explorer ants built"),
+        # The synthesiser's. A flow is the only thing here a ranking over
+        # single edges can never propose, so a model that stops at two states
+        # is adding almost nothing the deterministic planner would not have
+        # found -- every kept suite on disk had a maximum of two steps. The
+        # instruction to follow the chain as far as the map genuinely backs it
+        # is the difference, and it is one sentence away from being lost in an
+        # edit nobody would notice.
+        ("behaviour", "longest chain the map actually backs"),
     ):
         text = instructions(role)
         ok &= check(
@@ -2358,6 +2367,11 @@ def main() -> int:
     ok &= _planner_checks()
     print()
     ok &= _versioning_checks()
+    ok &= _baseline_checks()
+    ok &= _gate_wiring_checks()
+    ok &= _console_planner_checks()
+    ok &= _refresh_checks()
+    ok &= _carry_checks()
     ok &= _rescue_checks()
     ok &= _ladder_checks()
     ok &= _reverify_checks()
@@ -4578,6 +4592,595 @@ def _claim_checks() -> bool:
         "with no model there is nothing to steer, so nothing to spend",
         steer({claims[0]: ()}, None) == (),
         "a model-free run would re-crawl for every claim it could never match",
+    )
+    return ok
+
+
+def _baseline_checks() -> bool:
+    """What may become a baseline, and what a run refuses to record.
+
+    Every scenario this run compiled used to enter v001 regardless of what it
+    did when it was run, with the verdict written beside it as a note. That is
+    the one thing a baseline may not be: a suite recorded already failing has
+    nothing to regress *from*, so next week's replay compares a change against
+    a test that was never true.
+
+    `passed` and `healed` are kept and `defect` and `escalate` are refused, and
+    the asymmetry is the point. A `healed` scenario resolved its control on a
+    lower rung and then the application did exactly what it was recorded doing
+    -- the behaviour under test is intact and only the locator was stale, so
+    the healed locator is written in as the recorded one and the scenario is
+    sound. A `defect` scenario observed the app do something else. There is no
+    edit that makes it a baseline; there is only the decision not to record it.
+    """
+    from . import regression, runner
+    from .generator import Expectation, Scenario, Step
+
+    print("BASELINE    what a run refuses to record as its first suite")
+    ok = True
+
+    def scenario(name: str, action: str) -> Scenario:
+        return Scenario(
+            name=name,
+            target_url="http://localhost:3000/sut",
+            steps=(Step(
+                intent="press the button", action=action, from_key="a" * 16,
+                fields=(),
+                expect=Expectation(moved=True, mutating=True, added=(), removed=(),
+                                   to_key="b" * 16),
+            ),),
+            origin="map",
+        )
+
+    def result(sc: Scenario, verdict: str, *, rung: str = "exact",
+               action: str | None = None) -> runner.Result:
+        return runner.Result(
+            scenario=sc,
+            target_url=sc.target_url,
+            steps=[runner.StepResult(
+                step=sc.steps[0],
+                verdict=verdict,
+                resolution=runner.Resolution(
+                    action=action if action is not None else sc.steps[0].action,
+                    rung=rung, detail="",
+                ),
+                detail="",
+                actual_key="b" * 16,
+            )],
+        )
+
+    good = scenario("sign in", "button:Sign in")
+    bad = scenario("check out", "button:Check out")
+
+    try:
+        kept = regression.baseline(
+            (good, bad),
+            (result(good, runner.PASSED), result(bad, runner.DEFECT)),
+        )
+    except Exception as exc:  # noqa: BLE001 -- a missing gate must read as FAIL
+        return check(
+            "a scenario that failed when it was run does not become the baseline",
+            False,
+            f"{type(exc).__name__}: {exc}",
+        )
+
+    ok &= check(
+        "a scenario that failed when it was run does not become the baseline",
+        tuple(s.name for s in kept.scenarios) == ("sign in",),
+        f"recorded {[s.name for s in kept.scenarios]}, which includes a defect",
+    )
+
+    # A rename between the crawl and the replay is the ordinary case on a live
+    # app. The behaviour was upheld, so the scenario is kept -- but it is kept
+    # naming the control that exists now, or v001 is born holding a locator
+    # that already failed once.
+    renamed = regression.baseline(
+        (good,),
+        (result(good, runner.HEALED, rung="similarity", action="button:Log in"),),
+    )
+    ok &= check(
+        "a healed scenario is recorded naming the control that exists now",
+        renamed.scenarios[0].steps[0].action == "button:Log in",
+        f"recorded {renamed.scenarios[0].steps[0].action!r}, the stale locator",
+    )
+
+    # A gate that drops a scenario and says nothing is worse than no gate: the
+    # suite is quietly smaller and the report still claims the plan was kept.
+    ok &= check(
+        "a refused scenario is named, with the verdict that refused it",
+        kept.refused == (("check out", runner.DEFECT),),
+        f"refused={kept.refused!r}",
+    )
+
+    # The deadline case. `pipeline.run` breaks out of the replay loop on time,
+    # so a plan can be longer than the results it produced -- and a scenario
+    # nobody ran is not evidence of anything. Recording it would put an
+    # unverified test in the baseline under the same roof as seven verified
+    # ones, which is the one place the distinction stops being visible.
+    unrun = regression.baseline((good, bad), (result(good, runner.PASSED),))
+    ok &= check(
+        "a scenario the run never got to is not recorded as a baseline",
+        tuple(s.name for s in unrun.scenarios) == ("sign in",)
+        and unrun.refused == (("check out", "not run"),),
+        f"kept={[s.name for s in unrun.scenarios]} refused={unrun.refused!r}",
+    )
+    return ok
+
+
+def _gate_wiring_checks() -> bool:
+    """The gate is not a function that exists. It is a function `keep` calls.
+
+    `baseline` is pure and pinned four ways above, and every one of those checks
+    would still pass if nothing ever called it. That is the failure this guards:
+    the decision was written, reviewed, and left out of the path that records a
+    suite, so v001 goes on holding the defect and every check but this one is
+    green about it.
+
+    Driven against a real page because `keep` fingerprints the target before it
+    records, and a fingerprint is the one thing here that cannot be constructed.
+    """
+    import tempfile
+
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import sync_playwright
+
+    from . import regression, runner
+    from .explorer.forms import Credentials
+    from .generator import Expectation, Scenario, Step
+
+    print("\nGATE        the baseline decision is wired into the path that records")
+    ok = True
+
+    def scenario(name: str, action: str) -> Scenario:
+        return Scenario(
+            name=name, target_url=SUT,
+            steps=(Step(
+                intent="press the button", action=action, from_key="a" * 16,
+                fields=(),
+                expect=Expectation(moved=True, mutating=True, added=(), removed=(),
+                                   to_key="b" * 16),
+            ),),
+            origin="map",
+        )
+
+    def result(sc: Scenario, verdict: str) -> runner.Result:
+        return runner.Result(
+            scenario=sc, target_url=sc.target_url,
+            steps=[runner.StepResult(
+                step=sc.steps[0], verdict=verdict,
+                resolution=runner.Resolution(sc.steps[0].action, "exact", ""),
+                detail="", actual_key="b" * 16,
+            )],
+        )
+
+    good = scenario("sign in", "button:Sign in")
+    bad = scenario("check out", "button:Check out")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp) / "suite"
+        try:
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch()
+                page = browser.new_page()
+                kept = regression.keep(
+                    page, (good, bad), target_url=SUT,
+                    results=(result(good, runner.PASSED),
+                             result(bad, runner.DEFECT)),
+                    credentials=Credentials(username="u", password="p"),
+                    root=root, export_too=False,
+                )
+                browser.close()
+        except PlaywrightError:
+            print(f"        SKIPPED -- needs `make dev` for the SUT at {SUT}")
+            return True
+
+        recorded = tuple(entry["name"] for entry in kept.version.scenarios)
+
+    ok &= check(
+        "recording a suite refuses the scenario that failed",
+        recorded == ("sign in",),
+        f"v001 holds {list(recorded)}, so the baseline was born already red",
+    )
+
+    # The CLI reaches the same place by a different road. `pipeline._keep` had
+    # its own copy of the record branch, so a gate added to `regression.keep`
+    # would be true of the console and false of `make pipeline` -- two entry
+    # points disagreeing about what a baseline is.
+    from . import pipeline as pipeline_module
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp) / "suite"
+        try:
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch()
+                page = browser.new_page()
+                pipe = pipeline_module.Pipeline(target_url=SUT)
+                pipe.plan = (good, bad)
+                pipe.results = [result(good, runner.PASSED),
+                                result(bad, runner.DEFECT)]
+                pipe.plan_source = "map"
+                pipeline_module._keep(
+                    pipe, page, Credentials(username="u", password="p"),
+                    lambda decision, surface=None: None,
+                    lambda level, message, surface=None: None,
+                    suite_root=root,
+                )
+                browser.close()
+        except PlaywrightError:
+            print(f"        SKIPPED -- needs `make dev` for the SUT at {SUT}")
+            return ok
+
+        by_cli = tuple(entry["name"] for entry in pipe.version.scenarios)
+
+    ok &= check(
+        "the CLI records the same baseline the console would",
+        by_cli == ("sign in",),
+        f"`make pipeline` wrote {list(by_cli)} where the console wrote ['sign in']",
+    )
+    return ok
+
+
+def _console_planner_checks() -> bool:
+    """The console plans through the Planner, or the semantic layer is decoration.
+
+    The console computed a behavioural model, streamed every believed claim to
+    the screen, and then compiled its suite with `generator.scenarios(world)` --
+    the raw edge ranker, which structurally cannot express a sequence. So the
+    one thing the colony exists to add reached the operator's eyes and never
+    reached a test, and the kept suite recorded `source="map"` from a literal
+    rather than from what actually planned it.
+
+    Measured before this: every console-recorded version on disk carried
+    `source: map` with all-`map` origins, while the CLI's carried
+    `source: behaviour` with `behaviour:flow` scenarios in it -- two entry
+    points over one codebase producing different suites from the same app.
+    """
+    from .behavior import BehaviorModel, Hypothesis
+    from app.routers.explore import compose_plan
+
+    print("\nCONSOLE     the suite the console keeps comes from the Planner")
+    ok = True
+
+    world, a, b, c = _planner_world()
+    believed = BehaviorModel(
+        summary="a sign-in that leads home",
+        hypotheses=(Hypothesis(
+            claim="signing in leads to the home page", kind="flow", cites=(a, b, c),
+        ),),
+    )
+
+    planned = compose_plan(world, believed)
+    ok &= check(
+        "a flow the colony believed reaches the console's suite",
+        any(s.origin == "behaviour:flow" for s in planned.scenarios),
+        f"origins were {[s.origin for s in planned.scenarios]}",
+    )
+    ok &= check(
+        "and the version records what planned it, not a literal",
+        planned.source == "behaviour",
+        f"source={planned.source!r}",
+    )
+
+    # The floor. A console run with no key has no behavioural model, and the
+    # deterministic plan must still be the whole suite rather than nothing.
+    bare = compose_plan(world, BehaviorModel())
+    ok &= check(
+        "with no model the console still plans from the map alone",
+        bool(bare.scenarios)
+        and all(s.origin == "map" for s in bare.scenarios),
+        f"{len(bare.scenarios)} scenario(s), origins "
+        f"{[s.origin for s in bare.scenarios]}",
+    )
+
+    # `compose_plan` behaving correctly proves nothing about the run that is
+    # supposed to call it -- the first version of this fix defined the function,
+    # passed all three checks above, and left the run body compiling its suite
+    # with the ranker exactly as before. `scenarios` legitimately survives in
+    # this module for the *wider* list claims are attributed against; what may
+    # not come back is it producing the plan.
+    import inspect
+
+    import app.routers.explore as console
+
+    body = inspect.getsource(console)
+    ok &= check(
+        "the console's run path plans through the Planner, not the ranker",
+        "plan = scenarios(" not in body,
+        "explore.py still builds its suite with generator.scenarios, so the "
+        "behavioural model reaches the screen and not the tests",
+    )
+    return ok
+
+
+def _refresh_checks() -> bool:
+    """The behavioural model goes stale during WATCH unless something refills it.
+
+    RECORD builds the model once. WATCH then replays the suite, heals locators
+    against the live page, and writes `map_updates` back to the world model --
+    and touches the behavioural model not at all. So after a structural change
+    the system's *understanding* of the app is the understanding it had before
+    the change, and stays that way until somebody runs a whole record pass.
+
+    `refresh` is the narrow fix: re-synthesise over the region that moved, and
+    carry everything else through. Two properties, and the second is the one
+    that makes it safe.
+
+    **A claim about the region is replaced.** That is the point.
+
+    **A claim about anywhere else is carried, not re-admitted.** `admit()`
+    grounds a hypothesis against the map it is given, and the map here is a
+    *region* -- eight states around the one that moved. Re-admitting the whole
+    prior model against it would drop every claim about the rest of the
+    application for the sole reason that this crawl did not look there, which
+    would turn a local repair into global amnesia.
+    """
+    from .behavior import BehaviorModel, Hypothesis, refresh
+    from .llm import ToolCall, Turn
+
+    print("\nREFRESH     the behavioural model is refilled where the app moved")
+    ok = True
+
+    region, a, b, c = _planner_world()
+    # The region crawl saw `a` and `b`. `c` is elsewhere in the application and
+    # this crawl never went there.
+    del region.states[c]
+
+    prior = BehaviorModel(
+        summary="a sign-in that leads home",
+        hypotheses=(
+            Hypothesis(claim="signing in authenticates", kind="flow", cites=(a, b)),
+            Hypothesis(claim="the profile page lists orders", kind="flow",
+                       cites=(c,)),
+        ),
+    )
+
+    class Revised:
+        """Reports what the region looks like now."""
+
+        name, model = "scripted:revised", "none"
+
+        def turn(self, system, transcript, tool_defs):
+            return Turn(text="", calls=(ToolCall(
+                id="m1", name="model",
+                arguments={
+                    "summary": "a sign-in that now lands on a dashboard",
+                    "hypotheses": [
+                        {"claim": "signing in reaches the dashboard",
+                         "kind": "flow", "cites": [a, b]},
+                    ],
+                },
+            ),))
+
+    refreshed = refresh(prior, region, Revised())
+    claims = tuple(h.claim for h in refreshed.hypotheses)
+
+    ok &= check(
+        "a claim about the region that moved is replaced",
+        "signing in reaches the dashboard" in claims
+        and "signing in authenticates" not in claims,
+        f"claims={claims}",
+    )
+    ok &= check(
+        "a claim about the rest of the app is carried, not dropped",
+        "the profile page lists orders" in claims,
+        "re-admitting the prior model against a region map forgets every claim "
+        "about everywhere the region crawl did not go",
+    )
+
+    # With no provider there is nothing that can interpret the region, and the
+    # honest answer is the model we already had -- not an empty one.
+    # `synthesise` returns empty without a provider by design, so a refresh
+    # that simply forwarded it would delete the whole model on a no-key run.
+    ok &= check(
+        "with no provider the prior model survives untouched",
+        refresh(prior, region, None).hypotheses == prior.hypotheses,
+        "a no-key WATCH run erased the behavioural model it started with",
+    )
+
+    # `synthesise` has always taken a `prior` and nothing has ever passed one,
+    # so the parameter was live and unexercised -- and `brief` renders it in the
+    # shape `Exploration` used to have (summary / flows / gaps), which a
+    # `BehaviorModel` no longer produces. A refresh that hands over its prior
+    # and has it silently rendered as nothing is a refresh that re-reads the
+    # region with no memory of what it used to believe.
+    from .behavior import as_prior, brief
+
+    rendered = brief(region, as_prior(prior))
+    ok &= check(
+        "the prior model reaches the prompt that is asked to revise it",
+        "the profile page lists orders" in rendered,
+        "brief() renders a prior's summary and drops every hypothesis in it",
+    )
+
+    # Refreshing a model that dies with the process is the same as not
+    # refreshing it. Run N+1 recomputes its understanding from zero today, so a
+    # repair teaches the system nothing and the dashed "replayed again" arrow
+    # goes nowhere. The model rides with the suite: same version, same
+    # directory, one `git diff` away from being argued with.
+    import tempfile
+
+    from . import regression
+    from .behavior import BehaviorModel as Model
+    from .explorer.forms import Credentials
+    from .generator import Expectation, Scenario, Step
+
+    kept_model = BehaviorModel(
+        summary="a sign-in that leads home",
+        hypotheses=(Hypothesis(claim="signing in authenticates", kind="flow",
+                               cites=(a, b), status="supported",
+                               because="the map walked it"),),
+    )
+    only = Scenario(
+        name="sign in", target_url="http://sut/",
+        steps=(Step(intent="press", action="button:Sign in", from_key=a,
+                    fields=(),
+                    expect=Expectation(moved=True, mutating=True, added=(),
+                                       removed=(), to_key=b)),),
+        origin="map",
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp) / "suite"
+        regression.emit(
+            (only,), root, because="probe", credentials=Credentials("u", "p"),
+            target_url="http://sut/", behaviour=kept_model,
+        )
+        reloaded = regression.versions(root)[-1].behaviour
+
+    ok &= check(
+        "the behavioural model is kept with the suite version",
+        isinstance(reloaded, Model)
+        and tuple(h.claim for h in reloaded.hypotheses)
+        == ("signing in authenticates",),
+        f"reloaded={reloaded!r}",
+    )
+    ok &= check(
+        "and it comes back with the citations a refresh needs to place it",
+        bool(reloaded.hypotheses) and reloaded.hypotheses[0].cites == (a, b),
+        "without cites, the next refresh cannot tell a claim about the region "
+        "that moved from a claim about anywhere else",
+    )
+    ok &= check(
+        "and with the verdict the map had already reached on it",
+        bool(reloaded.hypotheses)
+        and reloaded.hypotheses[0].status == "supported",
+        "a supported invariant reloaded as unexamined is evidence thrown away",
+    )
+    return ok
+
+
+def _carry_checks() -> bool:
+    """A version emitted by the healer keeps the understanding it inherited.
+
+    `emit` defaults the model to empty, so the moment `verify` heals anything
+    the new version is written with no behavioural model at all -- and the
+    knowledge the run before it built is gone, silently, at exactly the moment
+    the suite is claiming to have carried forward. Losing it here would be
+    worse than never having stored it: v001 has a model, v002 does not, and the
+    lineage reads as though the app became uninterpretable.
+
+    With no provider there is nothing to refresh *with*, and the right answer
+    is still to carry -- for the same reason `refresh` returns its prior rather
+    than an empty model on a no-key run.
+    """
+    import tempfile
+
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import sync_playwright
+
+    from . import regression
+    from .behavior import BehaviorModel, Hypothesis
+    from .explorer.forms import Credentials
+
+    print("\nCARRY       a healed version inherits what the last one believed")
+    ok = True
+
+    believed = BehaviorModel(
+        summary="a sign-in that leads home",
+        hypotheses=(Hypothesis(claim="signing in authenticates", kind="flow",
+                               cites=("a" * 16,)),),
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp) / "suite"
+        try:
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch()
+                page = browser.new_page()
+                # Record against v1, then replay against v2 -- the markup knob,
+                # so the ladder heals and a new version is genuinely emitted.
+                page.goto(f"{SUT}?v=1")
+                from .explorer.crawler import Budget, crawl
+                from .planner import plan as make_plan
+
+                world = crawl(page, f"{SUT}?v=1", Budget(max_states=6,
+                                                         max_actions=12,
+                                                         max_seconds=60))
+                planned = make_plan(world, None, source="map", limit=4)
+                if not planned.scenarios:
+                    browser.close()
+                    print("        SKIPPED -- the crawl compiled no scenarios")
+                    return ok
+                regression.emit(
+                    planned.scenarios, root, because="probe baseline",
+                    credentials=Credentials("u", "p"),
+                    target_url=f"{SUT}?v=1", behaviour=believed,
+                )
+                report = regression.verify(
+                    page, root, target_url=f"{SUT}?v=2",
+                    credentials=Credentials("u", "p"),
+                    reverify=False, rescue=False,
+                )
+                browser.close()
+        except PlaywrightError as exc:
+            print(f"        SKIPPED -- needs `make dev` for the SUT ({exc})")
+            return ok
+
+        if report.emitted is None:
+            print("        SKIPPED -- nothing healed, so no version was emitted")
+            return ok
+
+        carried = report.emitted.behaviour
+
+    # The branch that only runs when a provider exists. Nothing above reaches
+    # it -- these checks run without a key -- so `verify`'s call into
+    # `rescue.look` was never executed by anything, and when `look` changed its
+    # signature on main the break was invisible: every check passed and the
+    # refresh would have raised `TypeError` on the first real WATCH run with a
+    # key set. A scripted provider cannot say anything useful about the region,
+    # and does not need to. What is under test is that the call is made and
+    # survives.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp) / "suite"
+        spoke: list[str] = []
+        try:
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch()
+                page = browser.new_page()
+                from .explorer.crawler import Budget, crawl
+                from .planner import plan as make_plan
+
+                world = crawl(page, f"{SUT}?v=1",
+                              Budget(max_states=6, max_actions=12,
+                                     max_seconds=60))
+                planned = make_plan(world, None, source="map", limit=3)
+                if planned.scenarios:
+                    regression.emit(
+                        planned.scenarios, root, because="probe baseline",
+                        credentials=Credentials("u", "p"),
+                        target_url=f"{SUT}?v=1", behaviour=believed,
+                    )
+                    regression.verify(
+                        page, root, target_url=f"{SUT}?v=2",
+                        credentials=Credentials("u", "p"),
+                        reverify=False, rescue=False,
+                        provider=Colony(),
+                        on_event=lambda level, message: spoke.append(message),
+                    )
+                browser.close()
+        except PlaywrightError as exc:
+            print(f"        SKIPPED -- needs `make dev` for the SUT ({exc})")
+            return ok
+        except TypeError as exc:
+            return ok & check(
+                "the refresh path runs when a provider is configured",
+                False,
+                f"verify raised {exc} -- the branch no check had ever entered",
+            )
+
+    ok &= check(
+        "the refresh path runs when a provider is configured",
+        any("behaviour refreshed" in line for line in spoke),
+        "verify never reported a refresh, so the provider branch was skipped "
+        "and would still be unexercised",
+    )
+
+    ok &= check(
+        "the emitted version carries the model the last one held",
+        tuple(h.claim for h in carried.hypotheses)
+        == ("signing in authenticates",),
+        f"v{report.emitted.number:03d} was written with "
+        f"{len(carried.hypotheses)} hypothesis(es); the run before it had 1",
     )
     return ok
 

@@ -249,6 +249,52 @@ class BehaviorModel:
     def of_kind(self, kind: str) -> tuple[Hypothesis, ...]:
         return tuple(h for h in self.hypotheses if h.kind == kind)
 
+    def as_dict(self) -> dict:
+        """The whole model, losslessly, for a version.json to carry.
+
+        `cites` and `status` are the two fields that would be tempting to drop
+        and cannot be. Without `cites`, `refresh` cannot tell a claim about the
+        region that moved from a claim about the rest of the app, and the merge
+        it does becomes a guess. Without `status`, a hypothesis the map had
+        already ruled on comes back `unexamined` and the evidence that settled
+        it is thrown away on reload.
+        """
+        return {
+            "summary": self.summary,
+            "dropped": self.dropped,
+            "hypotheses": [
+                {
+                    "claim": h.claim, "kind": h.kind, "cites": list(h.cites),
+                    "why": h.why, "rule": h.rule, "status": h.status,
+                    "because": h.because,
+                }
+                for h in self.hypotheses
+            ],
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict | None) -> BehaviorModel:
+        """Read one back. An absent or malformed block is an empty model."""
+        if not isinstance(raw, dict):
+            return cls()
+        return cls(
+            summary=raw.get("summary", "") or "",
+            dropped=int(raw.get("dropped", 0) or 0),
+            hypotheses=tuple(
+                Hypothesis(
+                    claim=h.get("claim", ""),
+                    kind=h.get("kind", ""),
+                    cites=tuple(h.get("cites") or ()),
+                    why=h.get("why", ""),
+                    rule=h.get("rule", ""),
+                    status=h.get("status", UNEXAMINED),
+                    because=h.get("because", ""),
+                )
+                for h in (raw.get("hypotheses") or ())
+                if isinstance(h, dict)
+            ),
+        )
+
     @property
     def open(self) -> tuple[Hypothesis, ...]:
         """Everything nothing has examined yet. What the orchestrator acts on."""
@@ -499,12 +545,107 @@ def brief(world: WorldMap, prior: dict | None = None) -> str:
             "",
             f"  {prior.get('summary', '')}",
         ]
+        # What was believed last time, when this is a *refresh* rather than a
+        # first reading. The region below has just been re-crawled because
+        # something in it moved, so these are the claims the revision is
+        # revising -- a model asked to re-read a screen with no record of what
+        # it used to think there will simply describe it afresh, and the
+        # difference between "this changed" and "this is what I see" is the
+        # whole of what a refresh is for.
+        believed = prior.get("hypotheses") or ()
+        if believed:
+            lines += [
+                "",
+                "It previously believed the following about this application. "
+                "Say which of these the region below has changed, and restate "
+                "those; leave the rest alone:",
+                "",
+            ]
+            lines += [
+                f"  [{claim.get('kind', '?')}] {claim.get('claim', '')}"
+                + (
+                    f"  ({claim['status']})"
+                    if claim.get("status") and claim["status"] != "unexamined"
+                    else ""
+                )
+                for claim in believed
+            ]
         for flow in prior.get("flows") or ():
             lines.append(f"  flow: {flow.get('name', '')} -- {flow.get('why', '')}")
         for gap in prior.get("gaps") or ():
             lines.append(f"  did not reach: {gap}")
 
     return "\n".join(lines)
+
+
+def refresh(
+    prior: BehaviorModel,
+    region: WorldMap,
+    provider=None,
+    *,
+    on_event=None,
+    run_id: int | None = None,
+) -> BehaviorModel:
+    """Re-interpret the part of the app that moved, and keep the rest.
+
+    RECORD builds the behavioural model once. WATCH then replays the suite and
+    heals locators against the live page, writing corrections back to the
+    *world* model -- and touching this one not at all. So after a structural
+    change the system's understanding of the application is the understanding
+    it had before the change, and stays that way until somebody runs a whole
+    record pass again. That is the loop the architecture draws and the code did
+    not have.
+
+    **Everything outside the region is carried, not re-admitted.** `admit()`
+    grounds a hypothesis against the map it is handed, and the map here is a
+    region -- a handful of states around the one that moved. Re-admitting the
+    prior model against it would drop every claim about the rest of the
+    application for the single reason that this crawl did not look there,
+    turning a local repair into global amnesia. Membership is decided by
+    citation: a hypothesis citing any state the region crawl re-observed is the
+    model's old reading of ground that has just been re-read, so the fresh
+    reading replaces it.
+
+    **With no provider the prior model survives unchanged.** `synthesise`
+    returns an *empty* model without one, by design -- there is no deterministic
+    way to guess what an application means. Forwarding that here would delete
+    the whole behavioural model on a no-key WATCH run, which is the opposite of
+    the honest answer: nothing was learned, so nothing changes.
+    """
+    if provider is None:
+        return prior
+
+    fresh = synthesise(
+        region, provider, prior=as_prior(prior), on_event=on_event, run_id=run_id
+    )
+    if not fresh.hypotheses:
+        # The provider answered with nothing admissible. The region was looked
+        # at and produced no reading, which is not evidence against what we
+        # already believed.
+        return prior
+
+    inside = set(region.states)
+    carried = tuple(
+        hypothesis
+        for hypothesis in prior.hypotheses
+        if not any(citation in inside for citation in hypothesis.cites)
+    )
+    return BehaviorModel(
+        summary=fresh.summary or prior.summary,
+        hypotheses=carried + fresh.hypotheses,
+        dropped=fresh.dropped,
+    )
+
+
+def as_prior(model: BehaviorModel) -> dict:
+    """The model as `brief` wants to read it back."""
+    return {
+        "summary": model.summary,
+        "hypotheses": [
+            {"claim": h.claim, "kind": h.kind, "status": h.status}
+            for h in model.hypotheses
+        ],
+    }
 
 
 def synthesise(
