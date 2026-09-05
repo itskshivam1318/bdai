@@ -959,3 +959,65 @@ and the Sarvam no-free-tier path. 70 PASS / 0 FAIL across all offline sections.
 which lives in the browser under BYOK and never reaches this process.
 
 **Who:** shivam + Claude.
+
+---
+
+## 2026-09-05 10:50 — A scenario's name is not its identity, and attribution was matching on the name
+
+The console reported:
+
+    claim not tested: A valid login should land on the logged-in-successfully
+    page. -- nothing in the suite exercises it
+
+It had been tested. `TestCase.path` for scenario 0 of that run reads
+`/practice-test-login/ -> /logged-in-successfully/`, verdict **passed**. The
+suite tested the one thing the user typed out, it passed, and the report said
+nothing exercised it. A false "not tested" on the claim the user asked for by
+name is worse than not testing it: it sends someone to write a test that exists.
+
+**Root cause.** `claims.brief` rendered each scenario as its name plus its step
+intents, and nothing else. That crawl produced *two* scenarios named
+`complete the Submit form and submit it` -- one landing on
+`/logged-in-successfully/`, one on `/contact/` -- which the brief rendered as
+two identical lines. The model was asked which of them covers a claim about
+landing on the logged-in page and was given nothing to tell them apart, so it
+declined to guess. Given the system prompt says a loose match is the expensive
+error, declining was the *correct* behaviour on the brief it was handed. The
+defect is in the question, not the answer.
+
+**Proven, not reasoned.** Same claim, same scenarios, same model, one line per
+scenario added saying where it ends:
+
+    control (as shipped)   claim 0 -> []      the false "not tested"
+    variant (+destination) claim 0 -> [0]     the scenario that does it
+
+**The fix is one line in the brief and a dict to feed it.** `brief` and
+`attribute` take `where: dict[str, str]`, state key to the URL the crawl saw it
+at, and render `ends on <url>` under each scenario. A plain dict rather than the
+WorldMap it comes from, so `claims.py` stays about claims; `explore._landings`
+is the one comprehension that reduces it.
+
+Where a scenario ends is the right discriminator on the merits, not just the
+convenient one: it is *measured* -- `Expectation.to_key` is computed from the
+diff between two observed states -- so citing it carries the same guarantee the
+rest of this module insists on. A name is invented by `intent_of` and the
+generator can emit the same one twice.
+
+**Verified end to end**, same session and target: before, `claim uncovered` and
+`claim not tested`. After, `claims: 1 of 1 covered by the compiled suite` and
+`claim passed: ... -- complete the Submit form and submit it`.
+
+**Checks:** 3 in `agents.probe` under CLAIMS, on a fixture of two same-named
+scenarios with different destinations -- that the brief names each destination,
+that it attaches each under its own scenario rather than listing them loose, and
+that a scenario whose terminal state is missing from the map still renders. 269
+PASS / 0 FAIL, `make check` clean.
+
+**Still open, and not fixed here:** `with_claimed` de-duplicates by
+`scenario.name`. With two scenarios sharing a name, a claim needing the one the
+cap dropped will find its namesake already in the plan and not be added. Not hit
+in this run because both were already in the suite. It is the same wrong
+assumption as above -- name as identity -- in a second place, and it belongs to
+whoever owns `claims.py`.
+
+**Who:** shivam + Claude.

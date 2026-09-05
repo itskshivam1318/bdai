@@ -2712,6 +2712,17 @@ def _claim_checks() -> bool:
         with_claimed(capped, plan, {claims[0]: (1,)}) == (plan[0], plan[1]),
         f"got {[s.name for s in with_claimed(capped, plan, {claims[0]: (1,)})]}",
     )
+    # Same wrong assumption as the brief's, in a second place: two scenarios can
+    # share a name, so a name is not an identity. A claim needing the twin the
+    # cap dropped would find its namesake in the plan and never be added -- the
+    # suite would then not contain the scenario the report says answers it.
+    ok &= check(
+        "a claim's scenario is added even when a namesake is already in the plan",
+        with_claimed((twins[0],), twins, {claims[0]: (1,)}) == (twins[0], twins[1]),
+        f"got {len(with_claimed((twins[0],), twins, {claims[0]: (1,)}))} scenario(s); "
+        "the twin that lands somewhere else was swallowed by its own name",
+    )
+
     ok &= check(
         "a claim's scenario already in the suite is not run twice",
         with_claimed(plan, plan, {claims[0]: (1,)}) == plan,
