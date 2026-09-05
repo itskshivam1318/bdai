@@ -251,6 +251,190 @@ def _status_policy() -> bool:
     return ok
 
 
+def _suite_download() -> bool:
+    """The suite endpoints, against a real version directory written here.
+
+    Written rather than pointed at `artifacts/suites/`: a probe that passes only
+    on the machine that has already recorded a suite is a probe that tells you
+    nothing on a fresh checkout, and this one has to fail when the router stops
+    finding files.
+    """
+    import io
+    import zipfile
+
+    from agents import regression
+    from agents.generator import Scenario, Step
+    from agents.generator import Expectation
+
+    print("\nSUITE       kept versions, served as files")
+    ok = True
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp) / "suites" / "example-com"
+        scenario = Scenario(
+            name="follow the Home link",
+            target_url="https://example.com",
+            origin="map",
+            steps=(
+                Step(
+                    intent="follow the Home link",
+                    action="link:Home",
+                    from_key="aaaa000000000000",
+                    fields=(),
+                    expect=Expectation(
+                        moved=True,
+                        mutating=False,
+                        added=("heading Welcome",),
+                        removed=(),
+                        to_key="bbbb000000000000",
+                    ),
+                ),
+            ),
+        )
+        version = regression.emit(
+            (scenario,),
+            root,
+            because="recorded by the probe",
+            target_url="https://example.com",
+            source="map",
+            outcomes=("passed",),
+        )
+
+        engine = create_engine(
+            f"sqlite:///{tmp}/suite.db", connect_args={"check_same_thread": False}
+        )
+        SQLModel.metadata.create_all(engine)
+
+        def override():
+            with Session(engine) as session:
+                yield session
+
+        app.dependency_overrides[get_session] = override
+        client = TestClient(app)
+        with Session(engine) as session:
+            run = Run(target_url="https://example.com", status="passed")
+            session.add(run)
+            session.commit()
+            session.refresh(run)
+            session.add(
+                TestCase(
+                    run_id=run.id,
+                    name="follow the Home link",
+                    status="defect",
+                    suite_version=version.label,
+                )
+            )
+            session.commit()
+            run_id = run.id
+
+        # The router resolves the directory from the target URL, so the probe
+        # has to put its version where `directory_for` will look.
+        original = regression.SUITES
+        regression.SUITES = pathlib.Path(tmp) / "suites"
+        try:
+            body = client.get(f"/api/runs/{run_id}/suite").json()
+            ok &= check(
+                "a run names the version kept for its target",
+                body["version"] and body["version"]["label"] == version.label,
+                f"got {body.get('version')}",
+            )
+            ok &= check(
+                "every kept scenario is listed",
+                len(body["specs"]) == 1,
+                f"got {len(body['specs'])}",
+            )
+            spec = body["specs"][0] if body["specs"] else {}
+            ok &= check(
+                "a baseline claims no re-verification, because there was none",
+                body["version"]["reverified"] == {} and body["version"]["rescues"] == 0,
+                "a version that never replayed anything must not wear the badge",
+            )
+            ok &= check(
+                "a spec arrives with its runnable source, not just a filename",
+                "@playwright/test" in spec.get("code", ""),
+                f"got {len(spec.get('code', ''))} bytes",
+            )
+            # The whole point of the join: the panel must show what *this* run
+            # did, not the verdict frozen into the manifest when it was written.
+            ok &= check(
+                "this run's verdict beats the one recorded at emit time",
+                spec.get("status") == "defect",
+                f"manifest said passed, endpoint said {spec.get('status')!r}",
+            )
+
+            archive = client.get(f"/api/runs/{run_id}/suite/download")
+            ok &= check(
+                "the suite downloads as a zip",
+                archive.status_code == 200
+                and archive.headers.get("content-type") == "application/zip",
+                f"{archive.status_code} {archive.headers.get('content-type')}",
+            )
+            names = []
+            if archive.status_code == 200:
+                with zipfile.ZipFile(io.BytesIO(archive.content)) as opened:
+                    names = opened.namelist()
+            ok &= check(
+                "the archive holds the .spec.ts, a config and a README",
+                any(n.endswith(".spec.ts") for n in names)
+                and "playwright.config.ts" in names
+                and "README.md" in names,
+                f"got {names}",
+            )
+            # The `.json` is this system's replay format and carries state keys
+            # that mean nothing outside a run. Shipping it makes the archive
+            # look like it needs AIVAR to be useful, which is the opposite of
+            # what the export is for.
+            ok &= check(
+                "and not the .json replay format",
+                not any(n.endswith(".json") and n != "version.json" for n in names),
+                f"got {names}",
+            )
+
+            ok &= check(
+                "one spec can be downloaded on its own",
+                client.get(
+                    f"/api/runs/{run_id}/suite/spec/{spec.get('file')}"
+                ).status_code
+                == 200,
+            )
+            # `stem` is matched against the manifest, never joined onto a path.
+            ok &= check(
+                "a spec name the manifest does not hold is a 404",
+                client.get(
+                    f"/api/runs/{run_id}/suite/spec/..%2F..%2Fsuite"
+                ).status_code
+                == 404,
+            )
+            ok &= check(
+                "an unknown run is a 404, not a 500",
+                client.get("/api/runs/424242/suite").status_code == 404,
+            )
+
+            # A target nothing has been recorded against is the state every
+            # console sits in before its first run. It must be an empty suite
+            # rather than an error, or the panel cannot say why it is empty.
+            with Session(engine) as session:
+                fresh = Run(target_url="https://nothing.example", status="passed")
+                session.add(fresh)
+                session.commit()
+                session.refresh(fresh)
+                fresh_id = fresh.id
+            empty = client.get(f"/api/runs/{fresh_id}/suite").json()
+            ok &= check(
+                "a target with no suite yet reports none rather than failing",
+                empty["version"] is None and empty["specs"] == [],
+            )
+            ok &= check(
+                "and downloading it is a 404, not an empty zip",
+                client.get(f"/api/runs/{fresh_id}/suite/download").status_code == 404,
+            )
+        finally:
+            regression.SUITES = original
+            app.dependency_overrides.clear()
+
+    return ok
+
+
 def main() -> int:
     print("API         TestClient, throwaway database, no browser\n")
     ok = True
@@ -393,6 +577,7 @@ def main() -> int:
 
     ok &= _invariant_reporting()
     ok &= _status_policy()
+    ok &= _suite_download()
 
     print()
     return 0 if ok else 1

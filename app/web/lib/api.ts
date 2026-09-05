@@ -279,6 +279,47 @@ export type TestCaseRow = {
   created_at: string;
 };
 
+/** One kept `.spec.ts`: the file, what it is about, and its source. */
+export type SpecFile = {
+  file: string;
+  name: string;
+  node: string | null;
+  origin: string;
+  covers: number;
+  status: string | null;
+  code: string;
+};
+
+export type SuiteVersion = {
+  label: string;
+  number: number;
+  parent: string | null;
+  because: string;
+  source: string;
+  saved_at: string;
+  scenarios: number;
+  heals: number;
+  /** Verdicts from replaying the repaired scenarios before this version was declared. */
+  reverified: Record<string, number>;
+  /** Steps recovered by exploring the region that lost the control. */
+  rescues: number;
+};
+
+/**
+ * The suite on disk for a run's target.
+ *
+ * `version` is null until a run has kept one — which is not the same as a run
+ * having produced no tests. A run still compiling has scenarios on the timeline
+ * and nothing here, and the panel says so rather than reading as empty.
+ */
+export type SuitePayload = {
+  target_url: string;
+  directory: string;
+  version: SuiteVersion | null;
+  versions: SuiteVersion[];
+  specs: SpecFile[];
+};
+
 /** Artifacts are served by the API, not by Next. */
 export const artifactUrl = (path: string) => `${API_BASE}/artifacts/${path}`;
 
@@ -421,6 +462,22 @@ export const api = {
   getMap: (runId: number) => request<WorldMapPayload>(`/api/runs/${runId}/map`),
   getProgress: (runId: number) => request<Progress>(`/api/runs/${runId}/progress`),
   listTests: (runId: number) => request<TestCaseRow[]>(`/api/runs/${runId}/tests`),
+  /** The kept suite for this run's target, with every spec's source inline. */
+  getSuite: (runId: number) => request<SuitePayload>(`/api/runs/${runId}/suite`),
+  /**
+   * Where the browser should go to download the archive.
+   *
+   * A plain URL rather than a fetch-and-blob: the server already sets
+   * `Content-Disposition`, so an anchor gets the filename, the progress bar and
+   * the download folder for free — and none of that survives being rebuilt out
+   * of an object URL.
+   */
+  suiteZipUrl: (runId: number, version?: string) =>
+    `${API_BASE}/api/runs/${runId}/suite/download` +
+    (version ? `?version=${encodeURIComponent(version)}` : ""),
+  specUrl: (runId: number, stem: string, version?: string) =>
+    `${API_BASE}/api/runs/${runId}/suite/spec/${encodeURIComponent(stem)}` +
+    (version ? `?version=${encodeURIComponent(version)}` : ""),
   addEvent: (runId: number, event: Partial<AgentEvent>) =>
     request<AgentEvent>(`/api/runs/${runId}/events`, {
       method: "POST",

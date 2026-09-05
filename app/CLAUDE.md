@@ -17,6 +17,8 @@ app/
 │   ├── agents/critic.py    computes coverage gaps; the model may only rank them
 │   ├── agents/generator.py map path → scenario → runnable .spec.ts
 │   ├── agents/runner.py    execute a scenario; heal, or report a defect, or escalate
+│   ├── agents/regression.py the suite kept on disk between runs, healed in place
+│   ├── agents/rescue.py    a control nothing can play: go and look for what replaced it
 │   ├── agents/orchestrator.py  the *exploration* colony — ants, not the pipeline
 │   ├── agents/ant.py       one ant: land, act a few times, report, die
 │   ├── agents/tools.py     what an ant and the orchestrator may see and do
@@ -34,7 +36,7 @@ app/
 ├── web/                frontend — Next.js 16 + React 19 + Tailwind v4
 │   ├── app/                layout, page, globals.css
 │   │   └── sut/            the system under test (see below)
-│   ├── components/         the console — Canvas, MapPane, StageRail, ChatDock…
+│   ├── components/         the console — Canvas, MapPane, SuitePane, ChatDock…
 │   └── lib/widgets/        the widget registry
 └── scripts/            dev.sh (both servers), worktree.sh (make worktree/list/rm)
 ```
@@ -578,6 +580,96 @@ sees the package set as current and leaves the shebangs alone. The fix is
 and the failure is silent in the UI, because the map pane swallows the error.
 Clear it with `make reset`.
 
+
+### The suite that is older than the change it catches
+
+`make specs` recompiles a suite from a crawl that has just happened, so it has
+no past and nothing it reports can be a regression. `agents/regression.py` keeps
+one: `artifacts/suites/<target>/` holds every scenario twice, as the `.json` a
+re-run loads and the `.spec.ts` a judge reads, plus a manifest carrying the
+target, the fingerprint it was recorded against, and the log of every repair
+since.
+
+The rewrite lives here rather than in `runner.py` for the reason the Runner's
+own docstring gives -- a scenario is a sequence, and healing step 2 while step 5
+is still to come mutates the thing being measured. So `verify` replays the
+scenario, waits for the verdict, and only then writes. `Resolution.healed` is
+the only gate: a step that resolved on the `exact` rung produces no repair, and
+**a scenario whose verdict is `defect` or `escalate` is not rewritten at all**,
+including its steps that did heal. Healing a locator says *this control was
+renamed*; rewriting a failing test says *the test was wrong to expect that*, and
+nothing here is evidence for the second.
+
+Measured on the SUT with one recorded suite and both knobs:
+
+| Replayed against | Verdicts | Files rewritten |
+|---|---|---|
+| `/sut` unchanged | 6 passed | 0 |
+| `/sut?v=2` markup moved | 4 healed, 2 defect | 8 -- and the `.spec.ts` now says `Log in` |
+| `/sut?bug=1` behaviour moved | 3 passed, 3 defect | **0** |
+
+**A fingerprint cannot be the trigger, and finding that out is the point.** The
+first version gated the replay on `fingerprint()` -- the landing page's
+`state_key`. Against `?bug=1` it saw an unchanged key, skipped the suite and
+printed calm, with three defects sitting in it: the two knobs are orthogonal on
+purpose, so a behavioural regression moves nothing a markup fingerprint
+compares. `should_replay` now defaults to replaying, and the cheap gate is
+`IF_DRIFTED=1` for a caller who knows they are only watching markup. An
+unchanged fingerprint is not evidence that nothing changed.
+
+### The console keeps a suite too, and a repair is replayed before it is written
+
+`regression.keep` is the record-or-replay decision -- there is no suite yet, so
+this run's plan becomes the baseline; or there is one, so replay it and heal.
+Which happens is the filesystem's answer, not a flag. `pipeline._keep` has
+always called it from the CLI; since 2026-09-05 `routers/explore.py` calls it
+too, and the reason it had to is worth keeping: **a console run compiled its
+scenarios, replayed them, showed six verdicts and then threw the tests away**.
+There was nothing to download and nothing to fail next week, which makes "a URL
+in, a meaningful test suite out" a claim about a process rather than an artifact.
+
+The console serves the files at `GET /api/runs/{id}/suite` (every spec's source
+inline), `/suite/download` (a zip with the `.spec.ts`, a `playwright.config.ts`
+and a README -- and deliberately *not* the `.json`, which is this system's
+replay format and carries state keys that mean nothing outside a run) and
+`/suite/spec/{stem}`. `web/components/SuitePane.tsx` is what replaced the stage
+rail: the six stages are a one-line strip, and the panel holds the tests.
+
+Two disciplines govern what may be written back, and both are in `verify`.
+
+**A repair is a hypothesis until the repaired scenario has been replayed.**
+`reverify` runs the changed scenarios -- only the changed ones, the rest were
+just run -- and a repair the replay contradicts is *withdrawn*: the original
+scenario is kept and the withdrawal is reported. Before this, the claim on the
+tin was "the healer repaired three locators" when what had been established was
+that three locators *resolved*, which is weaker -- the ladder can pick a control
+that exists, is of the right kind, and does something else entirely. The
+emitted version carries `reverified`, so the claim is readable off the manifest
+rather than out of a log.
+
+**An absence is not a defect, and `rescue.py` is the difference.** `runner.py`
+escalates three ways and only one of them is an absence -- `resolution.action is
+None`, nothing on this page plays the recorded part. The other two observed the
+app and found its behaviour ambiguous, and re-exploring those would be shopping
+for a second opinion about evidence we already have. On the absence, and only
+there, the region is crawled again (then handed to one aimed colony wave if a
+provider exists) and the *fresh* map is asked what replaced the control: an edge
+landing where the step landed, or failing that the only edge of the same kind
+whose `mutating` and movement agree with what was recorded. **Two candidates
+refuse.** A tie is the map reporting an ambiguity, and inventing a tie-break
+here is the coin-flip `runner.resolve` declines to make one rung lower.
+
+Measured on the SUT with a scenario rewritten to name a control that does not
+exist: the ladder escalated, the rescue crawled 8 states, proposed `link:v2`
+because it lands on the state key the step recorded, the re-verification
+replayed it and passed, and v002's `.spec.ts` now says
+`getByRole('link', { name: 'v2' })`.
+
+`artifacts/` is gitignored, so a kept suite survives the machine and not code
+review. That is the existing convention for `runs/`, and it is arguably wrong
+for this one -- a suite whose diff nobody reads cannot be argued with -- but
+changing it is a decision, not a cleanup.
+
 ## Running
 
 From here or from the repo root; `make` with no arguments lists every target.
@@ -589,6 +681,7 @@ make pipeline  # the whole claim: URL in, test quality report out
 make probe     # observable checks, all three suites. No API key, no quota
 make gaps      # crawl an app and rank what the crawl did not cover
 make specs     # write generated .spec.ts, then run them with Playwright
+make suite     # record a kept suite, or detect drift and heal it in place
 make check     # typecheck + lint — run before handing work off
 make scrub     # redact credentials already recorded (keeps every run)
 make reset     # wipe the database and artifacts

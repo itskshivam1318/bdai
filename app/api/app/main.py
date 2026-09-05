@@ -14,6 +14,7 @@ from .routers import (
     providers,
     runs,
     sessions,
+    specs,
     worldmap,
 )
 
@@ -43,6 +44,7 @@ app.include_router(runs.router)
 app.include_router(sessions.router)
 app.include_router(explore.router)
 app.include_router(progress.router)
+app.include_router(specs.router)
 app.include_router(worldmap.router)
 
 # Screenshots and diffs are written here and rendered straight into canvas

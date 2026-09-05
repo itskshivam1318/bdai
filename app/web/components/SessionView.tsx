@@ -3,7 +3,7 @@ import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ChatDock from "@/components/ChatDock";
 import MapPane from "@/components/MapPane";
-import StageRail from "@/components/StageRail";
+import SuitePane from "@/components/SuitePane";
 import SettingsDialog from "@/components/SettingsDialog";
 import { sessionLabel } from "@/components/Sidebar";
 import {
@@ -11,6 +11,7 @@ import {
   type ChatThread,
   type MapState,
   type Run,
+  type SuiteVersion,
   type TestSession,
 } from "@/lib/api";
 
@@ -42,6 +43,14 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
   const [context, setContext] = useState("");
   const [contextOpen, setContextOpen] = useState(false);
   const [selectedRunId, setSelectedRunId] = useState<number | null>(null);
+  /*
+   * Which suite version the header's download points at.
+   *
+   * Held here rather than read out of `SuitePane` because the panel can be
+   * shut, and the deliverable must not become unreachable when someone widens
+   * the map. It is one small request on the same three-second beat as the runs.
+   */
+  const [suiteVersion, setSuiteVersion] = useState<SuiteVersion | null>(null);
   /*
    * The chat windows, and which one the map is aimed at.
    *
@@ -130,6 +139,10 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
   if (shownRunId !== seenMapRunId) {
     setSeenMapRunId(shownRunId);
     if (Object.keys(attachedByThread).length) setAttachedByThread({});
+    // The header's download belongs to the run on screen. Clearing it here
+    // rather than in the fetch means the button never points at the run you
+    // just navigated away from, not even for the frame before the reply lands.
+    if (suiteVersion) setSuiteVersion(null);
   }
 
   // The map shows the focused window's selection, and only that one. A union
@@ -138,6 +151,32 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
   // Memoised because `MapPane` builds a Set from this and `StateCard` reads it
   // through context -- a fresh array every render would re-render every card on
   // every three-second poll.
+  /*
+   * The kept suite for the run on screen.
+   *
+   * On the runs' beat rather than the timeline's: a suite is written once, at
+   * the end of a run, so polling it per second would be a request a second that
+   * can almost never find anything new. Cleared to null on a run with nothing
+   * kept, which is what hides the header button rather than letting it 404.
+   */
+  useEffect(() => {
+    if (shownRunId == null) return;
+    let cancelled = false;
+    const poll = () =>
+      api
+        .getSuite(shownRunId)
+        .then((suite) => {
+          if (!cancelled) setSuiteVersion(suite.version);
+        })
+        .catch(() => {});
+    poll();
+    const timer = setInterval(poll, running ? 5000 : 20000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [shownRunId, running]);
+
   const attachedKeys = useMemo(
     () =>
       focusedId == null
@@ -392,6 +431,21 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
         >
           {runs.length ? "Run again" : "Start run"}
         </button>
+        {/*
+          The suite, in the header, because it is the deliverable rather than a
+          detail of the panel showing it. Rendered only once files exist: a
+          download that 404s is worse than one that is not offered, and the
+          panel already explains why there is nothing yet.
+        */}
+        {suiteVersion && shownRunId !== null && (
+          <a
+            href={api.suiteZipUrl(shownRunId, suiteVersion.label)}
+            title={`${suiteVersion.scenarios} Playwright test(s), ${suiteVersion.label}`}
+            className="shrink-0 rounded-md border border-rule px-2.5 py-1.5 text-xs hover:bg-hush"
+          >
+            ↓ Tests
+          </a>
+        )}
         <button
           onClick={() => setSettingsOpen(true)}
           className="rounded-md border border-rule px-2.5 py-1.5 text-xs hover:bg-hush"
@@ -403,8 +457,8 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
           onClick={() => setOpen(!railOpen)}
           aria-expanded={railOpen}
           aria-controls="stage-rail"
-          aria-label={railOpen ? "Hide stage rail" : "Show stage rail"}
-          title={railOpen ? "Hide stage rail" : "Show stage rail"}
+          aria-label={railOpen ? "Hide the test panel" : "Show the test panel"}
+          title={railOpen ? "Hide the test panel" : "Show the test panel"}
           className="rounded-md p-1.5 text-muted hover:bg-hush hover:text-ink"
         >
           {/* The left panel's icon with the bar on the other edge: both say
@@ -442,7 +496,7 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
           </div>
           {railOpen && (
             <div id="stage-rail" className="min-w-0 overflow-hidden">
-              <StageRail
+              <SuitePane
                 sessionId={sessionId}
                 runId={shownRunId}
                 running={running && shownRunId === latestId}

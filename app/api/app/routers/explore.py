@@ -33,7 +33,7 @@ from sqlmodel import Session, select
 
 # Absolute, not relative: `agents/` is a sibling of `app/` under `api/`, so a
 # relative import would climb above this package and fail at import time.
-from agents import ant, critic, invariants, orchestrator, runner, suite
+from agents import ant, critic, invariants, orchestrator, regression, runner, suite
 from agents.explorer import crawler, forms, store
 from agents.explorer.synth import Synthesizer
 from agents.context import Context, credentials_for, parse as parse_context
@@ -396,6 +396,11 @@ def _explore(
         # Assigned inside the `with` block below but read after it, and the
         # `except` path must still find a list rather than a NameError.
         results: list = []
+        # The suite version this run recorded or healed, once there is one.
+        # Declared out here because it is written inside the browser block
+        # and read after it, and a run that died before the keep still has
+        # to reach `save_results`.
+        kept: regression.Kept | None = None
         # Same hazard, same fix: a crawl that throws before generation still
         # reaches the report, and a claim that was never attributed is reported
         # as uncovered rather than crashing the run that would have said so.
@@ -737,6 +742,46 @@ def _explore(
                             surface="run",
                         )
 
+                # --- keep -------------------------------------------
+                #
+                # Everything above this line is one run's opinion of the app,
+                # held in this function's frame. This is where the run acquires
+                # a past: the scenarios are written to disk under a version, so
+                # they can be downloaded, run by a judge with none of this
+                # installed, and -- the point -- *replayed* next week against an
+                # app that has moved.
+                #
+                # Which of record-or-replay happens is the filesystem's answer,
+                # not a flag. `regression.keep` is the same routine
+                # `pipeline._keep` runs from the CLI, and running it here is
+                # what stopped the console being the one entry point whose
+                # tests died with the process that made them.
+                try:
+                    kept = regression.keep(
+                        page,
+                        tuple(plan),
+                        target_url=target_url,
+                        outcomes=tuple(r.verdict for r in results[: len(plan)]),
+                        credentials=credentials,
+                        source="map",
+                        # So a control the ladder cannot resolve is looked for
+                        # by ants at the region that lost it, rather than only
+                        # by a breadth-first crawl of the same screen.
+                        provider=provider,
+                        on_event=lambda level, message: emit(
+                            level, message, surface="suite"
+                        ),
+                    )
+                except Exception as exc:
+                    # A suite that could not be written must not cost this run
+                    # the verdicts it already has. The console still reports
+                    # them; there is simply nothing to download.
+                    emit(
+                        "error",
+                        f"suite not kept: {type(exc).__name__}: {exc}",
+                        surface="suite",
+                    )
+
                 browser.close()
 
             # Clearing stale rows is the caller's policy, not the store's: a
@@ -746,7 +791,45 @@ def _explore(
             for stale in db.exec(select(TestCase).where(TestCase.run_id == run_id)).all():
                 db.delete(stale)
 
-            written = suite.save_results(results, run_id, db)
+            # The kept suite's own verdicts, which are a different claim from
+            # the ones above and are stored as one.
+            #
+            # On the first run against a target there are none: the fresh plan
+            # *is* the suite, so it is labelled with the version it became. On
+            # every run after it the two diverge -- `results` is what this run's
+            # newly compiled plan did against the app as it is now, and these
+            # are what the tests recorded *last* time did when replayed. Only
+            # the second can be a regression, because only the second predates
+            # the change. Labelling both `v002` would report a first sighting as
+            # a regression, which is the one confusion this column exists to
+            # prevent.
+            replayed = list(kept.report.results) if (kept and kept.report) else []
+            replayed_label = (
+                kept.report.replayed.label
+                if kept and kept.report and kept.report.replayed
+                else ""
+            )
+            # Captured before the two lists are merged: "did every scenario this
+            # run planned return a verdict" is a question about the plan, and
+            # the replay adds results that were never in it.
+            executed = len(results)
+
+            written = suite.save_results(
+                results,
+                run_id,
+                db,
+                version=kept.version.label if kept and kept.recorded else "",
+            )
+            if replayed:
+                written += suite.save_results(
+                    replayed, run_id, db, version=replayed_label
+                )
+
+            # From here on the two are one list. A defect the *kept* suite found
+            # is the headline of a re-run -- it is the saved test failing, which
+            # is the whole reason for saving it -- so it has to reach the badge
+            # and the defect surface, not just the suite card.
+            results = results + replayed
 
             for outcome in results:
                 for step in outcome.healed_steps:
@@ -828,7 +911,7 @@ def _explore(
                 # suite is the worst thing to report. The rest of the policy is
                 # `status_for`, which `app/probe.py` can check without a
                 # browser.
-                incomplete = not plan or len(results) != len(plan)
+                incomplete = not plan or executed != len(plan)
                 run.status = status_for(
                     tally, violations, incomplete, provider is not None, len(unmatched)
                 )
