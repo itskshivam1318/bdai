@@ -34,3 +34,6 @@ app/api/artifacts/*
 app/web/generated/
 app/web/test-results/
 app/web/playwright-report/
+
+# scratch tree the pre-commit hook materialises from the index
+app/.precommit/
