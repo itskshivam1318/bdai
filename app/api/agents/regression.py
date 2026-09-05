@@ -439,6 +439,85 @@ def load(where: str | Path | Version) -> tuple[Scenario, ...]:
     return tuple(from_json(p.read_text(encoding="utf-8")) for p in files)
 
 
+def unseen(
+    candidates: tuple[Scenario, ...], directory: str | Path
+) -> tuple[Scenario, ...]:
+    """The candidates the saved suite does not already exercise.
+
+    **Matched on the action sequence, never on the state key or the name.**
+    That is the whole of the redundancy guard, and the reason it is not keyed
+    on state is worth stating: `state_key` folds in accessible names, so a
+    renamed button re-keys every state it appears on, and a diff of two maps
+    then reports *every* edge through those states as added. Keyed on state,
+    a cosmetic rename would append a duplicate of the entire suite -- the
+    precise failure "only generate tests for what changed" exists to prevent.
+
+    An action sequence survives that, because the Healer has already rewritten
+    the saved suite's actions to the new names by the time this runs (see
+    `pipeline._keep`, which extends only after `verify`). What is left over is
+    a path through the application that the suite genuinely does not walk.
+    """
+    already = {
+        tuple(step.action for step in scenario.steps)
+        for scenario in load(directory)
+    }
+    return tuple(
+        candidate
+        for candidate in candidates
+        if tuple(step.action for step in candidate.steps) not in already
+    )
+
+
+def extend(
+    directory: str | Path,
+    additions: tuple[Scenario, ...],
+    *,
+    because: str,
+    credentials: Credentials | None = None,
+    target_url: str = "",
+    mark: str = "",
+    source: str = "",
+    outcomes: tuple[str, ...] = (),
+) -> Version | None:
+    """Emit the saved suite plus `additions` as the next version.
+
+    The kept suite grows here and nowhere else. `verify` may only *repair* what
+    is already on disk -- `pipeline._keep` says why at length: a suite that
+    recompiles itself from the app as it is now agrees with the app by
+    construction and can no longer catch a regression. Adding a test for a flow
+    that did not exist when the baseline was recorded is the one change to a
+    kept suite that does not have that problem, because nothing is being
+    replaced.
+
+    Returns None when there is nothing to add, so a caller can treat "no new
+    behaviour was found" as the ordinary outcome it is rather than as an error
+    or an empty version on disk.
+    """
+    if not additions:
+        return None
+
+    existing = load(directory)
+    tally: dict[str, int] = {}
+    for verdict in outcomes:
+        if verdict:
+            tally[verdict] = tally.get(verdict, 0) + 1
+
+    return emit(
+        existing + additions,
+        directory,
+        because=because,
+        credentials=credentials,
+        target_url=target_url,
+        mark=mark,
+        source=source,
+        # Positional, and only the additions were run just now: the inherited
+        # scenarios carry no verdict rather than a stale one copied forward. A
+        # verdict on a version says what *this* version's run proved.
+        outcomes=("",) * len(existing) + outcomes,
+        verdicts=tally,
+    )
+
+
 def path_of(root: Path, scenario: Scenario) -> Path | None:
     """The `.json` a scenario was loaded from, matched by name."""
     for path in sorted(

@@ -90,6 +90,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         models=(
             ModelChoice("qwen/qwen3-coder-next", "Qwen3 Coder Next", "cheap, good at tools", max_output=32768),
             ModelChoice("minimax/minimax-m3:free", "MiniMax M3 (free)", "free tier, rate limited", max_output=32768),
+            ModelChoice("nvidia/nemotron-3.5-lightning:free", "Nemotron 3.5 Lightning (free)", "free, ~1.7x faster than MiniMax", max_output=32768),
             ModelChoice("deepseek/deepseek-chat", "DeepSeek Chat", max_output=16384),
             ModelChoice("anthropic/claude-haiku-4.5", "Claude Haiku 4.5 (routed)", max_output=32768),
             ModelChoice("google/gemini-2.5-flash", "Gemini 2.5 Flash (routed)", max_output=32768),
@@ -218,6 +219,15 @@ def free_route_for(provider: str) -> str | None:
     already in hand, so a Sarvam key cannot rescue itself with an OpenRouter
     route. Sarvam has no free tier and correctly gets None, which is what
     makes the 402 raise there instead of turning into a 401.
+
+    **The first `:free` row wins**, so the order of those rows in `PROVIDERS`
+    is the fallback policy and not a formatting choice. OpenRouter currently
+    lists two, and MiniMax M3 stays first on purpose: it is the one
+    `agents/probe.py` pins as the expected route, and moving Nemotron above it
+    would change what an unattended `LLM_FREE_FALLBACK=1` run silently becomes.
+    Nemotron is the faster of the two -- measured 2026-09-05, 3.1s against 5.4s
+    for one tool-calling round -- so if that flag is ever turned on by default,
+    reorder here and fix the probe in the same commit.
     """
     spec = BY_ID.get(provider)
     if not spec:
