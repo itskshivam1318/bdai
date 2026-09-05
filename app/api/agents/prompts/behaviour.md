@@ -42,6 +42,19 @@ One sentence, testable in principle, about behaviour rather than appearance.
 they become the path a test walks. "Log in, add an item, check it persisted" is
 a flow. "View the header" is not, however many states it touches.
 
+**Cite the longest chain the map actually backs.** A flow is the one thing here
+that a ranking over single edges can never propose, so a two-state flow adds
+almost nothing the deterministic planner would not have found on its own — the
+value is in the third and fourth state, where a test starts checking that
+something *survived*. Walk the transition list and follow it as far as it
+genuinely goes before you stop.
+
+Two rules bound that, and they are not negotiable. **Every consecutive pair must
+be an edge in the list above**: a flow whose chain has a gap compiles to nothing
+at all, so a longer guess is not worth more than a shorter fact. And **stop where
+the recorded transitions stop** — do not bridge two states because an
+application like this one usually connects them.
+
 **`invariant`** — something that ought to hold of any correct version of this
 application. These are the most valuable, because they can be checked without a
 baseline to compare against: an app that was already broken when the crawler

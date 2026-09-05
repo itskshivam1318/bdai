@@ -2248,6 +2248,14 @@ def main() -> int:
         # The console's chat reads this one. It has no tool loop to fail
         # loudly, so a broken prompt would show up only as a vague answer.
         ("analyst", "explorer ants built"),
+        # The synthesiser's. A flow is the only thing here a ranking over
+        # single edges can never propose, so a model that stops at two states
+        # is adding almost nothing the deterministic planner would not have
+        # found -- every kept suite on disk had a maximum of two steps. The
+        # instruction to follow the chain as far as the map genuinely backs it
+        # is the difference, and it is one sentence away from being lost in an
+        # edit nobody would notice.
+        ("behaviour", "longest chain the map actually backs"),
     ):
         text = instructions(role)
         ok &= check(
@@ -2362,6 +2370,8 @@ def main() -> int:
     ok &= _baseline_checks()
     ok &= _gate_wiring_checks()
     ok &= _console_planner_checks()
+    ok &= _refresh_checks()
+    ok &= _carry_checks()
     ok &= _rescue_checks()
     ok &= _reverify_checks()
 
@@ -4571,6 +4581,246 @@ def _console_planner_checks() -> bool:
         "plan = scenarios(" not in body,
         "explore.py still builds its suite with generator.scenarios, so the "
         "behavioural model reaches the screen and not the tests",
+    )
+    return ok
+
+
+def _refresh_checks() -> bool:
+    """The behavioural model goes stale during WATCH unless something refills it.
+
+    RECORD builds the model once. WATCH then replays the suite, heals locators
+    against the live page, and writes `map_updates` back to the world model --
+    and touches the behavioural model not at all. So after a structural change
+    the system's *understanding* of the app is the understanding it had before
+    the change, and stays that way until somebody runs a whole record pass.
+
+    `refresh` is the narrow fix: re-synthesise over the region that moved, and
+    carry everything else through. Two properties, and the second is the one
+    that makes it safe.
+
+    **A claim about the region is replaced.** That is the point.
+
+    **A claim about anywhere else is carried, not re-admitted.** `admit()`
+    grounds a hypothesis against the map it is given, and the map here is a
+    *region* -- eight states around the one that moved. Re-admitting the whole
+    prior model against it would drop every claim about the rest of the
+    application for the sole reason that this crawl did not look there, which
+    would turn a local repair into global amnesia.
+    """
+    from .behavior import BehaviorModel, Hypothesis, refresh
+    from .llm import ToolCall, Turn
+
+    print("\nREFRESH     the behavioural model is refilled where the app moved")
+    ok = True
+
+    region, a, b, c = _planner_world()
+    # The region crawl saw `a` and `b`. `c` is elsewhere in the application and
+    # this crawl never went there.
+    del region.states[c]
+
+    prior = BehaviorModel(
+        summary="a sign-in that leads home",
+        hypotheses=(
+            Hypothesis(claim="signing in authenticates", kind="flow", cites=(a, b)),
+            Hypothesis(claim="the profile page lists orders", kind="flow",
+                       cites=(c,)),
+        ),
+    )
+
+    class Revised:
+        """Reports what the region looks like now."""
+
+        name, model = "scripted:revised", "none"
+
+        def turn(self, system, transcript, tool_defs):
+            return Turn(text="", calls=(ToolCall(
+                id="m1", name="model",
+                arguments={
+                    "summary": "a sign-in that now lands on a dashboard",
+                    "hypotheses": [
+                        {"claim": "signing in reaches the dashboard",
+                         "kind": "flow", "cites": [a, b]},
+                    ],
+                },
+            ),))
+
+    refreshed = refresh(prior, region, Revised())
+    claims = tuple(h.claim for h in refreshed.hypotheses)
+
+    ok &= check(
+        "a claim about the region that moved is replaced",
+        "signing in reaches the dashboard" in claims
+        and "signing in authenticates" not in claims,
+        f"claims={claims}",
+    )
+    ok &= check(
+        "a claim about the rest of the app is carried, not dropped",
+        "the profile page lists orders" in claims,
+        "re-admitting the prior model against a region map forgets every claim "
+        "about everywhere the region crawl did not go",
+    )
+
+    # With no provider there is nothing that can interpret the region, and the
+    # honest answer is the model we already had -- not an empty one.
+    # `synthesise` returns empty without a provider by design, so a refresh
+    # that simply forwarded it would delete the whole model on a no-key run.
+    ok &= check(
+        "with no provider the prior model survives untouched",
+        refresh(prior, region, None).hypotheses == prior.hypotheses,
+        "a no-key WATCH run erased the behavioural model it started with",
+    )
+
+    # `synthesise` has always taken a `prior` and nothing has ever passed one,
+    # so the parameter was live and unexercised -- and `brief` renders it in the
+    # shape `Exploration` used to have (summary / flows / gaps), which a
+    # `BehaviorModel` no longer produces. A refresh that hands over its prior
+    # and has it silently rendered as nothing is a refresh that re-reads the
+    # region with no memory of what it used to believe.
+    from .behavior import as_prior, brief
+
+    rendered = brief(region, as_prior(prior))
+    ok &= check(
+        "the prior model reaches the prompt that is asked to revise it",
+        "the profile page lists orders" in rendered,
+        "brief() renders a prior's summary and drops every hypothesis in it",
+    )
+
+    # Refreshing a model that dies with the process is the same as not
+    # refreshing it. Run N+1 recomputes its understanding from zero today, so a
+    # repair teaches the system nothing and the dashed "replayed again" arrow
+    # goes nowhere. The model rides with the suite: same version, same
+    # directory, one `git diff` away from being argued with.
+    import tempfile
+
+    from . import regression
+    from .behavior import BehaviorModel as Model
+    from .explorer.forms import Credentials
+    from .generator import Expectation, Scenario, Step
+
+    kept_model = BehaviorModel(
+        summary="a sign-in that leads home",
+        hypotheses=(Hypothesis(claim="signing in authenticates", kind="flow",
+                               cites=(a, b), status="supported",
+                               because="the map walked it"),),
+    )
+    only = Scenario(
+        name="sign in", target_url="http://sut/",
+        steps=(Step(intent="press", action="button:Sign in", from_key=a,
+                    fields=(),
+                    expect=Expectation(moved=True, mutating=True, added=(),
+                                       removed=(), to_key=b)),),
+        origin="map",
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp) / "suite"
+        regression.emit(
+            (only,), root, because="probe", credentials=Credentials("u", "p"),
+            target_url="http://sut/", behaviour=kept_model,
+        )
+        reloaded = regression.versions(root)[-1].behaviour
+
+    ok &= check(
+        "the behavioural model is kept with the suite version",
+        isinstance(reloaded, Model)
+        and tuple(h.claim for h in reloaded.hypotheses)
+        == ("signing in authenticates",),
+        f"reloaded={reloaded!r}",
+    )
+    ok &= check(
+        "and it comes back with the citations a refresh needs to place it",
+        bool(reloaded.hypotheses) and reloaded.hypotheses[0].cites == (a, b),
+        "without cites, the next refresh cannot tell a claim about the region "
+        "that moved from a claim about anywhere else",
+    )
+    ok &= check(
+        "and with the verdict the map had already reached on it",
+        bool(reloaded.hypotheses)
+        and reloaded.hypotheses[0].status == "supported",
+        "a supported invariant reloaded as unexamined is evidence thrown away",
+    )
+    return ok
+
+
+def _carry_checks() -> bool:
+    """A version emitted by the healer keeps the understanding it inherited.
+
+    `emit` defaults the model to empty, so the moment `verify` heals anything
+    the new version is written with no behavioural model at all -- and the
+    knowledge the run before it built is gone, silently, at exactly the moment
+    the suite is claiming to have carried forward. Losing it here would be
+    worse than never having stored it: v001 has a model, v002 does not, and the
+    lineage reads as though the app became uninterpretable.
+
+    With no provider there is nothing to refresh *with*, and the right answer
+    is still to carry -- for the same reason `refresh` returns its prior rather
+    than an empty model on a no-key run.
+    """
+    import tempfile
+
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import sync_playwright
+
+    from . import regression
+    from .behavior import BehaviorModel, Hypothesis
+    from .explorer.forms import Credentials
+
+    print("\nCARRY       a healed version inherits what the last one believed")
+    ok = True
+
+    believed = BehaviorModel(
+        summary="a sign-in that leads home",
+        hypotheses=(Hypothesis(claim="signing in authenticates", kind="flow",
+                               cites=("a" * 16,)),),
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp) / "suite"
+        try:
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch()
+                page = browser.new_page()
+                # Record against v1, then replay against v2 -- the markup knob,
+                # so the ladder heals and a new version is genuinely emitted.
+                page.goto(f"{SUT}?v=1")
+                from .explorer.crawler import Budget, crawl
+                from .planner import plan as make_plan
+
+                world = crawl(page, f"{SUT}?v=1", Budget(max_states=6,
+                                                         max_actions=12,
+                                                         max_seconds=60))
+                planned = make_plan(world, None, source="map", limit=4)
+                if not planned.scenarios:
+                    browser.close()
+                    print("        SKIPPED -- the crawl compiled no scenarios")
+                    return ok
+                regression.emit(
+                    planned.scenarios, root, because="probe baseline",
+                    credentials=Credentials("u", "p"),
+                    target_url=f"{SUT}?v=1", behaviour=believed,
+                )
+                report = regression.verify(
+                    page, root, target_url=f"{SUT}?v=2",
+                    credentials=Credentials("u", "p"),
+                    reverify=False, rescue=False,
+                )
+                browser.close()
+        except PlaywrightError as exc:
+            print(f"        SKIPPED -- needs `make dev` for the SUT ({exc})")
+            return ok
+
+        if report.emitted is None:
+            print("        SKIPPED -- nothing healed, so no version was emitted")
+            return ok
+
+        carried = report.emitted.behaviour
+
+    ok &= check(
+        "the emitted version carries the model the last one held",
+        tuple(h.claim for h in carried.hypotheses)
+        == ("signing in authenticates",),
+        f"v{report.emitted.number:03d} was written with "
+        f"{len(carried.hypotheses)} hypothesis(es); the run before it had 1",
     )
     return ok
 

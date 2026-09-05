@@ -66,6 +66,8 @@ from pathlib import Path
 from playwright.sync_api import Page
 
 from . import runner
+from .behavior import BehaviorModel
+from .behavior import refresh as behavior_refresh
 from .explorer import statekey
 from .explorer.forms import Credentials
 from .explorer.observer import Observer
@@ -157,6 +159,11 @@ class Version:
     # Steps recovered by exploring the region that lost them, rather than by
     # the resolution ladder. See `agents/rescue.py`.
     rescues: tuple[dict, ...] = ()
+    #: What the run believed about the app when this version was written. The
+    #: suite and the understanding that produced it travel together, so run
+    #: N+1 starts from what run N learned instead of recomputing from zero --
+    #: and two versions' models are a diff rather than two separate opinions.
+    behaviour: BehaviorModel = field(default_factory=BehaviorModel)
 
     @property
     def label(self) -> str:
@@ -191,6 +198,7 @@ class Version:
             "map_updates": list(self.map_updates),
             "reverified": dict(self.reverified),
             "rescues": list(self.rescues),
+            "behaviour": self.behaviour.as_dict(),
         }
 
     def render(self) -> str:
@@ -250,6 +258,7 @@ def versions(directory: str | Path) -> tuple[Version, ...]:
                 map_updates=tuple(raw.get("map_updates", ())),
                 reverified=raw.get("reverified", {}),
                 rescues=tuple(raw.get("rescues", ())),
+                behaviour=BehaviorModel.from_dict(raw.get("behaviour")),
             )
         )
     return tuple(found)
@@ -327,6 +336,7 @@ def emit(
     outcomes: tuple[str, ...] = (),
     reverified: dict | None = None,
     rescues: tuple[dict, ...] = (),
+    behaviour: BehaviorModel | None = None,
 ) -> Version:
     """Write the next version. Never touches one already written.
 
@@ -388,6 +398,7 @@ def emit(
         map_updates=tuple(map_updates),
         reverified=dict(reverified or {}),
         rescues=tuple(rescues),
+        behaviour=behaviour or BehaviorModel(),
     )
     (where / VERSION).write_text(
         json.dumps(version.as_dict(), indent=2), encoding="utf-8"
@@ -920,6 +931,50 @@ def verify(
 
     applied = tuple(report.applied)
     updates = map_updates_for(applied)
+    # --- what this run now believes ---------------------------------------
+    #
+    # The suite is about to become a new version, and the understanding that
+    # produced it has to travel with it or the loop does not close: run N+1
+    # would recompute from zero, and the repair this run just made would teach
+    # the system nothing.
+    #
+    # Where a scenario failed, the region it stands in has moved, so the old
+    # reading of that region is the one thing here that is out of date --
+    # `rescue.look` crawls it (with one aimed colony wave when a provider
+    # exists) and `behavior.refresh` re-reads it, carrying every claim about
+    # the rest of the app through untouched. With no provider there is nothing
+    # that can interpret anything, and the honest answer is what we already
+    # believed rather than an empty model.
+    believed = version.behaviour
+    moved = tuple({
+        outcome.step.from_key
+        for result in report.results
+        if result.verdict != runner.PASSED
+        for outcome in result.steps
+        if outcome.verdict != runner.PASSED and outcome.step.from_key
+    })
+    if provider is not None and moved:
+        try:
+            region, how = rescue_agent.look(
+                page, url, moved[0], provider=provider,
+                credentials=credentials, on_event=on_event,
+            )
+            believed = behavior_refresh(believed, region, provider,
+                                        on_event=on_event)
+            if on_event:
+                on_event(
+                    "decision",
+                    f"behaviour refreshed over the region that moved "
+                    f"[{moved[0][:8]}] by {how}: "
+                    f"{len(believed.hypotheses)} claim(s) now held",
+                )
+        except Exception as exc:
+            # A refresh that fell over must not cost the suite its repairs.
+            # The model stays exactly as the last version left it.
+            if on_event:
+                on_event("warn", f"behaviour refresh failed: "
+                                 f"{type(exc).__name__}: {exc}")
+
     report.emitted = emit(
         tuple(next_suite),
         root,
@@ -951,6 +1006,7 @@ def verify(
         map_updates=updates,
         reverified=report.reverify_counts,
         rescues=tuple(r.as_dict() for r in report.recovered),
+        behaviour=believed,
     )
     report.rewritten = sorted(report.emitted.root.glob("*.spec.ts"))
     return report
