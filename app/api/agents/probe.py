@@ -3460,6 +3460,19 @@ def _fallback_checks() -> bool:
     FLAG = "LLM_FREE_FALLBACK"
     FREE = "minimax/minimax-m3:free"
     PAID = "qwen/qwen3-coder-next"
+
+    # `free_route_for` returns the *first* `:free` row, so the order of those
+    # rows in the catalogue is the fallback policy. A second free route was
+    # added 2026-09-05 (Nemotron, measurably faster); this pins which one an
+    # unattended run still lands on, so reordering the list has to come here
+    # and say so rather than changing behaviour silently.
+    from .llm.catalog import free_route_for
+
+    ok_order = check(
+        "the catalogue's first free row is still what a 402 falls back to",
+        free_route_for("openrouter") == FREE,
+        f"got {free_route_for('openrouter')}",
+    )
     # The provider's own words, trimmed to what `_post` actually reads.
     BODY = (
         '{"error":{"message":"This request requires more credits, or fewer '

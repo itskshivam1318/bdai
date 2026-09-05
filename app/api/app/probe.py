@@ -598,6 +598,87 @@ def _suites_are_per_session() -> bool:
     return ok
 
 
+def _halted_run_reporting() -> bool:
+    """A colony that died of a 402 must say so where a human is looking.
+
+    `8f6fceb` stopped a dead orchestrator from erasing the map, which was
+    right, but it routed the reason into `Exploration.gaps` alone. `gaps` is
+    the coverage story; the console reads `run.summary` for the health story
+    and `run.status` for the badge, and neither learned anything. Measured on
+    this workspace before the fix: a 402 on the wave-3 call produced
+    `summary == "stopped: error"` -- fourteen characters where the provider had
+    named both the number that would have worked and the URL to fix it -- over
+    a **green** badge, because `status_for` never saw that the run had halted.
+    Run 31 in `app.db`, from before that commit, carried the whole 402 in its
+    summary; the graceful stop traded a loud failure for a quiet one.
+    """
+    from agents import orchestrator
+    from agents.explorer.worldmap import WorldMap
+
+    from .routers.explore import status_for, summary_for
+
+    ok = True
+    quiet = {"passed": 3, "healed": 0, "defect": 0, "escalate": 0}
+    reason = (
+        "The colony stopped early: the model call failed "
+        "(qwen/qwen3-coder-next: 402 from the provider: requires more credits). "
+        "The map below is what had been walked when it did."
+    )
+    halted = orchestrator.Exploration(
+        world=WorldMap(), stopped="error", stopped_because=reason, gaps=(reason,)
+    )
+
+    ok &= check(
+        "a halted colony carries its reason on the exploration, not only in gaps",
+        halted.stopped_because == reason,
+    )
+    ok &= check(
+        "the console disclosure shows the provider's own words, not 'stopped: error'",
+        summary_for(halted, states=4, scenarios=3, needing_attention=0, modelled=True)
+        == reason,
+    )
+    ok &= check(
+        "a run that died on a provider error is not green",
+        status_for(quiet, (), incomplete=False, modelled=True, halted=True)
+        == "degraded",
+    )
+    # Nothing about the application misbehaved -- the key ran out. `failed` is
+    # red and reads as "your app is broken", which is a libel; the same
+    # argument the uncovered-claim case already makes.
+    ok &= check(
+        "a real defect still outranks a halted colony",
+        status_for(
+            {"passed": 1, "healed": 0, "defect": 1, "escalate": 0},
+            (),
+            incomplete=False,
+            modelled=True,
+            halted=True,
+        )
+        == "failed",
+    )
+
+    finished = orchestrator.Exploration(
+        world=WorldMap(), stopped="covered", summary="a shop with a checkout"
+    )
+    ok &= check(
+        "a clean run still shows the colony's own summary",
+        summary_for(finished, states=4, scenarios=3, needing_attention=0, modelled=True)
+        == "a shop with a checkout",
+    )
+    ok &= check(
+        "a model-free run still explains which key to set",
+        "OPENROUTER_API_KEY"
+        in summary_for(
+            orchestrator.Exploration(world=WorldMap(), stopped="no model"),
+            states=4,
+            scenarios=3,
+            needing_attention=0,
+            modelled=False,
+        ),
+    )
+    return ok
+
+
 def main() -> int:
     print("API         TestClient, throwaway database, no browser\n")
     ok = True
@@ -742,6 +823,7 @@ def main() -> int:
     ok &= _status_policy()
     ok &= _suite_download()
     ok &= _suites_are_per_session()
+    ok &= _halted_run_reporting()
 
     print()
     return 0 if ok else 1
