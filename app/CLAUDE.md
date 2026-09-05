@@ -22,6 +22,10 @@ app/
 │   ├── agents/tools.py     what an ant and the orchestrator may see and do
 │   ├── agents/context.py   the free-text box → credentials + focus + claims
 │   ├── agents/claims.py    a typed claim → the tests that already cover it
+│   ├── agents/invariants.py defects provable from the map alone, app unseen
+│   ├── agents/suite.py     the Runner's verdict, keyed to where on the map
+│   ├── agents/shots.py     one picture per state, taken at most once
+│   ├── agents/fixtures/    recorded pages, so a probe needs no live target
 │   ├── agents/prompts/     ant, orchestrator, critic, analyst — the tunable part
 │   ├── agents/llm/         one tool-calling loop, four providers, one catalogue
 │   ├── agent_mcp/          MCP server — the pipeline, for an external coding agent
@@ -29,9 +33,9 @@ app/
 ├── web/                frontend — Next.js 16 + React 19 + Tailwind v4
 │   ├── app/                layout, page, globals.css
 │   │   └── sut/            the system under test (see below)
-│   ├── components/         Canvas.tsx, WidgetNode.tsx
+│   ├── components/         the console — Canvas, MapPane, StageRail, ChatDock…
 │   └── lib/widgets/        the widget registry
-└── scripts/            dev.sh (runs both servers), worktree.sh (unused)
+└── scripts/            dev.sh (both servers), worktree.sh (make worktree/list/rm)
 ```
 
 `web/app/sut/` is our own system under test, and it carries **two orthogonal
@@ -94,8 +98,8 @@ behavioural model, `agents/explorer/worldmap.py`:
 | Generator | a path through the graph compiles to a test |
 | Healer | re-observe, compare state keys, and the failure classifies itself |
 
-Read `agents/explorer/__init__.py` first — it explains the eight modules and
-why only one of them (`synth.py`) calls a model. Then `worldmap.py`, which is
+Read `agents/explorer/__init__.py` first — it explains the modules and why
+only one of them (`synth.py`) calls a model. Then `worldmap.py`, which is
 the contract.
 
 Two entry points, both printing evidence rather than passing silently:
@@ -465,8 +469,8 @@ state and persists it 400ms after you stop typing.
 **Do not symlink `node_modules`.** Turbopack rejects it with *"Symlink
 [project]/node_modules is invalid, it points out of the filesystem root"*, and
 the failure is nasty: the API starts fine and only the web server dies.
-`scripts/worktree.sh` uses an APFS copy-on-write clone instead. Worktrees are no
-longer in use, but the trap is still live for anyone copying this tree by hand.
+`scripts/worktree.sh` uses an APFS copy-on-write clone instead, which is what
+`make worktree` runs. The trap is live for anyone copying this tree by hand.
 
 **`config.py` resolves every path from `__file__`**, so `app.db` and
 `artifacts/` follow `api/` wherever it moves. Keep it that way.
@@ -493,7 +497,7 @@ From here or from the repo root; `make` with no arguments lists every target.
 make setup     # first run only: npm install, uv sync, playwright install
 make dev       # both servers — web :3000, api :8000
 make pipeline  # the whole claim: URL in, test quality report out
-make probe     # 266 observable checks. No API key, no quota
+make probe     # observable checks, all three suites. No API key, no quota
 make gaps      # crawl an app and rank what the crawl did not cover
 make specs     # write generated .spec.ts, then run them with Playwright
 make check     # typecheck + lint — run before handing work off

@@ -1,6 +1,6 @@
 """Bounded exploration: walk an app and build a behavioural model of it.
 
-Eight modules. The six that build the map call no model at all:
+Six modules build the map, and none of them calls a model:
 
     observer.py   live page   -> Observation (a11y tree + network + elements)
     statekey.py   Observation -> a stable identity for "which state is this?"
@@ -13,6 +13,11 @@ and two sit at the edges, each crossing exactly one boundary:
 
     synth.py      the model seam. Invalid input, so error states are reachable.
     store.py      the database seam. WorldMap <-> SQLModel tables.
+
+Two more stand outside the loop entirely, and neither is imported by it:
+
+    snapshot.py   a WorldMap to a file and back, and the diff of two of them
+    probe.py      the observable check for observer + statekey
 
 `worldmap.py` is the artifact the rest of the pipeline reads and writes: the
 Planner's test plan is its transitions, the Generator compiles paths out of it,

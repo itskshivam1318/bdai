@@ -1,41 +1,26 @@
-# AIVAR — Hackathon Workspace
+# AIVAR — Autonomous Test Orchestration Agent
 
-Time-constrained experimental workspace. Theme: **Autonomous Test Orchestration
-Agent** — a URL in, a meaningful test suite out, no human between the stages.
+A URL in, a meaningful test suite out, with no human between the stages.
+A time-constrained hackathon workspace.
 
-## Map
+## Where things are
 
-| Path | Answers |
-|---|---|
-| `app/` | **The submission.** Frontend, backend, agent pipeline. Carries its own `CLAUDE.md` with the stack, layout, contracts and gotchas. |
-| `docs/problem/statement.md` | What are we solving? FROZEN — the brief, verbatim in substance. |
-| `docs/product/thesis.md` | What are we building, and what does the demo show? |
-| `docs/product/bets.md` | What are we unsure about, and how will we find out? |
-| `docs/product/decisions.md` | What has already been settled? Append-only. |
-| `docs/execution/packets/P*.md` | Who owns what, and what "done" means. |
-| `docs/research/README.md` | Prior art. **Read the index; open a full report only when the index says it answers your question** — the reports total ~1,300 lines. |
-| `docs/discussions/README.md` | Captured external conversations, verbatim. Arguments, not decisions. **Same rule: read the index** — the transcripts total ~5,500 lines. |
+- **`app/`** — the submission. Frontend, backend, agent pipeline. It carries its
+  own `CLAUDE.md` with the stack, the layout, what is hardcoded on purpose and
+  the gotchas, and it loads on its own when you touch a file there. Do not
+  duplicate any of it here.
+- **`docs/problem/statement.md`** — the brief and the rubric. FROZEN.
+- **`docs/product/decisions.md`** — why a settled design is the way it is.
+  Append-only and ~1,000 lines: a citation target, not a document to read
+  through. `app/CLAUDE.md` cites the entries that still matter.
 
-The repo — not the chat — holds project state. Read these before asking a human
-anything; if the answer isn't there, that's a bug in the files.
+Everything else under `docs/` is background — thesis, bets, prior-art reports,
+transcripts. Nothing in the running system reads them. Open one only when a file
+you are editing names it.
 
-**Never hand-maintain state that can be computed.** There is no `status.md`: run
-`git log --oneline` and read the packet files. A stale status file misleads
-three agents at once — worse than none.
-
-## Operating principles
-
-1. Validate the core loop before expanding the system.
-2. Prefer an existing open-source implementation over rebuilding infrastructure.
-   Search GitHub before writing a subsystem.
-3. Every claim about behaviour needs an observable check — a run, a screenshot,
-   a response body. Not "should work".
-4. Surface ambiguity instead of guessing. Write it into `docs/product/bets.md`.
-5. Parallel work has explicit ownership. Never modify files owned by another
-   packet; propose a contract change in `docs/product/decisions.md` instead.
-6. When evidence contradicts the design, change the design.
-7. Preserve working behaviour. If the demo path worked an hour ago, it must
-   still work now.
+The repo, not the chat, holds project state. **Never hand-maintain state that
+can be computed** — no status file, no check counts written into prose. Run
+`git log --oneline` and read the code.
 
 ## Running
 
@@ -43,12 +28,25 @@ three agents at once — worse than none.
 every target.
 
 ```bash
-make setup   # first run only: npm install, uv sync, playwright
-make dev     # web + api
-make smoke   # walking skeleton: drive a browser, break a locator, heal it
-make check   # typecheck + lint — run before handing work off
+make setup     # first run only: npm install, uv sync, playwright, git hooks
+make dev       # web :3000 + api :8000
+make pipeline  # the whole claim: URL in, test quality report out
+make probe     # observable checks. No API key, no quota
+make check     # typecheck + lint
 ```
 
-Working inside `app/`? `app/CLAUDE.md` carries the stack, the layout, what is
-hardcoded on purpose, and the gotchas. It loads on its own when you touch a file
-there — do not duplicate any of it here.
+`make probe` and `make check` both pass before you hand work off. `make smoke`
+is the original walking skeleton and is superseded — use `make pipeline`.
+
+Parallel sessions share this checkout. `make worktree` gives you your own ports
+and database; `make list` shows what is running.
+
+## Operating principles
+
+1. Validate the core loop before expanding the system.
+2. Prefer an existing open-source implementation over rebuilding infrastructure.
+3. Every claim about behaviour needs an observable check — a run, a response
+   body, a probe check that fails without the fix. Not "should work".
+4. When evidence contradicts the design, change the design.
+5. Preserve working behaviour. If the demo path worked an hour ago, it must
+   still work now.
