@@ -98,6 +98,22 @@ uv run python -m agents.explorer.probe     # is the state projection right? (no 
 uv run python -m agents.explorer.crawler <url>   # map an app, print states/transitions/gaps
 ```
 
+### Every model call leaves a transcript
+
+`agents/tracing.py:save_transcript` is called by all five: the orchestrator, each
+ant, the critic, the synthesizer and the console's analyst. Files land in
+`api/artifacts/transcripts/run-<id>/` — or `adhoc/` when there is no run, which
+is every CLI entry point. Each holds the system prompt as it was at the time,
+because `prompts/*.md` changes hourly and a transcript that records only the
+conversation cannot say which instructions produced it.
+
+Three of the five were silent until 2026-09-05, and the shape of the omission is
+worth knowing: `save_transcript` takes a `Transcript`, and only the two agents
+running a multi-turn tool loop built one. A single-turn call had nowhere to put
+its exchange, so the critic's one ranking — the call that decides the order of
+the final report — left nothing behind but a count. Adding a role here is two
+lines; skipping it is invisible.
+
 ### The map is persisted, and it is watchable
 
 `agents/explorer/store.py` is the only place the explorer meets the database —
@@ -144,16 +160,22 @@ OPENROUTER_API_KEY                  # probed FIRST by llm.load(), on cost. One
                                     # same OpenAICompat class at DeepSeek,
                                     # Groq, Cerebras or a local Ollama
 ANTHROPIC_API_KEY / GEMINI_API_KEY  # llm.load() picks a provider by whichever
-                                    # is present. With neither, a console run
-                                    # degrades to `explorer.crawler` — a real
-                                    # map, breadth-first, but no flows, no
-                                    # summary, no intent, and status `degraded`
-                                    # rather than `passed`. Also feeds synth.py:
-                                    # without it invalid payloads come from a
+                                    # is present. With none of the three, a
+                                    # console run degrades to
+                                    # `explorer.crawler` — a real map,
+                                    # breadth-first, but no flows, no summary,
+                                    # no intent, and status `degraded` rather
+                                    # than `passed`. Every model call in the
+                                    # system goes through `llm.load()`,
+                                    # synth.py included — it used to build its
+                                    # own Anthropic client and so stayed dark
+                                    # on an OpenRouter-only key while
+                                    # everything else worked. With no provider
+                                    # at all, invalid payloads come from a
                                     # static mutation table that knows nothing
                                     # about the app, and the crawl prints
-                                    # "PAYLOADS n from fallback" so a degraded
-                                    # run never looks like a good one
+                                    # "PAYLOADS n from fallback (<reason>)" so
+                                    # a degraded run never looks like a good one
 AIVAR_USERNAME / AIVAR_PASSWORD     # optional. forms.Credentials — without
                                     # these, any login wall stops the crawl at
                                     # one state
@@ -255,7 +277,12 @@ agent builds on sand:
 - The SUT's three variants are hand-written drift, not a real deploy.
 - `artifacts/invalid-payloads.json` is the replay log for `synth.py`: what the
   model chose to type, keyed by form shape. It makes a crawl reproducible and
-  re-runs free. Delete it to make the agent choose fresh payloads.
+  re-runs free. Delete it to make the agent choose fresh payloads. A
+  `"source": "fallback"` entry is a record of a degraded run rather than an
+  answer, so it is **not** served once a provider exists — otherwise an
+  afternoon with no key set silently pins every later run to the mutation
+  table. Model-sourced entries are still served unconditionally, which is where
+  the reproducibility comes from.
 
 If you add another, say so in a comment where it lives and add a line here.
 
@@ -346,7 +373,7 @@ From here or from the repo root; `make` with no arguments lists every target.
 make setup     # first run only: npm install, uv sync, playwright install
 make dev       # both servers — web :3000, api :8000
 make pipeline  # the whole claim: URL in, test quality report out
-make probe     # 115 observable checks. No API key, no quota
+make probe     # 149 observable checks. No API key, no quota
 make gaps      # crawl an app and rank what the crawl did not cover
 make specs     # write generated .spec.ts, then run them with Playwright
 make check     # typecheck + lint — run before handing work off

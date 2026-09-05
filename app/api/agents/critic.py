@@ -62,7 +62,8 @@ from dataclasses import dataclass
 from urllib.parse import urlparse
 
 from .explorer.worldmap import WorldMap
-from .llm import Tool, Transcript
+from .llm import Exchange, Tool, Transcript
+from .tracing import save_transcript
 
 _FORM_ACTION = re.compile(r"^submit\[(?P<mode>\w+)\]:(?P<descriptor>.+)$")
 
@@ -345,6 +346,7 @@ def prioritise(
     intent: str | None = None,
     instructions: str | None = None,
     on_event=None,
+    run_id: int | None = None,
 ) -> tuple[Gap, ...]:
     """Rank the computed candidates. Returns them ordered, with risk filled in.
 
@@ -368,6 +370,23 @@ def prioritise(
     system = instructions or load_instructions("critic")
     transcript = Transcript(prompt=brief(found, world.summary(), intent))
     turn = provider.turn(system, transcript, [PRIORITISE])
+
+    # Written before the answer is inspected, so a ranking that gets rejected
+    # for citing gaps that were never candidates still leaves the evidence of
+    # what it tried. This is one call, and it decides the order of the final
+    # report -- of the five model calls in the system it was the only one with
+    # no durable record at all.
+    transcript.exchanges.append(
+        Exchange(text=turn.text, calls=turn.calls, opaque=turn.opaque)
+    )
+    try:
+        save_transcript(
+            transcript, run_id=run_id, role="critic", system=system
+        )
+    except Exception:
+        # Losing the write-up must never lose the ranking. Same rule as
+        # `ant.explore` and `synth._save`.
+        pass
 
     call = next((c for c in turn.calls if c.name == "prioritise"), None)
     if call is None:

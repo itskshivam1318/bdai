@@ -420,3 +420,71 @@ text, network payloads, form semantics, cross-state structure. That choice
 decides what intent can say, and is the next thing to settle.
 
 **Who:** shivam + Claude, on `work/agent-forensics`.
+
+## 2026-09-05 06:45 — One provider seam, and every model call leaves a transcript
+
+A forensic pass over the five model callers — orchestrator, ant, critic,
+synthesizer, analyst — found three of them wired around the shared plumbing
+rather than through it. All three failures were silent by construction.
+
+**`synth.py` built its own `anthropic.Anthropic()`** and gated on
+`ANTHROPIC_API_KEY`. This workspace runs on `OPENROUTER_API_KEY`, so `_ask`
+returned `None` on every call and all five entries in
+`artifacts/invalid-payloads.json` read `"source": "fallback"`. The seam
+`explorer/__init__.py` calls *"the one place a model is worth its cost"* had
+never once fired, while every other model call in the system worked.
+
+**The decision:** every model call goes through `llm.load()`. There is exactly
+one place that answers "which provider", and adding a second way to find one is
+adding a second way to not find one. The structural guarantee that made the
+synthesizer a `json_schema` response — a payload or nothing, never prose to
+parse — is preserved as a `Tool`, which every provider serialises.
+
+**Degradation must name itself.** `Synthesizer.unavailable` carries the reason
+and the crawl prints it (`PAYLOADS 5 from fallback (RuntimeError: ...)`). A
+fallback that cannot say why it fell back is indistinguishable from a design.
+
+**`critic.prioritise` wrote no transcript** — the single call that decides the
+order of the final report, recorded only as the count `critic ranked 9 of 14`.
+The analyst wrote none either. The cause was not a policy: `save_transcript`
+takes a `Transcript`, and only the two agents with a multi-turn tool loop built
+one, so a single-turn call had nowhere to put its exchange. A dataclass boundary
+had become a logging policy without anyone choosing it. All five now write.
+
+**The console ran no critic.** `routers/explore.py` emitted `Exploration.gaps` —
+free text the orchestrator wrote into its `finish` call — as `gap:` lines. That
+is uncited, unverifiable model output presented as coverage evidence, which is
+the exact class of output `critic.py` was built to make structurally impossible,
+sitting on the one path the demo actually shows.
+
+**The decision:** the console runs `critic.prioritise` on both paths, model or
+not, and the two kinds of statement are **kept apart rather than merged**.
+Computed candidates print as `gap [kind] action in state -- risk` and can be
+looked up in the map. The colony's prose prints as `noted:` and is kept, because
+it names things no cell of a state table can — *"we never got past the login
+wall"* is a real observation and not a citation. One is evidence, the other is a
+claim; a reader who cannot tell them apart has neither.
+
+`_crawl_only` also stopped formatting its own gap strings from the top three
+rows of `WorldMap.gaps()`. That was one of four gap kinds, truncated, and it
+made the no-model path's coverage claim mean something different from every
+other path's.
+
+**Not a bug, corrected here:** transcripts filed under `adhoc/` rather than
+`run-<id>/` looked like broken `run_id` plumbing. It is not — every console run
+in `app.db` had errored on "no model configured" or run `degraded` on the
+deterministic crawler, so no console run had ever had a model to transcribe.
+Same root cause as the synthesizer, one layer up.
+
+**Evidence:** `make probe` — 149 checks, 0 fail, exit 0, measured inside a window
+where `(git status --porcelain; git diff; git diff --cached) | shasum` was
+identical before and after. Two earlier numbers taken in this session are
+withdrawn: they were guarded by `git status --porcelain | shasum`, which hashes
+filenames and status letters rather than content and so cannot see a second
+session editing an already-modified file. Nine checks are new and each
+is one of the above: the synthesizer asking a passed provider, refusing a field
+the form has not got, degrading on prose, degrading on a raised exception,
+serving the second identical form shape from cache, and the critic filing a
+transcript under its run that can reconstruct the call.
+
+**Who:** shivam + Claude, on `work/agent-forensics`.

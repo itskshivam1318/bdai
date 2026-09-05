@@ -9,9 +9,18 @@ Two consumers, deliberately separate, because they want different things:
                    tuning `prompts/*.md`. Ephemeral by default.
 
     transcripts/   "show me the agent's reasoning" -- a durable JSON record per
-                   ant, written beside the run's other evidence. This is the
-                   one the demo needs: the brief pays 15% for presenting the
-                   agent's decisions, and a trace UI on a laptop is not that.
+                   *model call*, written beside the run's other evidence. This
+                   is the one the demo needs: the brief pays 15% for presenting
+                   the agent's decisions, and a trace UI on a laptop is not
+                   that.
+
+**Five roles, and it was two for longer than anyone noticed.** `save_transcript`
+takes a `Transcript`, which only the orchestrator and the ants -- the two agents
+running a multi-turn tool loop -- had any reason to build. The critic, the
+synthesizer and the analyst each make exactly one call, so each had an answer
+and nowhere to put it, and all three were silent while looking no different from
+the outside. If you add a sixth model call anywhere, it appends one `Exchange`
+and calls this. Two lines, and invisible if you skip them.
 
 **Phoenix runs entirely locally.** `arize-phoenix` starts a UI on :6006 and
 collects over OpenTelemetry; nothing leaves the machine, which matters when the

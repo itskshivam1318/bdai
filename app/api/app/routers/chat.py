@@ -33,8 +33,9 @@ from pydantic import BaseModel
 from sqlmodel import Session, select
 
 from agents.ant import instructions
-from agents.llm import Transcript, load
+from agents.llm import Exchange, Transcript, load
 from agents.suite import verdicts_by_state
+from agents.tracing import save_transcript
 
 from ..db import get_session
 from ..models import AppState, ChatMessage, Run, StateTransition, TestSession
@@ -295,15 +296,38 @@ def send(session_id: int, body: ChatRequest, db: Session = Depends(get_session))
         question=question,
     )
 
+    system = instructions("analyst")
+    transcript = Transcript(prompt=prompt)
     try:
         provider = load()
-        turn = provider.turn(instructions("analyst"), Transcript(prompt=prompt), [])
+        turn = provider.turn(system, transcript, [])
     except Exception as exc:  # noqa: BLE001 -- the reason is the whole point
         # 502 rather than 500: the failure is almost always an absent or spent
         # API key, and `str(exc)` already says which. Swallowing it here is the
         # bug this codebase has fixed twice -- see `run.summary` and the console's
         # status disclosure.
         raise HTTPException(502, f"the model could not answer: {exc}") from exc
+
+    # `ChatMessage` stores the answer and the `node_keys` the question was asked
+    # about, which is enough to reconstruct roughly what the model saw and not
+    # what it was told. The assembled prompt is several hundred lines of map and
+    # the system prompt is edited constantly, so a thread that records neither
+    # cannot explain its own answers a day later. Written before the 502 guard
+    # below: an empty answer is the transcript most worth having.
+    transcript.exchanges.append(
+        Exchange(text=turn.text, calls=turn.calls, opaque=turn.opaque)
+    )
+    try:
+        save_transcript(
+            transcript,
+            run_id=run.id if run else None,
+            role="analyst",
+            system=system,
+            label=f"s{session_id}",
+        )
+    except Exception:
+        # Losing the write-up must never lose the answer.
+        pass
 
     answer = (turn.text or "").strip()
     if not answer:
