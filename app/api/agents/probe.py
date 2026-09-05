@@ -29,7 +29,8 @@ from playwright.sync_api import sync_playwright
 
 from . import tools
 from .ant import Report, explore, instructions
-from .explorer import forms
+from . import ant, orchestrator
+from .explorer import crawler, forms
 from .explorer.forms import Credentials
 from .explorer.observer import Observer
 from .explorer.worldmap import WorldMap
@@ -232,6 +233,89 @@ def check(label: str, condition: bool, detail: str = "") -> bool:
     if not condition and detail:
         print(f"        {detail}")
     return condition
+
+
+def _parity_checks() -> bool:
+    """The colony must honour what the crawler honours, and start where it stopped.
+
+    Every check here is a capability that existed in `explorer/crawler.py` and
+    silently did not exist in `orchestrator.py` + `ant.py`. The measured cost of
+    the worst one: `forms.perform` refuses `submit[invalid]` when handed no
+    synthesizer, the ant was told "that is a fact about the application, not
+    your mistake" -- which was false -- nothing was recorded, so `brief()` still
+    showed the action as untried and the orchestrator reassigned it. Two
+    separate saucedemo runs handed it to a fresh ant and got zero actions back.
+    """
+    from .explorer.worldmap import WorldMap
+
+    print("PARITY      the colony honours what the crawler honours")
+    ok = True
+
+    ok &= check(
+        "one guard, reachable from both walkers",
+        crawler.is_safe is forms.is_safe
+        and not forms.is_safe("button:Delete account")
+        and forms.is_safe("button:Sign in"),
+        "the destructive-action denylist is not shared",
+    )
+
+    ok &= check(
+        "an ant refuses a destructive action instead of clicking it",
+        "world.skipped" in _source(ant, "refused: the name suggests"),
+        "ant.py does not consult the guard before acting",
+    )
+
+    ok &= check(
+        "an ant is handed the synthesizer",
+        "synthesizer" in _signature(ant.explore)
+        and "synthesizer" in _signature(orchestrator.run),
+        "submit[invalid] is structurally impossible for every ant",
+    )
+
+    ok &= check(
+        "the orchestrator accepts a map the crawler already built",
+        "world" in _signature(orchestrator.run),
+        "the colony can only start from a blank map",
+    )
+
+    # A refused action must reach the orchestrator's view, or it is reassigned.
+    world = WorldMap()
+    world.states["abc12345deadbeef"] = __import__(
+        "agents.explorer.worldmap", fromlist=["StateNode"]
+    ).StateNode(
+        key="abc12345deadbeef", url="/", title="t",
+        actions=("submit[invalid]:button:Login",),
+    )
+    world.skipped[("abc12345deadbeef", "submit[invalid]:button:Login")] = (
+        "nothing here could be filled"
+    )
+    rendered = tools.brief(world, waves_left=3, ants_left=8)
+
+    ok &= check(
+        "a refused action is shown to the orchestrator, not hidden",
+        "REFUSED" in rendered and "submit[invalid]:button:Login" in rendered,
+        "brief() renders no refused section; the orchestrator cannot tell "
+        "'never tried' from 'tried and impossible'",
+    )
+    ok &= check(
+        "the refused action carries the reason it failed",
+        "nothing here could be filled" in rendered,
+        "a refusal with no reason is a to-do nobody can action",
+    )
+    return ok
+
+
+def _signature(fn) -> str:
+    import inspect
+
+    return str(inspect.signature(fn))
+
+
+def _source(module, needle: str) -> str:
+    import inspect
+
+    text = inspect.getsource(module)
+    return text if needle in text else ""
 
 
 def main() -> int:
@@ -1035,6 +1119,13 @@ def main() -> int:
     # answers -- just without remembering anything you said.
     print()
     ok &= _chat_transcript_checks()
+
+    # 9. The two walkers had drifted: every guard, the input synthesizer and
+    # the refused-action notebook lived in `crawler.py` and the colony -- the
+    # engine the console runs whenever an API key is present -- had none of
+    # them. These checks are what stops that reopening.
+    print()
+    ok &= _parity_checks()
 
     print()
     return 0 if ok else 1

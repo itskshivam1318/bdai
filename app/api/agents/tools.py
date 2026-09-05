@@ -224,6 +224,21 @@ def brief(
     Untried counts are shown per state because they are what a dispatch decision
     turns on: a state with 23 untried actions is a frontier, and one with none is
     finished territory.
+
+    **Refused actions are shown separately, and they are the point of a seeded
+    run.** An action the deterministic walker offered, tried, and could not
+    perform is not frontier -- it is the exact place determinism ran out and
+    judgement is needed. Without this section the orchestrator cannot tell "not
+    yet tried" from "tried and impossible", so it reassigns the impossible one
+    wave after wave: measured on saucedemo, `submit[invalid]` was handed to a
+    fresh ant in two separate runs and returned zero actions both times.
+
+    **Known limit, and it binds before the others do.** This renders one line
+    per state, so the orchestrator's prompt grows linearly with the map. That
+    is fine at 21 states and is the unbounded-context problem at 200 -- the
+    same failure the ant/orchestrator split exists to prevent, relocated. A
+    seeded run reaches that size much sooner than an unseeded one, so ranking
+    or bucketing states here is the next thing this function needs.
     """
     edges = sum(len(taken) for taken in world.transitions.values())
     lines = [
@@ -242,6 +257,19 @@ def brief(
         lines.append(
             f"  [{key[:8]}] {title:<30} {tried:>2} tried, {untried:>3} untried"
         )
+
+    if world.skipped:
+        lines += [
+            "",
+            f"{len(world.skipped)} action(s) OFFERED BUT REFUSED -- these were "
+            "tried and could not be done. They are not frontier; sending an ant "
+            "to repeat one costs a wave and finds nothing. They are where a "
+            "human or a cleverer approach is needed:",
+        ]
+        for (key, action), why in list(world.skipped.items())[:12]:
+            lines.append(f"  [{key[:8]}] {action}  --  {why}")
+        if len(world.skipped) > 12:
+            lines.append(f"  ... and {len(world.skipped) - 12} more")
 
     if reports:
         lines += ["", "what the last wave found:"]

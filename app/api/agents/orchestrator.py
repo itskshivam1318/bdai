@@ -24,8 +24,10 @@ Prompt: `prompts/orchestrator.md`. That file is the tunable part.
 
 from __future__ import annotations
 
+import os
 import sys
 import time
+from pathlib import Path
 from dataclasses import dataclass, field
 
 from playwright.sync_api import sync_playwright
@@ -35,11 +37,16 @@ from .ant import Report, explore, instructions
 from .explorer import forms
 from .explorer.forms import Credentials
 from .explorer.observer import Observer
-from .explorer.crawler import autosave
+from .explorer.crawler import Budget as CrawlBudget, autosave, crawl
+from .explorer.synth import Synthesizer
 from .explorer.worldmap import WorldMap
 from .llm import Exchange, Provider, ToolResult, Transcript, load
 from .shots import Shot
 from .tracing import save_transcript, start as start_tracing
+
+# Resolved from __file__ like `crawler.RUNS`, so it follows `api/` wherever
+# that moves rather than depending on the caller's working directory.
+ARTIFACTS = Path(__file__).resolve().parent.parent / "artifacts"
 
 
 @dataclass(frozen=True)
@@ -158,6 +165,8 @@ def run(
     run_id: int | None = None,
     shot: Shot | None = None,
     checkpoint=None,
+    synthesizer=None,
+    world: WorldMap | None = None,
 ) -> Exploration:
     """Explore `entry_url` until the orchestrator is satisfied or the budget ends.
 
@@ -189,7 +198,17 @@ def run(
             f"orchestrator on {provider.model}, ants on {ant_provider.model}",
         )
 
-    world = WorldMap(actions_of=lambda obs: forms.available_actions(page, obs))
+    # A map handed in is a crawl that already happened. The colony's first
+    # wave then decides where *judgement* is needed rather than what the
+    # application is -- measured on saucedemo, waves 1-4 of an unseeded run go
+    # entirely on rediscovering structure `explorer.crawler` produces in 124
+    # seconds for nothing, and the budget is gone before `finish` is reached.
+    #
+    # `actions_of` is rebound either way: it closes over a page, and the page
+    # that crawled is not the page the ants will walk.
+    seeded = world is not None
+    world = world or WorldMap()
+    world.actions_of = lambda obs: forms.available_actions(page, obs)
     result = Exploration(world=world)
 
     observer = Observer(page)
@@ -198,6 +217,13 @@ def run(
     entry_key = world.record(observer.observe())
     if shot is not None:
         world.attach_screenshot(entry_key, shot(entry_key))
+    if seeded:
+        emit(
+            "info",
+            f"seeded with {len(world.states)} state(s), "
+            f"{sum(len(t) for t in world.transitions.values())} transition(s) "
+            f"and {len(world.skipped)} refused action(s) from the crawler",
+        )
     emit("info", f"entry {entry_url} -> state {entry_key[:8]}")
 
     system = instructions("orchestrator")
@@ -308,6 +334,7 @@ def run(
                     budget=budget.ant_actions,
                     run_id=run_id,
                     shot=shot,
+                    synthesizer=synthesizer,
                 )
             except Exception as exc:
                 # One ant dying must not take the colony with it. A transient
@@ -433,6 +460,30 @@ def run(
     return result
 
 
+def seed_map(page, entry_url: str, credentials, synthesizer, budget=None):
+    """Walk the app deterministically, and hand the colony what it found.
+
+    The whole argument for the hybrid in one function. Measured on saucedemo at
+    equal action budgets: the crawler reaches 21 states for nothing in 124s,
+    the colony reaches 16 for ~$0.09 in ~1400s. An unseeded colony spends its
+    first four waves rebuilding what this returns, and in three complete runs
+    never had budget left to call `finish` -- so it produced no summary and no
+    flows, which is the only thing it can do that the crawler cannot.
+
+    The refused actions matter more than the states. `world.skipped` is the
+    list of things determinism tried and could not do -- login walls, forms
+    with no fillable field -- and that is precisely the work worth spending a
+    model on. `tools.brief` renders it for the orchestrator.
+    """
+    return crawl(
+        page,
+        entry_url,
+        budget or CrawlBudget(),
+        credentials=credentials,
+        synthesizer=synthesizer,
+    )
+
+
 def main(entry_url: str, intent: str | None = None) -> int:
     traces = start_tracing()
     provider = load()
@@ -450,6 +501,11 @@ def main(entry_url: str, intent: str | None = None) -> int:
         print(f"INTENT      {intent}")
     print()
 
+    # Seeding is the default because the hybrid is the product; `SEED=0` turns
+    # it off, which is what the crawler-vs-colony A/B needs to stay runnable.
+    seed = os.environ.get("SEED", "1") != "0"
+    synthesizer = Synthesizer(cache_path=ARTIFACTS / "invalid-payloads.json")
+
     with sync_playwright() as pw:
         browser = pw.chromium.launch()
         # Test and staging targets routinely serve self-signed or expired certs;
@@ -457,8 +513,20 @@ def main(entry_url: str, intent: str | None = None) -> int:
         # run still reports that transport security was not verified -- see
         # `_tls_warning`.
         page = browser.new_page(ignore_https_errors=True)
+
+        world = None
+        if seed:
+            print("SEED        crawling deterministically first...")
+            world = seed_map(page, entry_url, credentials, synthesizer)
+            print(
+                f"SEED        {len(world.states)} states, "
+                f"{sum(len(t) for t in world.transitions.values())} transitions, "
+                f"{len(world.skipped)} refused -- handing to the colony\n"
+            )
+
         result = run(
-            page, entry_url, provider, intent=intent, credentials=credentials
+            page, entry_url, provider, intent=intent, credentials=credentials,
+            synthesizer=synthesizer, world=world,
         )
         browser.close()
 

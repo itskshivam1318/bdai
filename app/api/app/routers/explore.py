@@ -207,6 +207,9 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
                 # run still reports that transport security was not verified -- see
                 # `_tls_warning`.
                 page = browser.new_page(ignore_https_errors=True)
+                synthesizer = Synthesizer(
+                    cache_path=settings.artifacts_dir / "invalid-payloads.json"
+                )
                 if provider is None:
                     result = _crawl_only(
                         page,
@@ -216,10 +219,41 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
                         shooter(page, run_id, settings.artifacts_dir),
                     )
                 else:
+                    # Crawl first, then colonise. The deterministic walk costs
+                    # no quota and produces the map in a couple of minutes; the
+                    # colony then spends its waves on judgement instead of on
+                    # rediscovering the same structure. Measured on saucedemo at
+                    # equal action budgets: crawler 21 states for nothing,
+                    # colony 16 for ~$0.09, and in three complete unseeded runs
+                    # the orchestrator never reached `finish` -- so the console
+                    # showed a map and never the written account underneath it.
+                    #
+                    # It also fills the canvas immediately: `checkpoint` streams
+                    # the crawl, so the graph draws while the model is still
+                    # being asked its first question.
+                    emit("info", "crawling deterministically first", surface="explore")
+                    seed = crawler.crawl(
+                        page,
+                        target_url,
+                        crawler.Budget(),
+                        credentials=Credentials.from_env(),
+                        synthesizer=synthesizer,
+                        checkpoint=checkpoint,
+                    )
+                    emit(
+                        "decision",
+                        f"seed: {len(seed.states)} states, "
+                        f"{sum(len(t) for t in seed.transitions.values())} "
+                        f"transitions, {len(seed.skipped)} refused -- "
+                        "handing to the colony",
+                        surface="explore",
+                    )
                     result = orchestrator.run(
                         page,
                         target_url,
                         provider,
+                        world=seed,
+                        synthesizer=synthesizer,
                         intent=body.intent,
                         budget=orchestrator.Budget(
                             max_waves=body.max_waves,
