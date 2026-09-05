@@ -32,7 +32,7 @@ from sqlmodel import Session, select
 
 # Absolute, not relative: `agents/` is a sibling of `app/` under `api/`, so a
 # relative import would climb above this package and fail at import time.
-from agents import orchestrator, runner, suite
+from agents import critic, invariants, orchestrator, runner, suite
 from agents.explorer import crawler, store
 from agents.explorer.forms import Credentials
 from agents.explorer.synth import Synthesizer
@@ -57,7 +57,96 @@ class ExploreRequest(BaseModel):
     ant_actions: int = 4
 
 
-def _crawl_only(page, target_url: str, emit, checkpoint, shot) -> orchestrator.Exploration:
+def report_invariants(world, emit) -> tuple[invariants.Violation, ...]:
+    """Check the finished map against rules no baseline is needed to apply.
+
+    Every other verdict this router reports is *differential*: `generator.py`
+    records what the application did and `runner.py` says DEFECT when it later
+    does something else. That oracle has one permanent blind spot -- an app
+    already broken when the crawler watched it has its brokenness recorded as
+    the specification -- and the blind spot swallows the whole console on any
+    target we cannot redeploy, because there is no second deploy to differ
+    from and every reachable verdict is PASSED.
+
+    `agents/invariants.py` is the other kind of oracle and was already written;
+    it was reachable only from `agents/pipeline.py`, the CLI. This is the same
+    call on the surface we demo.
+
+    Silence is reported too. "No rule fired" and "nobody looked" are different
+    claims, and only one of them is worth a line in the timeline.
+    """
+    violations = invariants.check(world)
+    for violation in violations:
+        emit(
+            "error",
+            f"invariant [{violation.rule}] {violation.action} "
+            f"in {violation.state[:8]} -- {violation.because}",
+            "defect",
+        )
+    if violations:
+        rules = ", ".join(sorted({violation.rule for violation in violations}))
+        emit("error", f"invariants: {len(violations)} broken ({rules})", "defect")
+    else:
+        # Not a claim of correctness -- only that these properties were checked
+        # and found intact. That belongs to the report; tagging it `defect`
+        # would open the defect widget to say nothing was wrong.
+        emit(
+            "decision",
+            "invariants: every rule that could be evaluated over this map held",
+            "report",
+        )
+    return violations
+
+
+# Which invariants are strong enough to colour the badge, and it is not all of
+# them. The split is whether the rule needs a *specification* to be true.
+#
+#   server-error     the server said 5xx in its own words. Needs nothing.
+#   empty-accepted   an empty submission reached the same state as a filled
+#                    one, so the fields were not required. Read off the map.
+#
+# The two left out both rest on `submit[invalid]`, and what makes that payload
+# invalid is a policy the synthesizer *guessed*. Measured on our own SUT: the
+# cached payload for `button:Continue` is `{Password: "short"}`, the app's only
+# rule is `complete = Boolean(email && password)`, and it confirms the order --
+# correctly. `invalid-accepted` called that a defect. The fallback payloads are
+# worse: `{'Project name': ''}` is an empty submission wearing an invalid
+# label, and it would fire the rule against an app doing nothing wrong.
+#
+# They are still reported, on the defect surface, with their evidence. They are
+# simply not proof, and a badge that reddens for a suspicion is a badge that
+# means nothing when it reddens for a 5xx. Narrowing the rule itself belongs in
+# `agents/invariants.py` -- gating on `Payload.source` is the obvious move --
+# and that file is another packet's.
+_PROVABLE = frozenset({"server-error", "empty-accepted"})
+
+
+def status_for(
+    tally: dict[str, int],
+    violations: tuple[invariants.Violation, ...],
+    incomplete: bool,
+    modelled: bool,
+) -> str:
+    """The badge, from everything the run learned. One place, so it is checkable.
+
+    A proven violation counts exactly like a DEFECT because it is one -- found
+    without a baseline rather than against one, which on a target we cannot
+    redeploy is the only way a defect can be found at all.
+
+    `degraded` survives a model-free run: a map and a suite exist, but no flow
+    was named and no intent was honoured, so green would claim more than
+    happened. It is unknown to STATUS_TONE and renders grey -- see
+    SessionView.tsx.
+    """
+    proven = sum(1 for violation in violations if violation.rule in _PROVABLE)
+    if tally[runner.DEFECT] or tally[runner.ESCALATE] or proven or incomplete:
+        return "failed"
+    return "passed" if modelled else "degraded"
+
+
+def _crawl_only(
+    page, target_url: str, emit, checkpoint, shot, synthesizer
+) -> orchestrator.Exploration:
     """The no-model path: the same WorldMap, built breadth-first with no model.
 
     Returned as an `Exploration` so the caller's save-and-report block does not
@@ -65,9 +154,11 @@ def _crawl_only(page, target_url: str, emit, checkpoint, shot) -> orchestrator.E
     journey is the one thing on that path that genuinely needs a model -- the
     graph itself never did, which is the whole argument in `explorer/__init__`.
 
-    `gaps` is rendered here rather than in the caller: the orchestrator hands
-    back prose a model wrote, `WorldMap.gaps()` hands back a dict, and the
-    timeline only knows how to print strings.
+    `gaps` is left empty on purpose. It used to hold the top three rows of
+    `WorldMap.gaps()`, formatted here because the timeline only prints strings
+    -- but that is one of four gap kinds, truncated to three, and it made this
+    path's coverage claim differ from every other path's. `critic.candidates`
+    computes all four from the same map and the caller runs it on both paths.
     """
     world = crawler.crawl(
         page,
@@ -75,18 +166,13 @@ def _crawl_only(page, target_url: str, emit, checkpoint, shot) -> orchestrator.E
         credentials=Credentials.from_env(),
         # Same cache the CLI uses, so a payload the model chose on an earlier
         # run is reused now that there is no model to ask.
-        synthesizer=Synthesizer(cache_path=settings.artifacts_dir / "invalid-payloads.json"),
+        synthesizer=synthesizer,
         checkpoint=checkpoint,
         # The console shows a thumbnail per state whichever path built the map,
         # so a degraded run gets cards with pictures in them rather than boxes.
         shot=shot,
     )
-    gaps = tuple(
-        f"[{key[:8]}] {', '.join(actions[:6])}"
-        for key, actions in sorted(world.gaps().items(), key=lambda kv: -len(kv[1]))
-        if actions
-    )
-    return orchestrator.Exploration(world=world, stopped="no model", gaps=gaps[:3])
+    return orchestrator.Exploration(world=world, stopped="no model")
 
 
 def _tls_warning(target_url: str) -> str | None:
@@ -194,9 +280,24 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
                 seen = len(world.states)
                 emit("info", f"  crawled {seen} state(s)")
 
+        # One synthesizer for the whole run, shared by the crawl and the
+        # replay. Two reasons it cannot be constructed at either call site:
+        # `forms.perform` refuses `submit[invalid]` outright when handed None,
+        # so a replay without one turns every invalid-input scenario into an
+        # ESCALATE that says "the action would not execute" -- a false
+        # unattributable verdict on a test the same function had just written.
+        # And the cache is the replay log: the scenario must be re-submitted
+        # with the payload the crawl actually recorded, or it is not a replay.
+        synthesizer = Synthesizer(
+            cache_path=settings.artifacts_dir / "invalid-payloads.json",
+            run_id=run_id,
+        )
+
         # Assigned inside the `with` block below but read after it, and the
         # `except` path must still find a list rather than a NameError.
         results: list = []
+        # Assigned inside the `with` below and read after it, like `results`.
+        ranked: tuple = ()
 
         try:
             with sync_playwright() as pw:
@@ -213,6 +314,7 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
                         emit,
                         checkpoint,
                         shooter(page, run_id, settings.artifacts_dir),
+                        synthesizer,
                     )
                 else:
                     result = orchestrator.run(
@@ -267,11 +369,41 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
                 )
 
                 # --- coverage, before generation, as the brief requires
-                for gap in result.gaps:
-                    emit("warn", f"gap: {gap}")
+                #
+                # `critic.candidates` computes every gap from the map and the
+                # model may only reorder them; anything it cites that was not a
+                # candidate is dropped and counted. This console used to print
+                # `result.gaps` instead -- free text the orchestrator wrote into
+                # its `finish` call, uncited and unverifiable, which is the exact
+                # class of output `critic.py` exists to make impossible. The two
+                # are kept apart rather than merged: one is evidence, the other
+                # is an observation, and only one of them can be looked up.
+                ranked = critic.prioritise(
+                    result.world,
+                    provider,
+                    intent=body.intent,
+                    run_id=run_id,
+                    on_event=lambda level, message: emit(
+                        level, message, surface="coverage"
+                    ),
+                )
+                for gap in ranked[:12]:
+                    emit(
+                        "warn",
+                        f"gap [{gap.kind}] {gap.action} "
+                        f"in {gap.where} -- {gap.risk or gap.why}",
+                    )
+                # The colony's own account of what it could not reach. Real, and
+                # often naming something no computed candidate can -- "we never
+                # got past the login wall" is not a cell of the state table --
+                # but it is a claim, not a citation, so it does not say "gap".
+                for note in result.gaps:
+                    emit("info", f"noted: {note}")
                 emit(
-                    "warn" if result.gaps else "info",
-                    f"coverage: {len(result.gaps)} gap(s) before generation",
+                    "warn" if ranked else "info",
+                    f"coverage: {len(ranked)} gap(s) before generation"
+                    + (f", {len(result.gaps)} note(s) from the colony"
+                       if result.gaps else ""),
                     surface="coverage",
                 )
 
@@ -292,6 +424,7 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
                                 page,
                                 scenario,
                                 credentials=credentials,
+                                synthesizer=synthesizer,
                                 on_event=emit,
                             )
                         )
@@ -326,6 +459,13 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
                         surface="defect",
                     )
 
+            # --- invariants --------------------------------------
+            # Checked over the finished map rather than during the crawl, and
+            # after replay rather than before it, so the timeline reads in the
+            # order the evidence arrived. On a target we cannot redeploy this
+            # is the only stage that can reach a verdict other than PASSED.
+            violations = report_invariants(result.world, emit)
+
             tally = {
                 v: sum(1 for r in results if r.verdict == v)
                 for v in (runner.PASSED, runner.HEALED, runner.DEFECT, runner.ESCALATE)
@@ -334,33 +474,29 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
                 "decision",
                 f"report: {tally[runner.PASSED]} passed, {tally[runner.HEALED]} healed, "
                 f"{tally[runner.DEFECT]} defect, {tally[runner.ESCALATE]} escalate, "
-                f"{len(result.gaps)} gap(s) remaining ({written} rows)",
+                f"{len(violations)} invariant(s) broken, "
+                f"{len(ranked)} gap(s) remaining ({written} rows)",
                 surface="report",
             )
 
             if run:
-                # A defect is a defect whoever found it, so it outranks the
-                # model question. Absent one, `degraded` survives a model-free
-                # run: a map and a suite exist, but no flow was named and no
-                # intent was honoured, so green would claim more than happened.
-                # `degraded` is unknown to STATUS_TONE and renders grey, which
-                # is the point -- see SessionView.tsx.
-                #
-                # Neither is a run that tested nothing a pass. Zero scenarios,
-                # or scenarios that all raised before returning a verdict, is
-                # not success: for a product whose claim is "a URL in, a
-                # meaningful suite out", a green badge over an empty suite is
-                # the worst thing to report.
+                # A run that tested nothing is not a pass either: zero
+                # scenarios, or scenarios that all raised before returning a
+                # verdict, is not success. For a product whose claim is "a URL
+                # in, a meaningful suite out", a green badge over an empty
+                # suite is the worst thing to report. The rest of the policy is
+                # `status_for`, which `app/probe.py` can check without a
+                # browser.
                 incomplete = not plan or len(results) != len(plan)
-                if tally[runner.DEFECT] or tally[runner.ESCALATE] or incomplete:
-                    run.status = "failed"
-                else:
-                    run.status = "passed" if provider else "degraded"
+                run.status = status_for(
+                    tally, violations, incomplete, provider is not None
+                )
                 run.summary = result.summary or (
                     f"{len(result.world.states)} states, {len(plan)} scenarios, "
                     f"{tally[runner.DEFECT] + tally[runner.ESCALATE]} needing "
                     f"attention -- crawled without a model. Set "
-                    f"ANTHROPIC_API_KEY for flows and a summary."
+                    f"OPENROUTER_API_KEY (cheapest), ANTHROPIC_API_KEY or "
+                    f"GEMINI_API_KEY for flows and a summary."
                     if provider is None
                     else f"stopped: {result.stopped}"
                 )
