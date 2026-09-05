@@ -31,7 +31,7 @@ from . import Exchange, Tool, ToolCall, Transcript, Turn
 #
 # Both constants come from the catalogue, so the console's OpenRouter select and
 # this class cannot disagree about what "default" means -- see `catalog.py`.
-from .catalog import BY_ID, max_output_for  # noqa: E402
+from .catalog import BY_ID, free_route_for, max_output_for  # noqa: E402
 
 DEFAULT_MODEL = BY_ID["openrouter"].default_model
 
@@ -49,6 +49,18 @@ DEFAULT_MODEL = BY_ID["openrouter"].default_model
 # replies for a run that happens at all. Prefer topping up, or a `:free` route,
 # which is not reserved against and takes the full ceiling.
 MAX_TOKENS_ENV = "LLM_MAX_TOKENS"
+
+# `LLM_FREE_FALLBACK` is the other half of that emergency: rather than shrinking
+# every reply to fit a nearly-empty key, retry the one call that 402'd on a
+# `:free` route, which reserves nothing. Set it to `1` for the provider's own
+# free model, or to a route id to name one.
+#
+# **Off by default, and that is the load-bearing part.** `docs/product/bets.md`
+# holds a crawler-vs-colony comparison; a run that quietly finished on a
+# different model than it started on would corrupt it without ever looking like
+# a failure. When it does fire it is announced at `warn` naming both routes, so
+# the timeline says which model produced the flows.
+FREE_FALLBACK_ENV = "LLM_FREE_FALLBACK"
 DEFAULT_BASE_URL = BY_ID["openrouter"].base_url or "https://openrouter.ai/api/v1"
 
 # 429 and 5xx are weather; a colony making hundreds of calls will meet them.
@@ -212,6 +224,22 @@ class OpenAICompat:
             return {}
         return decoded if isinstance(decoded, dict) else {}
 
+    def _fallback_route(self) -> str | None:
+        """The `:free` route to retry a 402 on, or None to let it raise.
+
+        Three ways this returns None, all deliberate: the flag is unset (the
+        default), the provider has no free tier, or we are *already* on the
+        route we would switch to. That last one is not hypothetical -- a
+        negative balance 402s free models too, per OpenRouter's own limits
+        doc -- and without it the retry would swap the route for itself and
+        spend all five attempts learning nothing.
+        """
+        choice = os.environ.get(FREE_FALLBACK_ENV, "").strip()
+        if not choice or choice.lower() in {"0", "false", "no", "off"}:
+            return None
+        route = choice if "/" in choice else free_route_for(self.name)
+        return route if route and route != self.model else None
+
     def _post(self, payload: dict) -> dict:
         """One request, retried on transient failures.
 
@@ -243,6 +271,26 @@ class OpenAICompat:
                 return response.json()
 
             body = response.text[:400]
+
+            # A 402 is terminal for the *route*, not for the run. The switch is
+            # made on `self` and not just on this payload because a colony makes
+            # ~78 calls: re-attempting the dead route on each one would spend a
+            # round trip per call to rediscover what this one already proved.
+            if response.status_code == 402 and attempt < 4:
+                route = self._fallback_route()
+                if route:
+                    self._notify(
+                        "warn",
+                        f"{self.model}: out of credit, falling back to {route} "
+                        f"for the rest of this run -- results are no longer "
+                        f"comparable to a {self.model} run",
+                    )
+                    self.model = route
+                    self.max_tokens = max_output_for(route)
+                    payload["model"] = route
+                    payload["max_tokens"] = self.max_tokens
+                    continue
+
             if response.status_code not in RETRY_STATUSES or attempt == 4:
                 # 402 is the credit reservation, and its message names the
                 # number that would have worked ("can only afford 268"). It is
@@ -254,7 +302,9 @@ class OpenAICompat:
                         f" -- the ceiling is {self.max_tokens} tokens; set "
                         f"{MAX_TOKENS_ENV} below the affordable number above to "
                         "trade truncated replies for a run, or use a `:free` "
-                        "route, which is not reserved against"
+                        "route, which is not reserved against -- "
+                        f"{FREE_FALLBACK_ENV}=1 switches to one automatically "
+                        "on the next 402"
                     )
                 raise RuntimeError(
                     f"{self.model}: {response.status_code} from the provider: "

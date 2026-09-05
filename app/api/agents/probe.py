@@ -1190,8 +1190,210 @@ def main() -> int:
     print()
     ok &= _navigation_checks()
 
+    # 14. An exhausted key is not a hypothetical: two live runs have died on
+    # one mid-wave. These pin the escape hatch *and* its default, which is off
+    # -- a run that quietly changes model corrupts every comparison in bets.md.
+    print()
+    ok &= _fallback_checks()
+
     print()
     return 0 if ok else 1
+
+
+def _fallback_checks() -> bool:
+    """An exhausted key ends a colony mid-wave. This is the escape hatch.
+
+    Measured on 2026-09-05: a wave-3 `dispatch` call 402'd with "requested up
+    to 32768 tokens, but can only afford 268" while the account still held $10.
+    OpenRouter checks `max_tokens` against the *key's* remaining budget before
+    the model runs, and that key carried its own spend cap -- so the balance
+    was never what bound. The run died with a 24-state crawl in it.
+
+    `LLM_FREE_FALLBACK` lets that call retry once on a `:free` route, which
+    reserves nothing. Two properties make the difference between a rescue and
+    a lie, and both are checked below:
+
+    1. **Off by default.** A run that silently changes model is a run whose
+       numbers cannot be compared to the one before it. `docs/product/bets.md`
+       holds a crawler-vs-colony A/B; a quiet downgrade would corrupt it.
+    2. **Loud when it fires.** The switch is announced at `warn` naming both
+       routes, so the timeline says which model actually produced the flows.
+
+    Offline: no key, no network, no quota. `_client` is a stub.
+    """
+    import os
+
+    from .llm.catalog import max_output_for
+    from .llm.openai_compat import OpenAICompat
+
+    FLAG = "LLM_FREE_FALLBACK"
+    FREE = "minimax/minimax-m3:free"
+    PAID = "qwen/qwen3-coder-next"
+    # The provider's own words, trimmed to what `_post` actually reads.
+    BODY = (
+        '{"error":{"message":"This request requires more credits, or fewer '
+        'max_tokens. You requested up to 32768 tokens, but can only afford '
+        '268.","code":402,"metadata":{"limit_source":"openrouter_credits"}}}'
+    )
+    REPLY = {
+        "choices": [
+            {"message": {"content": "ok", "role": "assistant"},
+             "finish_reason": "stop"}
+        ]
+    }
+
+    class Response:
+        def __init__(self, status_code: int, payload=None, text: str = ""):
+            self.status_code, self.text, self._payload = status_code, text, payload
+
+        def json(self):
+            return self._payload
+
+    class Client:
+        """Hands back scripted responses and keeps every payload it was sent."""
+
+        def __init__(self, *responses):
+            self.queue, self.sent = list(responses), []
+
+        def post(self, path, json):
+            self.sent.append(json)
+            return self.queue.pop(0) if self.queue else Response(200, REPLY)
+
+    def provider(model: str, *responses, name: str = "openrouter"):
+        fake = object.__new__(OpenAICompat)
+        fake.model, fake.max_tokens = model, max_output_for(model)
+        # The real `__init__` always sets this, and the resolver reads it: a
+        # fallback route is retried with the key already in hand, so it has to
+        # come from the provider that key opens.
+        fake.name = name
+        fake.notes = []
+        fake._notify = lambda level, message: fake.notes.append((level, message))
+        fake._client = Client(*responses)
+        return fake
+
+    def post(fake):
+        """Drive `_post` with the payload `turn()` would have built."""
+        return OpenAICompat._post(
+            fake, {"model": fake.model, "max_tokens": fake.max_tokens}
+        )
+
+    print("FALLBACK    an exhausted key degrades to a free route, loudly")
+    ok = True
+    before = os.environ.get(FLAG)
+
+    # 1. Off by default. This is the check that protects the A/B numbers.
+    try:
+        os.environ.pop(FLAG, None)
+        fake = provider(PAID, Response(402, text=BODY))
+        try:
+            post(fake)
+            ok &= check(
+                "an unflagged run still dies on 402 rather than switching model",
+                False,
+                "the 402 was swallowed and the run continued on another model",
+            )
+        except RuntimeError as exc:
+            ok &= check(
+                "an unflagged run still dies on 402 rather than switching model",
+                len(fake._client.sent) == 1 and fake.model == PAID,
+                f"sent {len(fake._client.sent)} request(s), ended on {fake.model}",
+            )
+            ok &= check(
+                "the unflagged 402 names the flag that would have saved it",
+                FLAG in str(exc),
+                f"the message offers no way out: {exc}",
+            )
+
+        # 2. Flagged: one retry on the free route, and the reply comes back.
+        os.environ[FLAG] = "1"
+        fake = provider(PAID, Response(402, text=BODY), Response(200, REPLY))
+        body = post(fake)
+        sent = fake._client.sent
+        ok &= check(
+            "a flagged 402 retries once on the free route",
+            len(sent) == 2 and sent[1]["model"].endswith(":free"),
+            f"sent {[p['model'] for p in sent]}",
+        )
+        ok &= check(
+            "the retry returns the reply, not the 402",
+            body == REPLY,
+            f"got {body!r}",
+        )
+        # The paid model's ceiling is not the free one's, and sending the wrong
+        # number is a 400 rather than a clamp.
+        ok &= check(
+            "the retry carries the free route's own ceiling",
+            len(sent) == 2
+            and sent[1]["max_tokens"] == max_output_for(sent[1]["model"]),
+            f"retried with max_tokens={sent[-1].get('max_tokens')}",
+        )
+        # A colony makes ~78 calls. Re-attempting the dead route on each one
+        # spends a round trip per call to learn what it already knows.
+        ok &= check(
+            "the switch sticks for the rest of the run",
+            fake.model.endswith(":free")
+            and fake.max_tokens == max_output_for(fake.model),
+            f"instance still on {fake.model}",
+        )
+        ok &= check(
+            "the switch is announced with both routes named",
+            any(
+                level in ("warn", "error") and PAID in m and ":free" in m
+                for level, m in fake.notes
+            ),
+            f"notes={fake.notes}",
+        )
+
+        # 3. An explicit route beats the catalogue's pick.
+        os.environ[FLAG] = "deepseek/deepseek-chat:free"
+        fake = provider(PAID, Response(402, text=BODY), Response(200, REPLY))
+        post(fake)
+        ok &= check(
+            "the flag may name the route to fall back to",
+            fake._client.sent[1]["model"] == "deepseek/deepseek-chat:free",
+            f"fell back to {fake._client.sent[1]['model']}",
+        )
+
+        # 4. The loop guard. A free route 402s when the balance is *negative*
+        # -- documented, and it applies to free models too -- so this is a
+        # reachable state, not a hypothetical.
+        os.environ[FLAG] = "1"
+        fake = provider(FREE, Response(402, text=BODY))
+        try:
+            post(fake)
+            ok &= check(
+                "a 402 on the free route itself is not retried forever",
+                False,
+                "the free route fell back to itself",
+            )
+        except RuntimeError:
+            ok &= check(
+                "a 402 on the free route itself is not retried forever",
+                len(fake._client.sent) == 1,
+                f"sent {len(fake._client.sent)} request(s)",
+            )
+        # 5. Sarvam has no `:free` route. Falling back to MiniMax's would send
+        # a Sarvam key to OpenRouter and turn a legible 402 into a 401.
+        fake = provider("sarvam-m", Response(402, text=BODY), name="sarvam")
+        try:
+            post(fake)
+            ok &= check(
+                "a provider with no free tier raises rather than misrouting",
+                False,
+                "a sarvam key was pointed at another provider's route",
+            )
+        except RuntimeError:
+            ok &= check(
+                "a provider with no free tier raises rather than misrouting",
+                len(fake._client.sent) == 1 and fake.model == "sarvam-m",
+                f"ended on {fake.model}",
+            )
+    finally:
+        os.environ.pop(FLAG, None)
+        if before is not None:
+            os.environ[FLAG] = before
+
+    return ok
 
 
 def _byok_checks() -> bool:

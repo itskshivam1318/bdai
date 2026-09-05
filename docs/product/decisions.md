@@ -707,3 +707,54 @@ and does not exist, because the probe is offline by design. Left as a known gap
 rather than making `make probe` need the internet.
 
 **Who:** shivam + Claude.
+
+---
+
+## 2026-09-05 10:20 — A 402 may fall back to a `:free` route, but only when asked
+
+`LLM_FREE_FALLBACK` lets an exhausted key retry the call that 402'd on the
+provider's own `:free` route. **It is off by default, and that default is the
+decision** — the fallback itself is the easy part.
+
+**Why the mechanism is needed.** OpenRouter checks `max_tokens` against the
+key's remaining budget *before* the model runs, so a nearly-empty key refuses a
+large request outright: "requested up to 32768 tokens, but can only afford 268".
+Observed on a wave-3 `dispatch` call while the account still held $10 — the
+balance is not what binds, a per-key spend cap is, and the error's own remedy
+link points at the key page rather than at `/credits`. This behaviour appears in
+no OpenRouter documentation page; it is stated only in third-party write-ups and
+in the error text itself. `catalog.py` is where we write it down.
+
+**Why off by default.** `docs/product/bets.md` holds a crawler-vs-colony
+comparison. A run that silently finished on a different model than it started on
+would corrupt that measurement while looking exactly like a success — no error,
+no gap, just numbers that mean something other than their label. Rescuing a demo
+is worth an env var; rescuing it invisibly is not. When the fallback does fire it
+is announced at `warn` naming both routes, so the timeline records which model
+actually produced the flows.
+
+**Alternatives rejected.** *Lowering `LLM_MAX_TOKENS` instead* — the standard
+advice for this error, and it does not work at the observed budget: $0.0002 of
+headroom is 268 tokens at qwen3-coder-next's $0.80/M, and even a 1024-token
+ceiling costs $0.0008. The key was at zero, not merely below 32768. *On by
+default* — see above. *Resolving the fallback route across the whole catalogue*
+— the retry reuses the key already in hand, so `free_route_for()` is scoped to
+one provider; a Sarvam key pointed at MiniMax's route turns a legible 402 into a
+baffling 401. Sarvam and Claude have no free tier and correctly raise.
+
+**Switch persists on the instance,** not per call: a colony makes ~78 calls and
+re-attempting the dead route on each would spend a round trip per call to
+rediscover what the first one proved. `max_tokens` is re-resolved for the new
+route, because a ceiling above a model's cap is a 400 rather than a clamp.
+
+**Checks:** 10 new in `agents.probe` under `FALLBACK`, offline and
+deterministic — a stubbed `_client` scripts the 402. The first asserts an
+*unflagged* 402 still dies, which is the check protecting the A/B; others pin
+the loop guard (a negative balance 402s free models too, so falling back to the
+route we are already on is reachable), the re-resolved ceiling, the persistence,
+and the Sarvam no-free-tier path. 70 PASS / 0 FAIL across all offline sections.
+
+**Not verified live.** The stub proves the wiring; a real 402 needs a spent key,
+which lives in the browser under BYOK and never reaches this process.
+
+**Who:** shivam + Claude.

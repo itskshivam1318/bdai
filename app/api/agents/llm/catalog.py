@@ -173,6 +173,21 @@ def max_output_for(model: str) -> int:
     return FALLBACK_MAX_OUTPUT
 
 
+def free_route_for(provider: str) -> str | None:
+    """The provider's own `:free` model, or None if it has none.
+
+    Scoped to one provider rather than the whole catalogue because a fallback
+    route has to be *reachable*: it is retried with the key and base URL
+    already in hand, so a Sarvam key cannot rescue itself with an OpenRouter
+    route. Sarvam has no free tier and correctly gets None, which is what
+    makes the 402 raise there instead of turning into a 401.
+    """
+    spec = BY_ID.get(provider)
+    if not spec:
+        return None
+    return next((m.id for m in spec.models if m.id.endswith(":free")), None)
+
+
 def as_json() -> list[dict]:
     """The catalogue as the settings dialog consumes it. No keys, only names."""
     return [
