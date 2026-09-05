@@ -1224,3 +1224,50 @@ re-walked known edges and added nothing. That is a cost bug, not a correctness
 one, and it is untouched.
 
 **Who:** shivam + Claude.
+
+---
+
+## 2026-09-05 19:20 — The Generator is a model call; the map still decides what exists
+
+Supersedes, for the Generator only, the stance in *2026-09-04 19:00* that
+`generator.py` compiles scenarios and no model writes a test. The critic's
+argument there stands: a model that writes its own assertions cannot be checked
+by anything on the map. What changed is *where the line is drawn*.
+
+`generator.propose` hands the model the whole map — every state by page, every
+recorded edge with an id, and under each edge the effects the app produced when
+the crawler took it, each with an id — and asks it to write the suite: which
+paths, chained how, named what, protecting what, and **which recorded effects
+prove each step**. The model decides what is worth testing. It cannot write a
+step that is not a recorded edge, an assertion that is not a recorded effect,
+or a chain whose edges do not connect; each is dropped and counted, and the
+counts reach the plan, the announcement and the report. A scenario that starts
+mid-map is prefixed with the recorded route from the entry — the same fix
+`from_flow` needed, measured on a Velogent run where 6 of 7 escalations were
+believed flows replayed from the login URL with their first control absent.
+
+**Why:** shivam: *"why are we hell bent on deterministic generator … let's
+change the recorded decision, let's make generator use LLM."* The compile
+spends a suite by arithmetic — per page, per kind — and cannot tell a checkout
+from a footer link. Choosing what to test is judgement, and judgement is the
+job the brief scores. What the compile was protecting is *verifiability*, and
+that survives intact: every pass condition a test carries is still an effect
+the app was observed to produce, so `runner.py` can still tell a broken locator
+from a defect when it fails. Letting the model **drop** brittle effects — a
+user's email, a timestamp — is a strict improvement on asserting all twelve.
+
+**Alternatives rejected:** free-text assertions checked live (a failure could
+not be classified; reported as *unverified* at best); the model emitting
+`.spec.ts` directly (nothing to heal, nothing to classify). Both offered in
+chat; shivam chose the extractive design.
+
+**Consequence:** `planner.plan` asks the model before judging the plan source,
+so a run with no believed flows still gets a model-written suite; `source=map`
+keeps the model out entirely and remains the A/B knob. **Deterministic is the
+fallback, never removed:** no provider, a model that times out, or a model
+whose every test names something unrecorded all degrade to the compile and say
+so in `Plan.degraded`. Measured the same evening: `sarvam-105b` timed out at
+631s on a 43k-character brief and the plan degraded cleanly. The transcript
+files under the run as role `generator`, and `web/lib/agents.ts` attributes it.
+
+**Who:** shivam decided; Claude built.

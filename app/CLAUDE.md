@@ -15,7 +15,7 @@ app/
 │   ├── agents/explorer/    observe → identify → map → crawl → store. See below
 │   ├── agents/pipeline.py  **the meta-agent** — URL in, report out. Start here
 │   ├── agents/critic.py    computes coverage gaps; the model may only rank them
-│   ├── agents/generator.py map path → scenario → runnable .spec.ts
+│   ├── agents/generator.py a model writes the suite over the map; the map decides what exists. Compile is the fallback
 │   ├── agents/runner.py    execute a scenario; heal, or report a defect, or escalate
 │   ├── agents/regression.py the suite kept on disk between runs, healed in place
 │   ├── agents/rescue.py    a control nothing can play: go and look for what replaced it

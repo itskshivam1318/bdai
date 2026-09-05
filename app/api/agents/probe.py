@@ -690,6 +690,11 @@ def _dispatch_checks() -> bool:
         "an assignment naming no agent still runs an ant",
         tools.refuse_assignment(world, {"state": "aaaaaaaa"}) is None,
     )
+    ok &= check(
+        "a state id copied back with the brief's brackets still resolves",
+        tools.refuse_assignment(world, {"state": "[aaaaaaaa]", "agent": "ant"}) is None,
+        "measured 2026-09-05 on saucedemo: four waves, zero ants, every id bracketed",
+    )
 
     # The feedback loop: what an earlier dispatch produced has to reach the
     # next decision, or the orchestrator re-runs work that is already done.
@@ -874,6 +879,34 @@ def _flow_checks() -> bool:
     ok &= check(
         "a fully walked flow is not offered as a place to send an ant",
         f"[{'a' * 8}] -> [{'b' * 8}]" not in briefed,
+    )
+
+    # Measured 2026-09-05 on two pipeline runs: `uncompilable=1` with no
+    # unwalked pair, on a chain the crawler had walked end to end and could
+    # type. "Uncompilable" covered at least three different refusals and named
+    # none, so a run could not say why its one believed flow became no test.
+    from .generator import refusal
+
+    one_state = Hypothesis(claim="x", kind="flow", cites=("a" * 16,))
+    ok &= check(
+        "a refused flow says why: too few cited states",
+        "1 state" in refusal(world, one_state),
+        f"got {refusal(world, one_state)!r}",
+    )
+    ok &= check(
+        "a refused flow says why: the unwalked pair",
+        "a" * 8 in refusal(world, unwalked) and "c" * 8 in refusal(world, unwalked),
+        f"got {refusal(world, unwalked)!r}",
+    )
+    ok &= check("a compilable flow has no refusal", refusal(world, walked) == "")
+    planned = plan(world, BehaviorModel(hypotheses=(one_state,)), source="behaviour")
+    ok &= check(
+        "the plan carries each refusal with its claim",
+        planned.refused == (("x", refusal(world, one_state)),),
+        f"got {planned.refused!r}",
+    )
+    ok &= check(
+        "the plan renders the refusal", "1 state" in planned.render(),
     )
 
     return ok
@@ -1326,6 +1359,7 @@ def main() -> int:
     ok &= _interleave_checks()
     ok &= _per_page_checks()
     ok &= _frontier_order_checks()
+    ok &= _model_generator_checks()
     ok &= _ceiling_checks()
     print()
     ok &= _surface_checks()
@@ -4557,6 +4591,171 @@ def _frontier_order_checks() -> bool:
         "with nothing novel left, the old order stands: here, then depth",
         first("err", ("err", "submit[empty]:button:Sign in"), ("dash", "link:Velogent Velogent"))
         == ("err", "submit[empty]:button:Sign in"),
+    )
+    return ok
+
+
+def _effects_world():
+    """Four states with real snapshots, so edges carry effects a model can cite.
+
+    login -> valid -> dashboard -> Datasets -> datasets; login -> invalid -> error.
+    Returns the map and the keys.
+    """
+    from .explorer.observer import Observation
+    from .explorer.worldmap import StateNode, Transition, WorldMap
+
+    login, err, dash, data = "a" * 16, "d" * 16, "b" * 16, "c" * 16
+    form = '- heading "Welcome back" [level=1]\n- textbox "Username"\n- textbox "Password"\n- button "Sign in"'
+    pages = {
+        login: ("/login", "Login", form),
+        err: ("/login", "Login", form + "\n- paragraph: Invalid credentials"),
+        dash: ("/dashboard", "Dashboard", '- heading "Dashboard" [level=1]\n- paragraph: Signed in as user@example.com\n- link "Datasets"'),
+        data: ("/datasets", "Datasets", '- heading "Datasets" [level=1]\n- button "New dataset"'),
+    }
+    world = WorldMap()
+    world.evidence = []
+    for key, (path, title, snapshot) in pages.items():
+        world.evidence.append(Observation(url=f"http://sut{path}", title=title, snapshot=snapshot))
+        world.states[key] = StateNode(
+            key=key, url=f"http://sut{path}", title=title, actions=(),
+            evidence=(len(world.evidence) - 1,),
+        )
+    world.entry_key = login
+    index = {key: i for i, key in enumerate(pages)}
+    for from_key, action, to_key, mutating in (
+        (login, "submit[valid]:button:Sign in", dash, True),
+        (login, "submit[invalid]:button:Sign in", err, True),
+        (dash, "link:Datasets", data, False),
+    ):
+        world.transitions[(from_key, action)] = [
+            Transition(from_key=from_key, action=action, to_key=to_key,
+                       mutating=mutating, evidence=index[to_key])
+        ]
+    return world, login, err, dash, data
+
+
+def _model_generator_checks() -> bool:
+    """The Generator is a model call, and the map still decides what exists.
+
+    Decided 2026-09-05. The model writes the suite -- which recorded paths,
+    chained how, named what, proving each step with which recorded effects --
+    and `generator.propose` keeps only what the map backs: a step is a recorded
+    edge or it is dropped, an assertion is a recorded effect or it is dropped,
+    a chain that breaks is dropped whole, and a scenario starting mid-map is
+    prefixed with the route from the entry. Without a provider the compile is
+    the whole plan, as it always was.
+    """
+    from .behavior import BehaviorModel, Hypothesis
+    from .generator import edges, expectation, from_flow, propose
+    from .planner import plan
+
+    print("GENERATOR   a model writes the suite; the map decides what exists")
+    ok = True
+    world, login, err, dash, data = _effects_world()
+    ids = {edge: f"e{i}" for i, edge in enumerate(edges(world))}
+    valid = ids[(login, "submit[valid]:button:Sign in")]
+    invalid = ids[(login, "submit[invalid]:button:Sign in")]
+    datasets = ids[(dash, "link:Datasets")]
+    landing = expectation(world, login, "submit[valid]:button:Sign in").added
+    heading = next(i for i, line in enumerate(landing) if "Dashboard" in line)
+
+    class Writer:
+        name, model = "scripted:writer", "none"
+
+        def turn(self, system, transcript, tool_defs):
+            return Turn(text="", calls=(ToolCall(id="g1", name="suite", arguments={
+                "tests": [
+                    {"name": "Signing in with valid credentials reaches the dashboard",
+                     "why": "nobody can use the product without it",
+                     "steps": [{"edge": valid, "assert": [heading]}]},
+                    {"name": "Datasets opens from the dashboard",
+                     "steps": [{"edge": datasets}]},
+                    {"name": "a checkout the crawler never saw",
+                     "steps": [{"edge": "e99"}]},
+                    {"name": "a chain that does not connect",
+                     "steps": [{"edge": invalid}, {"edge": datasets}]},
+                    {"name": "an effect nobody recorded",
+                     "steps": [{"edge": valid, "assert": [heading, 42]}]},
+                ]}),))
+
+    proposal = propose(world, Writer(), limit=8)
+    names = [s.name for s in proposal.scenarios]
+    ok &= check(
+        "the tests the map backs are built, the others are not",
+        len(proposal.scenarios) == 3 and "a checkout the crawler never saw" not in names
+        and "a chain that does not connect" not in names,
+        f"{names}",
+    )
+    ok &= check(
+        "an unrecorded edge and a broken chain are counted as invented",
+        proposal.invented == 2, f"invented={proposal.invented}",
+    )
+    ok &= check(
+        "an assertion naming no recorded effect is trimmed and counted",
+        proposal.trimmed == 1
+        and proposal.scenarios[2].steps[-1].expect.added == (landing[heading],),
+        f"trimmed={proposal.trimmed}",
+    )
+    first = proposal.scenarios[0]
+    ok &= check(
+        "the model chose which recorded effect proves the step",
+        first.steps[-1].expect.added == (landing[heading],)
+        and len(landing) > 1 and first.why and first.origin == "generator:model",
+        f"added={first.steps[-1].expect.added} of {len(landing)}",
+    )
+    second = proposal.scenarios[1]
+    ok &= check(
+        "a test that starts mid-map is prefixed with the route from the entry",
+        [st.action for st in second.steps]
+        == ["submit[valid]:button:Sign in", "link:Datasets"]
+        and second.steps[0].from_key == login,
+        f"{[st.action for st in second.steps]}",
+    )
+    ok &= check(
+        "with no provider the model writes nothing and says so",
+        propose(world, None).degraded.startswith("no provider"),
+    )
+
+    believed = BehaviorModel(summary="", hypotheses=(
+        Hypothesis(claim="the dashboard leads to datasets", kind="flow", cites=(dash, data)),
+    ))
+    flow = from_flow(world, believed.hypotheses[0])
+    ok &= check(
+        "a believed flow that starts mid-map is prefixed too",
+        flow is not None and [st.action for st in flow.steps]
+        == ["submit[valid]:button:Sign in", "link:Datasets"],
+        f"{flow and [st.action for st in flow.steps]}",
+    )
+
+    alone = plan(world, None, source="behaviour", limit=8, provider=Writer())
+    ok &= check(
+        "the planner puts the model's tests in the plan and counts them",
+        alone.from_model == 2 and alone.invented == 2 and alone.trimmed == 1,
+        f"from_model={alone.from_model} invented={alone.invented} trimmed={alone.trimmed}",
+    )
+    with_model = plan(world, believed, source="behaviour", limit=8, provider=Writer())
+    ok &= check(
+        "a believed flow outranks the model's test that walks the same edges",
+        with_model.from_model == 1 and with_model.from_behaviour == 1
+        and with_model.scenarios[0].origin == "behaviour:flow",
+        f"from_model={with_model.from_model} invented={with_model.invented} "
+        f"trimmed={with_model.trimmed} origins={[s.origin for s in with_model.scenarios]}",
+    )
+    ok &= check(
+        "a duplicate walk is kept once, first writer wins",
+        len({tuple(st.action for st in s.steps) for s in with_model.scenarios})
+        == len(with_model.scenarios),
+    )
+    map_only = plan(world, believed, source="map", limit=8, provider=Writer())
+    ok &= check(
+        "source=map keeps the model out of the plan",
+        map_only.from_model == 0 and all(s.origin == "map" for s in map_only.scenarios),
+        f"{[s.origin for s in map_only.scenarios]}",
+    )
+    no_key = plan(world, None, source="behaviour", limit=8)
+    ok &= check(
+        "no provider: the compile is the whole plan",
+        no_key.from_model == 0 and len(no_key) > 0 and all(s.origin == "map" for s in no_key.scenarios),
     )
     return ok
 

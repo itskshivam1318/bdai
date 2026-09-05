@@ -287,7 +287,10 @@ def _landings(world) -> dict[str, str]:
     return {key: node.url for key, node in world.states.items()}
 
 
-def _compile(world, behaviour, *, limit: int = 8):
+def _compile(
+    world, behaviour, *, limit: int = 8, provider=None, run_id=None, on_event=None,
+    intent=None,
+):
     """This run's plan: believed flows first, then the computed suite.
 
     The console's route to `planner.plan` -- the same one `pipeline.py` takes
@@ -301,7 +304,10 @@ def _compile(world, behaviour, *, limit: int = 8):
     it with a hand-built map and one hypothesis, so the wiring is checkable
     without a browser, a key or a live app.
     """
-    return make_plan(world, behaviour, source=source_from_env(), limit=limit)
+    return make_plan(
+        world, behaviour, source=source_from_env(), limit=limit,
+        provider=provider, run_id=run_id, on_event=on_event, intent=intent,
+    )
 
 
 def _session_context(run: Run, db: Session) -> str | None:
@@ -778,7 +784,11 @@ def _explore(
                     "recorded state(s)",
                     surface="suite",
                 )
-                planned = _compile(result.world, result.behaviour, limit=body.max_scenarios)
+                planned = _compile(
+                    result.world, result.behaviour, limit=body.max_scenarios,
+                    provider=provider, run_id=run_id,
+                    on_event=lambda level, message: emit(level, message, surface="suite"),
+                )
                 plan = planned.scenarios
 
                 # The claims the user typed, matched against tests that already
@@ -866,7 +876,11 @@ def _explore(
                     # the interleave both change, and patching the old plan would
                     # produce a suite the planner would never emit. The colony
                     # ran again, so `result.behaviour` is this wave's model.
-                    planned = _compile(result.world, result.behaviour, limit=body.max_scenarios)
+                    planned = _compile(
+                        result.world, result.behaviour, limit=body.max_scenarios,
+                        provider=provider, run_id=run_id,
+                        on_event=lambda level, message: emit(level, message, surface="suite"),
+                    )
                     plan = planned.scenarios
                     considered = _compile(
                         result.world, result.behaviour, limit=40
@@ -904,15 +918,22 @@ def _explore(
                 # layer having been given its chance and added nothing.
                 emit(
                     "warn" if not plan else "decision",
-                    f"suite: {len(plan)} scenarios compiled from recorded paths "
-                    f"({planned.from_behaviour} from a flow the colony "
-                    "believed in)"
+                    f"suite: {len(plan)} scenarios over recorded paths "
+                    f"({planned.from_model} written by the Generator's model, "
+                    f"{planned.from_behaviour} from a flow the colony believed in, "
+                    f"{planned.from_map} compiled)"
+                    + (
+                        f"; the map refused {planned.invented} step(s) and "
+                        f"{planned.trimmed} assertion(s) the model wrote"
+                        if planned.invented or planned.trimmed
+                        else ""
+                    )
                     + (
                         f"; {planned.uncompilable} believed flow(s) named an "
                         "ordering nobody walked and were not compiled"
                         + "".join(
-                            f"; '{claim}' breaks at [{a[:8]}] -> [{b[:8]}]"
-                            for claim, a, b in planned.unwalked
+                            f"; '{claim[:60]}' -- {why}"
+                            for claim, why in planned.refused
                         )
                         if planned.uncompilable
                         else ""

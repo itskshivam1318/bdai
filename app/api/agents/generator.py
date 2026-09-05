@@ -48,6 +48,7 @@ from urllib.parse import urlparse
 from .explorer.forms import Credentials, fields_of, value_for
 from .explorer.statekey import explain, normalize
 from .explorer.worldmap import Transition, WorldMap, is_flow
+from .llm import Tool
 
 # A normalised node line: `  - heading "Order confirmed"` or `  - alert: text`.
 # Normalisation has already stripped refs, boxes and the trailing colon, so this
@@ -127,7 +128,12 @@ class Scenario:
     steps: tuple[Step, ...]
     # "map" -- a recorded edge `scenarios()` ranked highly enough to compile.
     # "behaviour:<kind>" -- a hypothesis the colony believed and the map backed.
+    # "generator:model" -- the Generator's model wrote it over the map; see
+    # `propose`.
     origin: str = "map"
+    # What breaks for a user if this fails, in the author's words. Empty for a
+    # compiled scenario, whose name already says what it does.
+    why: str = ""
 
     @property
     def terminal(self) -> Step:
@@ -448,6 +454,47 @@ def interleave(groups: dict[str, list], limit: int) -> list:
 
 
 
+def _step(world: WorldMap, cursor: str, edge: str) -> Step | None:
+    """One recorded edge as a step, or None if it was never taken from here."""
+    expect = expectation(world, cursor, edge)
+    if expect is None:
+        return None
+    observation = world.evidence[world.states[cursor].evidence[0]]
+    return Step(
+        intent=intent_of(edge, observation.title, _where(world, expect.to_key)),
+        action=edge,
+        from_key=cursor,
+        fields=_typed(world, cursor, edge),
+        expect=expect,
+    )
+
+
+def route_to(world: WorldMap, target: str) -> list[Step] | None:
+    """The steps from the entry to `target`, or None if nothing recorded gets there.
+
+    Measured 2026-09-05 on a Velogent run: 6 of 7 escalations were believed
+    flows that began on the dashboard, replayed from the login URL, where their
+    first control did not exist -- "no control here plays the recorded part".
+    `from_flow` compiled the cited states and nothing before them. A scenario
+    starts where the browser starts, so anything that begins elsewhere is
+    prefixed with the shortest recorded route, exactly as `scenarios()` does.
+    """
+    route = world.paths().get(target)
+    if route is None:
+        return None
+    steps: list[Step] = []
+    cursor = world.entry_key
+    for edge in route:
+        if not writable(edge):
+            return None
+        step = _step(world, cursor, edge)
+        if step is None:
+            return None
+        steps.append(step)
+        cursor = step.expect.to_key
+    return steps
+
+
 def from_flow(world: WorldMap, hypothesis) -> Scenario | None:
     """Compile a believed flow into a scenario, or None if the map cannot back it.
 
@@ -510,6 +557,9 @@ def from_flow(world: WorldMap, hypothesis) -> Scenario | None:
             )
         )
 
+    prefix = route_to(world, path[0])
+    if prefix is None:
+        return None
     entry = world.states.get(world.entry_key) if world.entry_key else None
     return Scenario(
         # Named for the claim, because that is what a reader needs: a scenario
@@ -518,9 +568,299 @@ def from_flow(world: WorldMap, hypothesis) -> Scenario | None:
         # checking, and only the second can be wrong in an interesting way.
         name=hypothesis.claim,
         target_url=(entry.url if entry else world.states[path[0]].url),
-        steps=tuple(steps),
+        steps=tuple(prefix + steps),
         origin=f"behaviour:{hypothesis.kind}",
     )
+
+
+# --- the model writes the suite ------------------------------------------------
+
+
+SUITE = Tool(
+    name="suite",
+    description=(
+        "Write the test suite. Every step must quote an edge id exactly as "
+        "given; every assertion must quote an effect id from that same edge. "
+        "Consecutive steps must chain: one edge's destination is the next "
+        "edge's source. Anything else is dropped and counted."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "tests": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": (
+                                "what the user accomplishes, in one sentence a "
+                                "tester would recognise"
+                            ),
+                        },
+                        "why": {
+                            "type": "string",
+                            "description": (
+                                "what breaks for a user if this test fails, in "
+                                "one concrete sentence"
+                            ),
+                        },
+                        "steps": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "edge": {
+                                        "type": "string",
+                                        "description": "an edge id, exactly as given, e.g. e12",
+                                    },
+                                    "assert": {
+                                        "type": "array",
+                                        "items": {"type": "integer"},
+                                        "description": (
+                                            "ids of this edge's recorded effects "
+                                            "worth asserting. Omit to assert them all; "
+                                            "pass [] to assert none and judge the step "
+                                            "on whether the app moved"
+                                        ),
+                                    },
+                                },
+                                "required": ["edge"],
+                            },
+                        },
+                    },
+                    "required": ["name", "steps"],
+                },
+            }
+        },
+        "required": ["tests"],
+    },
+)
+
+
+@dataclass(frozen=True)
+class Proposal:
+    """What the model wrote, and what of it the map refused."""
+
+    scenarios: tuple[Scenario, ...]
+    invented: int = 0  # steps naming no recorded edge, or breaking the chain
+    trimmed: int = 0  # assertions naming no recorded effect
+    degraded: str = ""  # why the model contributed nothing, if it did not
+
+
+def edges(world: WorldMap) -> tuple[tuple[str, str], ...]:
+    """The edges a model may cite, in a fixed order. `e{i}` names `edges[i]`.
+
+    Only edges that could become a step: recorded at least once, with a
+    control that can be written down. The order is the map's insertion order,
+    so an id is stable for the life of one map.
+    """
+    return tuple(
+        (from_key, action)
+        for (from_key, action), taken in world.transitions.items()
+        if taken and writable(action)
+    )
+
+
+def brief_for_suite(world: WorldMap, limit: int, intent: str | None = None) -> str:
+    """The map as the model sees it. Edge and effect ids are the only handles."""
+    lines = [
+        "The application, as explored:",
+        "",
+        world.summary(),
+        "",
+        "States, by page:",
+        "",
+    ]
+    by_page: dict[str, list[str]] = {}
+    for key, node in world.states.items():
+        by_page.setdefault(page_of(world, key), []).append(key)
+    for page, keys in by_page.items():
+        lines.append(f"  {page}")
+        for key in keys:
+            node = world.states[key]
+            mark = "  (entry)" if key == world.entry_key else ""
+            lines.append(f"    [{key[:8]}] {node.title}{mark}")
+    lines += ["", "Recorded edges. `e<n>` is the edge; `e<n>.<m>` is one of its effects:", ""]
+    for index, (from_key, action) in enumerate(edges(world)):
+        expect = expectation(world, from_key, action)
+        if expect is None:
+            continue
+        where = page_of(world, expect.to_key)
+        verb = "moved to" if expect.moved else "stayed on"
+        fired = ", sent a non-GET request" if expect.mutating else ""
+        lines.append(
+            f"  [e{index}] from [{from_key[:8]}] {page_of(world, from_key)} -- "
+            f"{action} -> {verb} [{expect.to_key[:8]}] {where}{fired}"
+        )
+        if not expect.added:
+            lines.append("        (no recorded effect; the step is judged on whether the app moved)")
+        for effect_index, line in enumerate(expect.added):
+            lines.append(f"        e{index}.{effect_index}  {line.strip()}")
+    lines += [
+        "",
+        f"Write at most {limit} tests. Prefer chains of consecutive edges over "
+        "single clicks, and spread them across the pages above.",
+    ]
+    if intent:
+        lines += ["", f"The person who started this run asked for: {intent}"]
+    return "\n".join(lines)
+
+
+_EDGE_ID = re.compile(r"^e(\d+)$")
+
+
+def propose(
+    world: WorldMap,
+    provider,
+    limit: int = 8,
+    *,
+    intent: str | None = None,
+    instructions: str | None = None,
+    on_event=None,
+    run_id: int | None = None,
+) -> Proposal:
+    """Ask the model to write the suite over the map, and keep what the map backs.
+
+    Decided 2026-09-05 (decisions.md): the Generator is a model call. The model
+    chooses which recorded paths become tests, chains them, names them, says
+    what each protects, and picks which recorded effects prove each step. The
+    map keeps deciding what exists: a step is a recorded edge or it is dropped,
+    an assertion is a recorded effect or it is dropped, and a scenario that
+    does not start at the entry is prefixed with the recorded route there. So
+    every pass condition a test carries is still something the app was
+    observed to do, which is what lets `runner.py` tell a broken locator from
+    a defect when it fails.
+
+    With no provider this returns an empty proposal and says so; `scenarios()`
+    is the deterministic floor every no-key run stands on.
+    """
+    def emit(level: str, message: str) -> None:
+        if on_event:
+            on_event(level, message)
+
+    if provider is None:
+        return Proposal((), degraded="no provider; the suite is the deterministic compile")
+    citable = edges(world)
+    if not citable or world.entry_key is None:
+        return Proposal((), degraded="nothing recorded to write a test over")
+
+    from .ant import instructions as load_instructions
+    from .llm import Exchange, Transcript
+    from .tracing import save_transcript
+
+    system = instructions or load_instructions("generator")
+    transcript = Transcript(prompt=brief_for_suite(world, limit, intent))
+    try:
+        turn = provider.turn(system, transcript, [SUITE])
+    except Exception as exc:
+        emit(
+            "warn",
+            f"generator model did not answer ({type(exc).__name__}: {exc}); "
+            "the suite is the deterministic compile",
+        )
+        return Proposal((), degraded=f"model failed: {type(exc).__name__}")
+
+    transcript.exchanges.append(
+        Exchange(text=turn.text, calls=turn.calls, opaque=turn.opaque)
+    )
+    try:
+        save_transcript(transcript, run_id=run_id, role="generator", system=system)
+    except Exception:
+        # Losing the write-up must never lose the suite. Same rule as the critic.
+        pass
+
+    call = next((c for c in turn.calls if c.name == "suite"), None)
+    if call is None:
+        emit("warn", "generator model wrote no suite; the suite is the deterministic compile")
+        return Proposal((), degraded="the model called no tool")
+
+    entry_url = world.states[world.entry_key].url
+    built: list[Scenario] = []
+    invented = trimmed = 0
+    for test in call.arguments.get("tests", []) or []:
+        if not isinstance(test, dict):
+            invented += 1
+            continue
+        steps: list[Step] = []
+        cursor: str | None = None
+        sound = True
+        for raw in test.get("steps", []) or []:
+            match = _EDGE_ID.match(str((raw or {}).get("edge", "")).strip())
+            index = int(match.group(1)) if match else -1
+            if not 0 <= index < len(citable):
+                invented += 1
+                sound = False
+                break
+            from_key, action = citable[index]
+            if cursor is not None and from_key != cursor:
+                # The chain broke: this edge does not leave where the last one
+                # landed. A detour would test something the model did not ask for.
+                invented += 1
+                sound = False
+                break
+            step = _step(world, from_key, action)
+            if step is None:
+                invented += 1
+                sound = False
+                break
+            chosen = raw.get("assert")
+            if isinstance(chosen, list):
+                keep = []
+                for effect in chosen:
+                    if isinstance(effect, int) and 0 <= effect < len(step.expect.added):
+                        keep.append(step.expect.added[effect])
+                    else:
+                        trimmed += 1
+                step = Step(
+                    intent=step.intent,
+                    action=step.action,
+                    from_key=step.from_key,
+                    fields=step.fields,
+                    expect=Expectation(
+                        moved=step.expect.moved,
+                        mutating=step.expect.mutating,
+                        added=tuple(dict.fromkeys(keep)),
+                        removed=step.expect.removed,
+                        to_key=step.expect.to_key,
+                    ),
+                )
+            steps.append(step)
+            cursor = step.expect.to_key
+        if not sound or not steps:
+            if not steps and sound:
+                invented += 1
+            continue
+        prefix = route_to(world, steps[0].from_key)
+        if prefix is None:
+            invented += 1
+            continue
+        name = " ".join(str(test.get("name", "")).split()) or steps[-1].intent
+        built.append(
+            Scenario(
+                name=name[:200],
+                target_url=entry_url,
+                steps=tuple(prefix + steps),
+                origin="generator:model",
+                why=" ".join(str(test.get("why", "")).split())[:300],
+            )
+        )
+        if len(built) >= limit:
+            break
+
+    if invented or trimmed:
+        emit(
+            "warn",
+            f"generator model cited {invented} step(s) the map never recorded and "
+            f"{trimmed} effect(s) no edge produced; dropped",
+        )
+    if not built:
+        return Proposal(
+            (), invented, trimmed,
+            degraded="every test the model wrote named something the map never recorded",
+        )
+    return Proposal(tuple(built), invented, trimmed)
 
 
 def unwalked(world: WorldMap, hypothesis) -> tuple[str, str] | None:
@@ -551,6 +891,46 @@ def unwalked(world: WorldMap, hypothesis) -> tuple[str, str] | None:
         if not walked:
             return (from_key, to_key)
     return None
+
+
+def refusal(world: WorldMap, hypothesis) -> str:
+    """Why `from_flow` would return None for this hypothesis, or "" if it would not.
+
+    `from_flow` refuses for four different reasons and returns the same None
+    for each, which was enough while the count was the only consumer. It is
+    not enough once the count is a number in a report: two pipeline runs on
+    2026-09-05 each recorded one uncompilable flow on a chain the crawler had
+    walked end to end, and nothing could say whether the model had cited one
+    state, cited them out of order, or named an edge nobody could type.
+
+    Kept as a second function rather than a reason on `from_flow` so the
+    compiler's contract -- a Scenario or None -- stays what every caller reads.
+    """
+    if getattr(hypothesis, "kind", "") != "flow":
+        return f"not a flow ({getattr(hypothesis, 'kind', '')!r})"
+    path = hypothesis.states
+    if len(path) < 2:
+        return (
+            f"cites {len(path)} state(s); a flow needs at least two in order"
+            + (f" ({len(hypothesis.actions)} action(s) cited instead)"
+               if getattr(hypothesis, "actions", ()) else "")
+        )
+    for from_key, to_key in zip(path, path[1:]):
+        edge = next(
+            (
+                action
+                for (key, action), taken in world.transitions.items()
+                if key == from_key and any(t.to_key == to_key for t in taken)
+            ),
+            None,
+        )
+        if edge is None:
+            return f"no recorded edge [{from_key[:8]}] -> [{to_key[:8]}]"
+        if not writable(edge):
+            return f"edge {edge!r} at [{from_key[:8]}] cannot be typed"
+        if expectation(world, from_key, edge) is None:
+            return f"no expectation recorded for {edge!r} at [{from_key[:8]}]"
+    return ""
 
 
 def scenarios(
@@ -715,6 +1095,7 @@ def from_json(text: str) -> Scenario:
         # "map" rather than "" keeps an old suite comparable instead of putting
         # it in a third category no consumer knows how to count.
         origin=raw.get("origin", "map"),
+        why=raw.get("why", ""),
         steps=tuple(
             Step(
                 intent=step["intent"],

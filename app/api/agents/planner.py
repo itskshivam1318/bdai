@@ -42,7 +42,9 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-from .generator import Scenario, from_flow, scenarios, page_of, unwalked
+from .generator import (
+    Scenario, from_flow, page_of, propose, refusal, scenarios, unwalked,
+)
 
 # The two world models a plan can be built from. `behaviour` is a superset:
 # it starts with the believed flows and then fills from the map.
@@ -72,6 +74,9 @@ class Plan:
     # to_key). Where the colony should send an ant next -- `tools.brief` offers
     # the same pairs to the orchestrator.
     unwalked: tuple[tuple[str, str, str], ...] = ()
+    # Every uncompilable flow with the reason `from_flow` refused it:
+    # (claim, reason). A superset of `unwalked`, in prose.
+    refused: tuple[tuple[str, str], ...] = ()
     # Set when the plan was narrowed to one state key.
     node: str = ""
     # Why the requested source was not the source used, if it was not.
@@ -80,6 +85,12 @@ class Plan:
     # slots reserved for each before any page took more. See `share`.
     pages: int = 0
     per_page: int = 0
+    # Scenarios the Generator's model wrote over the map (`generator.propose`),
+    # and what of its writing the map refused: steps naming no recorded edge,
+    # assertions naming no recorded effect.
+    from_model: int = 0
+    invented: int = 0
+    trimmed: int = 0
 
     def __len__(self) -> int:
         return len(self.scenarios)
@@ -133,6 +144,8 @@ class Plan:
             lines.append(
                 f"            unwalked: [{from_key[:8]}] -> [{to_key[:8]}]  {claim}"
             )
+        for claim, why in self.refused:
+            lines.append(f"            refused: {why}  ({claim[:60]})")
         for scenario in self.scenarios:
             lines.append(
                 f"  [{scenario.node[:8]}] {scenario.name}  ({scenario.origin})"
@@ -181,6 +194,10 @@ def plan(
     node: str = "",
     only: set[tuple[str, str]] | None = None,
     per_page: int | None = None,
+    provider=None,
+    run_id: int | None = None,
+    on_event=None,
+    intent: str | None = None,
 ) -> Plan:
     """What to test, best first, capped at `limit`.
 
@@ -189,6 +206,13 @@ def plan(
     coverage of a region answerable. The filter runs before the cap, so asking
     for a node does not return the whole map's best eight and then discard
     seven of them.
+
+    `provider` is the Generator's model (decided 2026-09-05, see
+    `generator.propose`). With one, and `source="behaviour"`, the model writes
+    scenarios over the map and they rank ahead of the compiled ones; the
+    compile still fills what the model left, and is the whole plan when there
+    is no provider or the model's writing named nothing the map recorded.
+    `source="map"` keeps the model out of the plan entirely -- the A/B knob.
 
     `only` narrows it to scenarios whose *terminal* edge is one of a given set
     of `(from_key, action)` pairs -- what incremental generation needs, so a
@@ -202,27 +226,13 @@ def plan(
     believed: list[Scenario] = []
     uncompilable = 0
     missing: list[tuple[str, str, str]] = []
+    refused: list[tuple[str, str]] = []
     degraded = ""
 
+    written: list[Scenario] = []
+    invented = trimmed = 0
     if source == "behaviour":
         hypotheses = tuple(behaviour.of_kind("flow")) if behaviour else ()
-        if not hypotheses:
-            # No provider, or a model that named no flow. The map alone is
-            # still a plan, and saying which happened is the difference
-            # between a smaller suite and a broken one.
-            #
-            # The source is *demoted to what actually happened*, not left at
-            # what was asked for. A version stamped `behaviour` with no
-            # hypothesis in it would sit in the comparison as though the
-            # semantic layer had been given its chance and added nothing, which
-            # is the one wrong answer the A/B can produce.
-            degraded = (
-                "asked for behaviour; no behavioural model, so the plan is the "
-                "deterministic map alone"
-                if behaviour is None or not getattr(behaviour, "hypotheses", ())
-                else "asked for behaviour; the model named no flow to compile"
-            )
-            source = "map"
         for hypothesis in hypotheses:
             scenario = from_flow(world, hypothesis)
             if scenario is None:
@@ -230,8 +240,43 @@ def plan(
                 pair = unwalked(world, hypothesis)
                 if pair is not None:
                     missing.append((hypothesis.claim, *pair))
+                refused.append((hypothesis.claim, refusal(world, hypothesis)))
                 continue
             believed.append(scenario)
+
+        # The Generator's model (decided 2026-09-05, `generator.propose`). It
+        # writes over the map whether or not the colony believed anything, so
+        # it is asked before the source is judged.
+        proposal = propose(
+            world, provider, limit, intent=intent, on_event=on_event, run_id=run_id
+        )
+        written = list(proposal.scenarios)
+        invented, trimmed = proposal.invented, proposal.trimmed
+
+        if not believed and not written:
+            # Nothing model-derived reached the plan. The map alone is still a
+            # plan, and saying which happened is the difference between a
+            # smaller suite and a broken one.
+            #
+            # The source is *demoted to what actually happened*, not left at
+            # what was asked for. A version stamped `behaviour` with nothing
+            # model-derived in it would sit in the comparison as though the
+            # semantic layer had been given its chance and added nothing, which
+            # is the one wrong answer the A/B can produce.
+            reasons = []
+            if behaviour is None or not getattr(behaviour, "hypotheses", ()):
+                reasons.append("no behavioural model")
+            elif not hypotheses:
+                reasons.append("the colony named no flow to compile")
+            else:
+                reasons.append("no believed flow was one the map could back")
+            if proposal.degraded:
+                reasons.append(proposal.degraded)
+            degraded = (
+                "asked for behaviour; " + "; ".join(reasons)
+                + "; the plan is the deterministic map alone"
+            )
+            source = "map"
 
     pages, owed = share(world, limit)
     if per_page is None:
@@ -240,13 +285,18 @@ def plan(
         scenarios(world, limit=max(limit, 8), only=only, per_page=per_page)
     )
 
-    # Deduplicated on the action sequence, not the name: a believed flow and a
-    # computed scenario can walk the same edges under different names, and
-    # running both would double-count the coverage they prove.
-    seen = {tuple(step.action for step in s.steps) for s in believed}
-    ordered = believed + [
-        s for s in computed if tuple(step.action for step in s.steps) not in seen
-    ]
+    # Deduplicated on the action sequence, not the name: a believed flow, a
+    # model-written scenario and a computed one can walk the same edges under
+    # different names, and running two would double-count the coverage they
+    # prove. First writer keeps it: believed, then the model, then the compile.
+    ordered: list[Scenario] = []
+    seen: set[tuple[str, ...]] = set()
+    for scenario in believed + written + computed:
+        walk = tuple(step.action for step in scenario.steps)
+        if walk in seen:
+            continue
+        seen.add(walk)
+        ordered.append(scenario)
 
     if only is not None:
         # `scenarios()` already honoured this for the computed half; the
@@ -268,9 +318,13 @@ def plan(
         scenarios=chosen,
         source=source,
         from_behaviour=sum(1 for s in chosen if s.origin.startswith("behaviour")),
-        from_map=sum(1 for s in chosen if not s.origin.startswith("behaviour")),
+        from_map=sum(1 for s in chosen if s.origin == "map"),
+        from_model=sum(1 for s in chosen if s.origin == "generator:model"),
+        invented=invented,
+        trimmed=trimmed,
         uncompilable=uncompilable,
         unwalked=tuple(missing),
+        refused=tuple(refused),
         node=node,
         degraded=degraded,
         pages=pages,

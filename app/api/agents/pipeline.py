@@ -581,6 +581,8 @@ def run(
         pipe.behaviour,
         source=plan_source or source_from_env(),
         limit=budget.max_scenarios,
+        provider=provider,
+        on_event=lambda level, message: emit(level, message, "suite"),
     )
     pipe.plan = planned.scenarios
     pipe.plan_source = planned.source
@@ -590,14 +592,21 @@ def run(
             "generate", f"compiled {len(pipe.plan)} scenarios",
             "each is a path the crawler actually walked, and each assertion is "
             "an effect the application actually produced when it walked it. "
-            f"{planned.from_behaviour} came from a flow the colony believed in "
-            "and the rest from ranking the recorded edges"
+            f"{planned.from_behaviour} came from a flow the colony believed in, "
+            f"{planned.from_model} were written by the Generator's model over the "
+            "map, and the rest from ranking the recorded edges"
+            + (
+                f"; the map refused {planned.invented} step(s) and "
+                f"{planned.trimmed} assertion(s) the model wrote"
+                if planned.invented or planned.trimmed
+                else ""
+            )
             + (
                 f"; {planned.uncompilable} believed flow(s) named an ordering "
                 "nobody walked and were not compiled"
                 + "".join(
-                    f"; '{claim}' breaks at [{a[:8]}] -> [{b[:8]}]"
-                    for claim, a, b in planned.unwalked
+                    f"; '{claim[:60]}' -- {why}"
+                    for claim, why in planned.refused
                 )
                 if planned.uncompilable
                 else ""
@@ -608,6 +617,9 @@ def run(
             source=planned.source,
             scenarios=len(pipe.plan),
             from_behaviour=planned.from_behaviour,
+            from_model=planned.from_model,
+            invented=planned.invented,
+            trimmed=planned.trimmed,
             uncompilable=planned.uncompilable,
             pages=planned.pages,
             per_page=planned.per_page,

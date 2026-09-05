@@ -9,6 +9,8 @@ the console cannot render without: `GET /api/runs/{id}/map`.
 
 from __future__ import annotations
 
+import re
+
 import json
 import pathlib
 import sys
@@ -720,7 +722,10 @@ def _console_plans_from_behaviour() -> bool:
     )
     ok &= check(
         "and every compile of the executed plan honours it",
-        source.count("_compile(result.world, result.behaviour, limit=body.max_scenarios)") == 2,
+        len(re.findall(
+            r"_compile\(\s*result\.world,\s*result\.behaviour,\s*limit=body\.max_scenarios",
+            source,
+        )) == 2,
         "a call site still compiles with the planner's default",
     )
 

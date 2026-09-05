@@ -65,19 +65,18 @@ export const AGENTS: Agent[] = [
   {
     key: "generator",
     title: "Generator",
-    what: "compiles recorded paths into runnable Playwright tests",
-    // `claims` is the only model call in this stage -- it decides whether the
-    // suite already answers the sentence the tester typed. Listed ahead of the
-    // writer: `claims.attribute` makes that call and does not yet record it,
-    // which is why the Generator's evidence today is its record and not a
-    // conversation. See the note in api/agents/claims.py.
-    roles: ["claims"],
+    what: "writes the suite over the map: a model picks the paths, names the tests and chooses the effects that prove them",
+    // `generator` is the model that writes the suite (generator.propose);
+    // `claims` decides whether the suite already answers the sentence the
+    // tester typed. See the note in api/agents/claims.py for why the second
+    // does not yet record its call.
+    roles: ["generator", "claims"],
     surfaces: ["suite"],
     deterministic:
-      "No model writes a test here. generator.scenarios compiles a path the " +
-      "crawl actually walked, so every step is something the app was observed " +
-      "to do — which is why a generated test cannot assert a screen that was " +
-      "never seen.",
+      "The map decides what exists. Every step the model writes must be an " +
+      "edge the crawl recorded and every assertion an effect the app produced " +
+      "when it was recorded; anything else is dropped and counted. With no key " +
+      "generator.scenarios compiles the same paths without a model.",
   },
   {
     key: "healer",
