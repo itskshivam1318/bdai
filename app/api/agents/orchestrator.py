@@ -263,7 +263,29 @@ def run(
         if time.monotonic() > deadline or ants_left <= 0:
             break
 
-        turn = provider.turn(system, transcript, tools.ORCHESTRATOR_TOOLS)
+        try:
+            turn = provider.turn(system, transcript, tools.ORCHESTRATOR_TOOLS)
+        except Exception as exc:
+            # The same argument the dead-ant handler below makes, one level up
+            # and previously unmade. A provider failure here -- a 402, a
+            # transient 503 -- propagated out of `run` and took the whole
+            # exploration with it: the map, the wave that had already reported,
+            # the autosave, the summary. Measured 2026-09-05: a seeded run lost
+            # a 24-state crawl and a completed first wave to a credits error on
+            # the wave-3 call, and the process exited with a traceback rather
+            # than with the map it was holding.
+            #
+            # Breaking out rather than retrying, because the two failures worth
+            # surviving are opposite: a rate limit wants a wait this loop
+            # cannot afford, and an exhausted balance never recovers. Both are
+            # better answered by ending the run with what it has.
+            emit("error", f"orchestrator call failed: {type(exc).__name__}: {exc}")
+            result.stopped = "error"
+            result.gaps = result.gaps + (
+                f"The colony stopped early: the model call failed ({exc}). "
+                "The map below is what had been walked when it did.",
+            )
+            break
 
         if turn.done:
             emit("warn", "orchestrator said nothing actionable; stopping")
@@ -448,9 +470,11 @@ def run(
     except Exception:
         pass
 
-    if not result.summary:
+    if not result.summary and result.stopped != "error":
         # Ran out of budget before the orchestrator chose to finish. Say so
-        # rather than presenting a partial map as a complete account.
+        # rather than presenting a partial map as a complete account. An error
+        # is excluded: it is also a run with no summary, and relabelling it
+        # "budget" would hide the reason it has none.
         result.stopped = "budget"
         result.gaps = result.gaps + (
             "Exploration was cut off by the budget before the orchestrator "
