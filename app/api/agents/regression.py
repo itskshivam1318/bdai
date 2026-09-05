@@ -261,6 +261,56 @@ def current(directory: str | Path) -> Version | None:
     return known[-1] if known else None
 
 
+#: The verdicts a scenario may carry and still become a baseline.
+#:
+#: `healed` is here and it is the only debatable entry. It means the locator
+#: resolved on a lower rung than `exact` -- the control was renamed -- and then
+#: the application did precisely what it was recorded doing. The behaviour under
+#: test is intact, so the scenario is sound once the healed locator is written
+#: in as the recorded one, which is what `baseline` does. Refusing it would
+#: discard a working test because its button changed name between the crawl and
+#: the replay minutes later, which is the ordinary case on a live app.
+KEEPABLE = (runner.PASSED, runner.HEALED)
+
+
+@dataclass(frozen=True)
+class Baseline:
+    """The scenarios that may be recorded, and the ones this run refused."""
+
+    scenarios: tuple[Scenario, ...]
+    outcomes: tuple[str, ...]
+    #: (name, verdict) for each scenario kept out. Reported, never silent.
+    refused: tuple[tuple[str, str], ...] = ()
+
+
+def baseline(
+    plan: tuple[Scenario, ...], results: tuple[runner.Result, ...]
+) -> Baseline:
+    """Which of this run's scenarios may become the recorded baseline. Pure."""
+    kept: list[Scenario] = []
+    outcomes: list[str] = []
+    refused: list[tuple[str, str]] = []
+
+    for scenario, result in zip(plan, results):
+        if result.verdict not in KEEPABLE:
+            refused.append((scenario.name, result.verdict))
+            continue
+        recorded, _ = repaired(scenario, result)
+        kept.append(recorded)
+        outcomes.append(result.verdict)
+
+    # `zip` already stops at the shorter of the two, so an unexecuted scenario
+    # is out of the suite either way. What it is not, without this, is
+    # *reported* -- and a baseline that is quietly two tests shorter than the
+    # plan the report printed is the failure this whole gate is about.
+    for scenario in plan[len(results):]:
+        refused.append((scenario.name, "not run"))
+
+    return Baseline(
+        scenarios=tuple(kept), outcomes=tuple(outcomes), refused=tuple(refused)
+    )
+
+
 def emit(
     scenarios_: tuple[Scenario, ...],
     directory: str | Path,
@@ -937,7 +987,7 @@ def keep(
     plan: tuple[Scenario, ...],
     *,
     target_url: str,
-    outcomes: tuple[str, ...] = (),
+    results: tuple[runner.Result, ...] = (),
     credentials: Credentials | None = None,
     because: str = "",
     source: str = "",
@@ -971,14 +1021,33 @@ def keep(
             on_event(level, message)
 
     if existing is None:
-        if not plan:
-            say("warn", "no suite kept: this run compiled no scenarios")
+        # The gate. A baseline is the thing every later run is measured
+        # against, so what may go into it is decided here and refusals are
+        # spoken aloud -- see `baseline`.
+        chosen = baseline(tuple(plan), tuple(results))
+        if chosen.refused:
+            say(
+                "warn",
+                f"{len(chosen.refused)} scenario(s) not recorded: "
+                + ", ".join(f"{name} ({verdict})" for name, verdict in chosen.refused)
+                + " -- a suite recorded already failing has nothing to regress from",
+            )
+        if not chosen.scenarios:
+            say(
+                "warn",
+                "no suite kept: "
+                + (
+                    "every scenario this run compiled was refused"
+                    if chosen.refused
+                    else "this run compiled no scenarios"
+                ),
+            )
             return Kept(directory=directory, version=None)
         counts: dict[str, int] = {}
-        for verdict in outcomes:
+        for verdict in chosen.outcomes:
             counts[verdict] = counts.get(verdict, 0) + 1
         version = emit(
-            tuple(plan),
+            chosen.scenarios,
             directory,
             because=because or f"recorded from the {source or 'map'} world model",
             credentials=credentials,
@@ -986,14 +1055,20 @@ def keep(
             mark=fingerprint(page, target_url),
             source=source,
             verdicts=counts,
-            outcomes=outcomes,
+            outcomes=chosen.outcomes,
         )
         if export_too:
             export(version)
         say(
             "decision",
             f"kept {version.label}: {len(version.scenarios)} scenario(s) written "
-            f"to disk as the baseline the next run is measured against",
+            f"to disk as the baseline the next run is measured against"
+            + (
+                f", {len(chosen.refused)} refused"
+                if chosen.refused
+                else ""
+            )
+            ,
         )
         return Kept(directory=directory, version=version, recorded=True)
 

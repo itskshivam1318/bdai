@@ -663,14 +663,41 @@ def _keep(pipe: Pipeline, page, credentials, announce, emit, suite_root=None, pr
     if existing is None:
         if not pipe.plan:
             return
-        # The verdicts from the baseline pass, aligned by position. Nothing is
-        # re-run: these scenarios were executed minutes ago against this URL.
-        outcomes = tuple(r.verdict for r in pipe.results[: len(pipe.plan)])
+        # The gate, and it is the same one `regression.keep` applies for the
+        # console -- shared as a function rather than as a convention, because
+        # two entry points that disagree about what a baseline is produce two
+        # different suites from one run and no way to tell which is the claim.
+        #
+        # The verdicts come from the baseline pass, aligned by position.
+        # Nothing is re-run: these scenarios were executed minutes ago against
+        # this URL.
+        chosen = regression.baseline(
+            pipe.plan, tuple(pipe.results[: len(pipe.plan)])
+        )
+        if chosen.refused:
+            announce(
+                pipe.decide(
+                    "suite",
+                    f"{len(chosen.refused)} scenario(s) refused from the baseline",
+                    "a suite recorded already failing has nothing to regress "
+                    "from -- these were run, classified, and left out rather "
+                    "than saved with the verdict written beside them: "
+                    + ", ".join(
+                        f"{name} ({verdict})" for name, verdict in chosen.refused
+                    ),
+                    refused=len(chosen.refused),
+                    kept=len(chosen.scenarios),
+                ),
+                surface="suite",
+            )
+        if not chosen.scenarios:
+            pipe.stopped = "nothing worth keeping"
+            return
         counts: dict[str, int] = {}
-        for verdict in outcomes:
+        for verdict in chosen.outcomes:
             counts[verdict] = counts.get(verdict, 0) + 1
         pipe.version = regression.emit(
-            pipe.plan,
+            chosen.scenarios,
             directory,
             because=f"recorded from the {pipe.plan_source} world model",
             credentials=credentials,
@@ -678,7 +705,7 @@ def _keep(pipe: Pipeline, page, credentials, announce, emit, suite_root=None, pr
             mark=regression.fingerprint(page, pipe.target_url),
             source=pipe.plan_source,
             verdicts=counts,
-            outcomes=outcomes,
+            outcomes=chosen.outcomes,
         )
         regression.export(pipe.version)
         announce(

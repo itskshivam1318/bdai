@@ -40,6 +40,7 @@ from agents.context import Context, credentials_for, parse as parse_context
 from agents.claims import attribute, claimed_by, gaps_for, steer, with_claimed
 from agents.generator import scenarios
 from agents.llm import load
+from agents.planner import Plan, plan as make_plan, source_from_env
 from agents.shots import shooter
 from agents.tracing import start as start_tracing
 from ..byok import Choice, byok
@@ -592,7 +593,8 @@ def _explore(
                 )
 
                 # --- suite -------------------------------------------
-                plan = scenarios(result.world)
+                planned = compose_plan(result.world, result.behaviour)
+                plan = planned.scenarios
 
                 # The claims the user typed, matched against tests that already
                 # exist -- never against tests a model wrote for them. See
@@ -665,7 +667,8 @@ def _explore(
                     # Re-compiled, not amended: the map grew, so the ranking and
                     # the interleave both change, and patching the old plan would
                     # produce a suite `generator.scenarios` would never emit.
-                    plan = scenarios(result.world)
+                    planned = compose_plan(result.world, result.behaviour)
+                    plan = planned.scenarios
                     considered = scenarios(result.world, limit=40)
                     matched = attribute(
                         context.claims,
@@ -695,9 +698,25 @@ def _explore(
                     )
                 emit(
                     "warn" if not plan else "decision",
-                    f"suite: {len(plan)} scenarios compiled from recorded paths",
+                    f"suite: {len(plan)} scenarios compiled from recorded paths"
+                    f" -- {planned.from_behaviour} from a flow the colony believed"
+                    f", {planned.from_map} from ranking the recorded edges",
                     surface="suite",
                 )
+                # A believed flow the map could not back compiles to nothing.
+                # Silent, that reads identically to a model that named no flow
+                # at all -- and the two say opposite things about the semantic
+                # layer, so the count is reported rather than inferred.
+                if planned.uncompilable:
+                    emit(
+                        "warn",
+                        f"{planned.uncompilable} believed flow(s) named an "
+                        "ordering nobody walked and were not compiled",
+                        surface="suite",
+                    )
+                if planned.degraded:
+                    emit("warn", f"planner degraded: {planned.degraded}",
+                         surface="suite")
 
                 # --- run and heal ------------------------------------
                 for index, scenario in enumerate(plan, start=1):
@@ -761,9 +780,9 @@ def _explore(
                         page,
                         tuple(plan),
                         target_url=target_url,
-                        outcomes=tuple(r.verdict for r in results[: len(plan)]),
+                        results=tuple(results[: len(plan)]),
                         credentials=credentials,
-                        source="map",
+                        source=planned.source,
                         # So a control the ladder cannot resolve is looked for
                         # by ants at the region that lost it, rather than only
                         # by a breadth-first crawl of the same screen.
@@ -953,6 +972,25 @@ def _explore(
             run.finished_at = datetime.now(timezone.utc)
             db.add(run)
             db.commit()
+
+
+def compose_plan(world, behaviour=None, *, limit: int = 8) -> Plan:
+    """The scenarios this run will test, from the Planner rather than the ranker.
+
+    This used to be `scenarios(world)` inline, and the cost was invisible: the
+    console computed a behavioural model, printed every believed claim to the
+    timeline, and then compiled its suite from the raw edge ranking -- which
+    can rank single edges and structurally cannot express a sequence. So "log
+    in, add an item, check it survived" could be believed, displayed, and never
+    tested, and the kept version recorded `source="map"` from a literal instead
+    of from whatever actually planned it.
+
+    A thin function on purpose. What it buys is a seam the probe can hold: the
+    console's planning is now the same call the CLI makes, and a check can
+    prove a believed flow survives into the console's suite without standing up
+    a whole run.
+    """
+    return make_plan(world, behaviour, source=source_from_env(), limit=limit)
 
 
 @router.post("/{run_id}/explore", status_code=202)
