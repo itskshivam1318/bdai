@@ -256,6 +256,21 @@ its exchange, so the critic's one ranking — the call that decides the order of
 the final report — left nothing behind but a count. Adding a role here is two
 lines; skipping it is invisible.
 
+**A role names the agent, not the module.** `rescue.look` runs the same colony
+code as the Planner, so its wave used to file under `orchestrator` and `ant` —
+and in `adhoc/`, because no `run_id` reached it. The Healer's one model-backed
+step, the call that decides what replaced a control the ladder cannot find, was
+therefore the single stage of the pipeline whose reasoning the console could not
+show. `orchestrator.run(filed_as=...)` and `ant.explore(role=...)` exist for
+that: a rescue files as `healer`, under the run. `web/lib/agents.ts` is the
+other half — the table that says which roles and which `Event.surface` values
+belong to which of the brief's agents, and what an agent that never calls a
+model leaves behind instead.
+
+`claims.attribute` is the one model call still writing nothing. It decides
+whether the suite already covers the sentence the tester typed, and a claim
+reported "uncovered" is currently unarguable.
+
 ### The map is persisted, and it is watchable
 
 `agents/explorer/store.py` is the only place the explorer meets the database —
@@ -456,7 +471,11 @@ agent builds on sand:
   it only creates tables it cannot find — and a column may go on that list only
   if an existing row is *correct* without it (nullable, or defaulted). Anything
   needing a value computed from the old row is a real migration, and that is
-  `make reset`. `db.adopt_orphan_chat()` is the companion: it gives messages
+  `make reset`. `db._backfill_session_uids` runs straight after and is the
+  narrowest widening of that rule: a null `TestSession.uid` *is* correct and
+  nothing crashes on it, but `directory_for` then falls back to the shared
+  per-target suite, which is the bug the column exists to fix. A fresh random
+  value is not computed from the old row, so it stays a backfill. `db.adopt_orphan_chat()` is the companion: it gives messages
   written before `ChatThread` existed a thread to belong to.
   `db.init_db()` imports `app.models` for a load-bearing reason — `create_all`
   only builds what has registered itself on the metadata, so without that import
@@ -627,6 +646,24 @@ too, and the reason it had to is worth keeping: **a console run compiled its
 scenarios, replayed them, showed six verdicts and then threw the tests away**.
 There was nothing to download and nothing to fail next week, which makes "a URL
 in, a meaningful test suite out" a claim about a process rather than an artifact.
+
+**In the console the suite belongs to a session; on the CLI it belongs to the
+target.** `regression.directory_for(url, session_uid=...)` is the difference, and
+it exists because "is there a suite for this target yet" is the right question
+at a command line and the wrong one in a console two people can point at the
+same staging URL. Keyed on the target alone, a *new* session opened on the
+previous one's tests: `keep` found a suite, replayed instead of recording, and
+the panel filled with scenarios that session never compiled -- reported as
+exactly that. Within one session nothing changed, and that is the point: run
+twice and the second run still replays the first, heals it and emits v002.
+`app/probe.py`'s SESSIONS section fails without the scope.
+
+It is keyed on `TestSession.uid` and not on `id`, because `id` is a row number:
+it is 1 on a fresh database and 1 again after `make reset` — which does not
+clear `artifacts/`. A suite directory named `-s1` is therefore handed to
+whichever session is first in the *next* database, which is the same bug one
+level down. `uid` is twelve hex characters issued once, and
+`db._backfill_session_uids` gives one to every session that predates it.
 
 The console serves the files at `GET /api/runs/{id}/suite` (every spec's source
 inline), `/suite/download` (a zip with the `.spec.ts`, a `playwright.config.ts`

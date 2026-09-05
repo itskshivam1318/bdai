@@ -277,6 +277,14 @@ def run(
     def announce(decision: Decision, surface: str | None = None) -> None:
         emit("decision", f"{decision.choice} -- {decision.because}", surface)
 
+    # The map this target had *before* this run, captured now because `crawl`
+    # autosaves on the way out -- ask afterwards and the newest file for this
+    # target is the one we just wrote. Held as a path rather than a loaded map
+    # so a run that never reaches the suite stage pays nothing for it.
+    from .explorer.crawler import saved_maps
+
+    previous_map = (saved_maps(target_url) or (None,))[-1]
+
     # --- explore ---------------------------------------------------------
     explore_budget = CrawlBudget(
         max_actions=budget.explore_actions, max_seconds=budget.explore_seconds
@@ -624,7 +632,8 @@ def run(
     # A recompiled suite cannot regress -- it is rebuilt from whatever the app
     # looks like now, so it agrees with the app by construction.
     if keep_suite:
-        _keep(pipe, page, credentials, announce, emit, suite_root, provider)
+        _keep(pipe, page, credentials, announce, emit, suite_root, provider,
+              previous_map)
 
     pipe.stopped = "complete"
     announce(
@@ -642,7 +651,8 @@ def run(
     return pipe
 
 
-def _keep(pipe: Pipeline, page, credentials, announce, emit, suite_root=None, provider=None) -> None:
+def _keep(pipe: Pipeline, page, credentials, announce, emit, suite_root=None,
+          provider=None, previous_map=None) -> None:
     """Persist the suite as a version, or replay the saved one and heal it.
 
     Which of the two happens is decided by the filesystem and not by a flag,
@@ -754,6 +764,7 @@ def _keep(pipe: Pipeline, page, credentials, announce, emit, suite_root=None, pr
             ),
             surface="defect" if report.defects else "suite",
         )
+        _extend(pipe, directory, page, credentials, announce, previous_map)
         return
 
     announce(
@@ -781,6 +792,164 @@ def _keep(pipe: Pipeline, page, credentials, announce, emit, suite_root=None, pr
             **report.counts,
         ),
         surface="heal",
+    )
+    _extend(pipe, directory, page, credentials, announce, previous_map)
+
+
+def _extend(pipe: Pipeline, directory, page, credentials, announce, previous_map) -> None:
+    """Add tests for behaviour this target did not have last time. Nothing else.
+
+    **Why the kept suite may grow but may not be rebuilt.** `_keep` refuses to
+    recompile a saved suite, because a suite rebuilt from the app as it is now
+    agrees with the app by construction and stops being able to catch anything.
+    A flow that did not exist when the baseline was recorded is the one addition
+    that does not have that problem: no saved expectation is being replaced, so
+    nothing that could have failed is being quietly rewritten into something
+    that passes.
+
+    **What counts as new is computed, not judged.** `snapshot.compare` is a set
+    difference over two maps of the same target, and `edges_added` is its
+    answer. No model is asked whether a feature is new, which matters because
+    the wrong answer here writes a test for behaviour nobody shipped.
+
+    **Two guards, and both are load-bearing.**
+
+        the state key moves under a rename, so `edges_added` alone reports the
+        whole application as new the first time a button is renamed.
+        `regression.unseen` drops any candidate whose action sequence the suite
+        already walks, and this runs *after* `verify`, so the comparison is
+        against a suite the Healer has already rewritten to the new names.
+
+        an edge nobody can reach is not a feature. `scenarios()` compiles from
+        `world.paths()`, so a candidate with no route from the entry never
+        becomes a scenario at all.
+    """
+    if previous_map is None or pipe.world is None:
+        # No earlier map for this target: everything is "new" and appending all
+        # of it would duplicate the baseline. The first comparison is the run
+        # after this one.
+        return
+
+    from .explorer import snapshot
+    from . import regression
+
+    try:
+        before = snapshot.load(previous_map)
+    except Exception as exc:
+        emit_reason = f"the previous map could not be read ({type(exc).__name__})"
+        announce(
+            pipe.decide(
+                "extend", "no comparison against the last run",
+                f"{emit_reason}, so this run cannot tell new behaviour from old "
+                "and adds nothing rather than guessing",
+            ),
+            surface="suite",
+        )
+        return
+
+    diff = snapshot.compare(before, pipe.world)
+    if not diff.edges_added:
+        announce(
+            pipe.decide(
+                "extend", "no new behaviour to add",
+                "every edge in this run's map was in the last one, so the kept "
+                "suite already covers everything the crawl can reach",
+                states_added=len(diff.states_added),
+                edges_added=0,
+            ),
+            surface="suite",
+        )
+        return
+
+    only = {(from_key, action) for from_key, action, _ in diff.edges_added}
+    candidates = make_plan(
+        pipe.world,
+        pipe.behaviour,
+        source=pipe.plan_source or source_from_env(),
+        limit=len(only),
+        only=only,
+    ).scenarios
+    additions = regression.unseen(candidates, directory)
+
+    if not additions:
+        announce(
+            pipe.decide(
+                "extend", f"{len(diff.edges_added)} new edge(s), nothing to add",
+                "the map grew, but every path it grew by is one the saved suite "
+                "already walks -- which is what a renamed control looks like "
+                "from here, and the Healer has already absorbed it",
+                edges_added=len(diff.edges_added),
+                compiled=len(candidates),
+                redundant=len(candidates),
+            ),
+            surface="suite",
+        )
+        return
+
+    # Run them before writing them, for the reason `verify` re-verifies a
+    # repair: a scenario that has never been executed is a hypothesis, and one
+    # written into the suite unexecuted becomes next run's baseline -- where a
+    # test that was broken on arrival is indistinguishable from a regression.
+    # Only what reached its own recorded outcome is kept.
+    confirmed: list[Scenario] = []
+    outcomes: list[str] = []
+    for scenario in additions:
+        result = replay(
+            page, scenario, target_url=pipe.target_url, credentials=credentials
+        )
+        pipe.results.append(result)
+        if result.verdict in (PASSED, HEALED):
+            confirmed.append(scenario)
+            outcomes.append(result.verdict)
+
+    if not confirmed:
+        announce(
+            pipe.decide(
+                "extend", f"{len(additions)} new scenario(s), none confirmed",
+                "each was compiled from an edge the crawler walked and then "
+                "failed when replayed on its own, so none was written: a suite "
+                "is not the place to find out whether its newest test works",
+                compiled=len(additions),
+                confirmed=0,
+            ),
+            surface="suite",
+        )
+        return
+
+    version = regression.extend(
+        directory,
+        tuple(confirmed),
+        because=(
+            f"{len(confirmed)} flow(s) this target did not have when "
+            f"{pipe.version.label if pipe.version else 'the baseline'} was recorded"
+        ),
+        credentials=credentials,
+        target_url=pipe.target_url,
+        mark=regression.fingerprint(page, pipe.target_url),
+        source=pipe.plan_source,
+        outcomes=tuple(outcomes),
+    )
+    if version is None:
+        return
+
+    pipe.version = version
+    regression.export(version)
+    named = ", ".join(s.name for s in confirmed[:3])
+    announce(
+        pipe.decide(
+            "extend", f"added {len(confirmed)} scenario(s) as {version.label}",
+            "the application gained behaviour the saved suite did not cover, so "
+            "a test was written for that and for nothing else -- the scenarios "
+            f"already on disk were neither recompiled nor re-ranked. Added: {named}",
+            version=version.label,
+            added=len(confirmed),
+            rejected=len(additions) - len(confirmed),
+            edges_added=len(diff.edges_added),
+            redundant=len(candidates) - len(additions),
+            states_added=len(diff.states_added),
+            total=len(version.scenarios),
+        ),
+        surface="suite",
     )
 
 

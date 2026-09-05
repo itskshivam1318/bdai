@@ -35,10 +35,16 @@ locator *and* the outcome changed, both variables moved at once and the run is
 genuinely unattributable -- so it says so, with both diffs attached, instead of
 picking the answer that makes the dashboard greener.
 
-Healing itself is deliberately dull; see `resolve()`. It is a ladder of
-observable rungs, and the rung that fires is recorded, because "healed by
-structural match" and "healed by name similarity" are different amounts of
-trust and a report that hides which one happened is not evidence.
+Healing itself is deliberately dull; see `ladder()`. It is a sequence of
+observable rungs, and the rung that fired is recorded, because "healed by
+structural match", "healed by name similarity" and "healed because a model
+picked it out of four" are different amounts of trust and a report that hides
+which one happened is not evidence.
+
+Only the last rung asks a model, and only where nothing observable is left to
+ask. It can name a control but never invent one, and whatever it names is
+replayed and classified like any other repair -- so the invariant above holds
+over it too: healing cannot override a failed verification.
 """
 
 from __future__ import annotations
@@ -54,6 +60,8 @@ from .explorer.forms import Credentials
 from .explorer.observer import Observation, Observer
 from .explorer.statekey import explain, state_key
 from .generator import Scenario, Step
+from .llm import Exchange, Tool, Transcript
+from .tracing import save_transcript
 
 _FORM_ACTION = re.compile(r"^submit\[(?P<mode>\w+)\]:(?P<descriptor>.+)$")
 
@@ -72,7 +80,7 @@ class Resolution:
     """Which control this step will act on, and how we decided that."""
 
     action: str | None
-    rung: str  # 'exact' | 'structural' | 'similarity' | 'unresolved'
+    rung: str  # 'exact' | 'structural' | 'similarity' | 'ranked' | 'unresolved'
     detail: str
 
     @property
@@ -120,8 +128,194 @@ def _parts(action: str) -> tuple[str | None, str, str]:
     return (form.group("mode") if form else None), role, name
 
 
-def resolve(page: Page, step: Step, here: Observation) -> Resolution:
+CHOOSE = Tool(
+    name="choose",
+    description=(
+        "Name which of the offered controls now plays the part the recorded "
+        "step played. Answer with a candidate's `id` exactly as given. If none "
+        "of them plays that part, or two of them equally could, do not call "
+        "this tool at all -- a refusal is a real answer here and a wrong repair "
+        "is a green run over a broken application."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "id": {
+                "type": "integer",
+                "description": "the candidate's id, exactly as given",
+            },
+            "why": {
+                "type": "string",
+                "description": (
+                    "what makes this the same control, in one concrete sentence "
+                    "about its role in the flow -- not 'it looks similar'"
+                ),
+            },
+        },
+        "required": ["id", "why"],
+    },
+)
+
+
+def _brief(step: Step, candidates: tuple[tuple[str, str], ...]) -> str:
+    """The candidate list as the model sees it. Ids are the only writable handle."""
+    _, role, name = _parts(step.action)
+    lines = [
+        "A recorded test step can no longer find the control it was written "
+        "against, and more than one control on the page could be it.",
+        "",
+        f"The step means: {step.intent}",
+        f"It was recorded against: {role} named {name!r}",
+        "When it ran, the application: "
+        + ("moved to another state" if step.expect.moved else "stayed where it was")
+        + (" and sent a write request" if step.expect.mutating else ""),
+    ]
+    if step.expect.added:
+        lines += ["", "and these appeared:"]
+        lines += [f"    {line.strip()}" for line in step.expect.added[:6]]
+    lines += ["", "Controls of the right kind on the page as it is now:", ""]
+    for index, (_, candidate) in enumerate(candidates):
+        lines.append(f"  [{index}] {role} {candidate!r}")
+    return "\n".join(lines)
+
+
+def ranked(
+    step: Step,
+    candidates: tuple[tuple[str, str], ...],
+    provider=None,
+    *,
+    on_event=None,
+    run_id: int | None = None,
+) -> Resolution:
+    """The ladder's bottom rung: ask a model to break a tie it may not invent.
+
+    Reached only from `resolve`, and only after `structural` and `similarity`
+    have both declined -- which is the position `resolve`'s docstring reserved
+    for a model call and the reason this is not one rung higher. Every rung
+    above produces an observable fact; this one produces a judgement, so it goes
+    last, where the alternative is not a better answer but no answer at all.
+
+    Three things keep it honest, and each is a way it could otherwise start
+    manufacturing green.
+
+    **It answers by index.** The model is handed a list `forms.available_actions`
+    computed and may only point into it. An id that names no candidate is
+    dropped and the escalation stands, exactly as `critic.prioritise` and
+    `claims.attribute` drop an invented citation. A control that is not on the
+    page cannot be named, whatever the model says.
+
+    **It refuses below two candidates.** One candidate is the structural rung's
+    answer and none is `rescue`'s; in both cases a model asked here would be
+    overruling a deterministic result with an opinion. The guard lives in this
+    function rather than in its caller so the property holds for anyone who
+    calls it.
+
+    **It is still replayed.** A repair from this rung goes back through the same
+    `_met` check as any other, so a step ranked onto the wrong control fails
+    verification and reports DEFECT or ESCALATE. Healing cannot override a
+    failed verification -- that invariant is what makes a guess admissible here
+    at all.
+    """
+    def emit(level: str, message: str) -> None:
+        if on_event:
+            on_event(level, message)
+
+    if provider is None or len(candidates) < 2:
+        return Resolution(None, "unresolved", "no ranking was attempted")
+
+    system = (
+        "You decide which control on a web page now plays the part a recorded "
+        "test step was written against. You are given only controls that exist "
+        "on the page and are already of the right kind; your whole job is to "
+        "choose among them or to decline. Declining is correct whenever two of "
+        "them could equally be the answer -- a human resolves that in seconds, "
+        "and a wrong repair hides a real defect behind a passing test."
+    )
+    transcript = Transcript(prompt=_brief(step, candidates))
+    try:
+        turn = provider.turn(system, transcript, [CHOOSE])
+    except Exception as exc:
+        # Losing the model costs the tie-break and nothing else. The step was
+        # already unresolvable when we got here, so the honest outcome is the
+        # escalation that was standing -- never a repair, and never a crash that
+        # would take the rest of the scenario's steps with it.
+        detail = f"could not rank ({type(exc).__name__}: {exc})"
+        emit("warn", f"healer {detail}")
+        return Resolution(None, "unresolved", detail)
+
+    transcript.exchanges.append(
+        Exchange(text=turn.text, calls=turn.calls, opaque=turn.opaque)
+    )
+    try:
+        save_transcript(
+            transcript, run_id=run_id, role="healer", system=system, label="rank"
+        )
+    except Exception:
+        # Same rule as `critic.prioritise` and `ant.explore`: losing the
+        # write-up must never lose the answer.
+        pass
+
+    call = next((c for c in turn.calls if c.name == "choose"), None)
+    if call is None:
+        return Resolution(
+            None, "unresolved",
+            f"{len(candidates)} candidates and the healer declined to choose: "
+            f"{[name for _, name in candidates[:4]]}",
+        )
+
+    index = call.arguments.get("id")
+    if not isinstance(index, int) or not 0 <= index < len(candidates):
+        return Resolution(
+            None, "unresolved",
+            f"the healer named candidate {index!r}, which is not one of the "
+            f"{len(candidates)} offered",
+        )
+
+    action, name = candidates[index]
+    why = str(call.arguments.get("why", "")).strip()
+    _, _, want_name = _parts(step.action)
+    return Resolution(
+        action, "ranked",
+        f"{want_name!r} -> {name!r}, chosen from {len(candidates)} candidates "
+        f"none of which matched by name: {why}",
+    )
+
+
+def resolve(
+    page: Page,
+    step: Step,
+    here: Observation,
+    provider=None,
+    *,
+    on_event=None,
+    run_id: int | None = None,
+) -> Resolution:
     """Find the control this step means, on the page as it is now.
+
+    Reads the page, then hands the ladder its action vocabulary. The split is
+    so that `ladder` -- which is where every policy decision lives -- can be
+    checked without a browser, a key or a live app.
+    """
+    return ladder(
+        step,
+        forms.available_actions(page, here),
+        forms.fields_of(here),
+        provider,
+        on_event=on_event,
+        run_id=run_id,
+    )
+
+
+def ladder(
+    step: Step,
+    available: tuple[str, ...],
+    fields_now: tuple[tuple[str, str], ...],
+    provider=None,
+    *,
+    on_event=None,
+    run_id: int | None = None,
+) -> Resolution:
+    """Which control this step means, given what the page now offers.
 
     A ladder, most trustworthy rung first. Each rung is an observable fact about
     the live page, not an opinion about it, and the rung that fired is reported
@@ -142,20 +336,20 @@ def resolve(page: Page, step: Step, here: Observation) -> Resolution:
     alike the names are, and a margin over the runner-up, so a page with two
     equally plausible buttons escalates instead of coin-flipping.
 
-    Deliberately not here: a model call. Ranking candidates is the documented
-    model seam (`research/README.md`: judges rank reliably and score
-    unreliably), but every rung above already produces evidence, and a model
-    added at the bottom would only ever speak when the deterministic rungs have
-    already failed -- which is precisely when its answer would be least
-    checkable. It belongs above `escalate`, not above `structural`.
+    **ranked** -- several structural candidates and none of them reads like the
+    recorded name. This is the documented model seam (`research/README.md`:
+    judges rank reliably and score unreliably), and it took the position this
+    docstring reserved for it: above `escalate`, below `structural`. It is last
+    because every rung over it produces an observable fact and this one produces
+    a judgement, so a model reached earlier would be overruling evidence. It is
+    *present* because the alternative here is not a better answer -- it is no
+    answer, and the whole scenario ends on this step. See `ranked` for the three
+    properties that stop it manufacturing green.
     """
-    available = forms.available_actions(page, here)
-
     if step.action in available:
         return Resolution(step.action, "exact", "the recorded control is still here")
 
     want_mode, want_role, want_name = _parts(step.action)
-    fields_now = forms.fields_of(here)
 
     candidates = []
     for action in available:
@@ -205,11 +399,22 @@ def resolve(page: Page, step: Step, here: Observation) -> Resolution:
             f"clear of {runner_up[2]!r} at {runner_up[0]:.2f}",
         )
 
+    # Every observable rung has now declined, and the alternative to a
+    # judgement here is not a better answer but no answer at all -- the whole
+    # scenario ends on this step. `ranked` may only point into `candidates`, and
+    # whatever it points at is still replayed and still classified.
+    judged = ranked(
+        step, tuple(candidates), provider, on_event=on_event, run_id=run_id
+    )
+    if judged.action is not None:
+        return judged
+
     return Resolution(
         None,
         "unresolved",
         f"{len(candidates)} candidates and none clearly {want_name!r}: "
-        f"{[name for _, _, name in scored[:4]]}",
+        f"{[name for _, _, name in scored[:4]]}"
+        + (f" ({judged.detail})" if provider is not None else ""),
     )
 
 
@@ -242,6 +447,8 @@ def run(
     credentials: Credentials | None = None,
     synthesizer=None,
     on_event=None,
+    provider=None,
+    run_id: int | None = None,
 ) -> Result:
     """Execute one scenario and classify every step.
 
@@ -272,7 +479,9 @@ def run(
     emit(f"replaying {scenario.name!r} against {url}")
 
     for step in scenario.steps:
-        resolution = resolve(page, step, here)
+        resolution = resolve(
+            page, step, here, provider, on_event=on_event, run_id=run_id
+        )
 
         if resolution.action is None:
             detail = (

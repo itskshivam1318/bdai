@@ -85,9 +85,40 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def directory_for(target_url: str, root: Path | None = None) -> Path:
-    """One suite per target, named after the target a reader would recognise."""
-    return (root or SUITES) / _slug(target_url.split("://", 1)[-1])
+def directory_for(
+    target_url: str, root: Path | None = None, session_uid: str | None = None
+) -> Path:
+    """One suite per target -- and per session, wherever there is one.
+
+    **A session is the unit of a suite's history, not a URL.** Keyed on the
+    target alone, a second session pointed at the same app opened on the first
+    session's tests: `keep` asks the filesystem whether a suite exists, finds
+    one, and replays it instead of recording. Everything downstream then reads
+    as drift -- the new session's console shows scenarios it never compiled,
+    healed against a baseline someone else recorded, sometimes with a context
+    box that says something different. Two people testing the same staging URL
+    is the normal case, not an edge one.
+
+    Within a session the old behaviour is exactly what is wanted: run twice and
+    the second run replays the first one's suite, heals it, and emits v002. That
+    is the drift story, and it is why this scopes rather than disables.
+
+    `session_uid=None` keeps the target-only path, which is what every CLI entry
+    point (`make suite`, `make pipeline`, `rescue.py`) has and should have --
+    there is no session at a command line, and one suite per target is the right
+    answer there.
+
+    **The session's `uid`, not its row number.** `TestSession.id` is 1 on a
+    fresh database and 1 again after `make reset`, which does not clear
+    `artifacts/` -- so a suite directory named after the row number is handed to
+    whichever session is first in the *next* database. That is the same bug one
+    level down: tests belonging to a session that no longer exists, presented as
+    this one's history.
+    """
+    slug = _slug(target_url.split("://", 1)[-1])
+    if session_uid:
+        slug = f"{slug}-{_slug(session_uid)}"
+    return (root or SUITES) / slug
 
 
 # ---------------------------------------------------------------- fingerprint
@@ -469,6 +500,85 @@ def load(where: str | Path | Version) -> tuple[Scenario, ...]:
     return tuple(from_json(p.read_text(encoding="utf-8")) for p in files)
 
 
+def unseen(
+    candidates: tuple[Scenario, ...], directory: str | Path
+) -> tuple[Scenario, ...]:
+    """The candidates the saved suite does not already exercise.
+
+    **Matched on the action sequence, never on the state key or the name.**
+    That is the whole of the redundancy guard, and the reason it is not keyed
+    on state is worth stating: `state_key` folds in accessible names, so a
+    renamed button re-keys every state it appears on, and a diff of two maps
+    then reports *every* edge through those states as added. Keyed on state,
+    a cosmetic rename would append a duplicate of the entire suite -- the
+    precise failure "only generate tests for what changed" exists to prevent.
+
+    An action sequence survives that, because the Healer has already rewritten
+    the saved suite's actions to the new names by the time this runs (see
+    `pipeline._keep`, which extends only after `verify`). What is left over is
+    a path through the application that the suite genuinely does not walk.
+    """
+    already = {
+        tuple(step.action for step in scenario.steps)
+        for scenario in load(directory)
+    }
+    return tuple(
+        candidate
+        for candidate in candidates
+        if tuple(step.action for step in candidate.steps) not in already
+    )
+
+
+def extend(
+    directory: str | Path,
+    additions: tuple[Scenario, ...],
+    *,
+    because: str,
+    credentials: Credentials | None = None,
+    target_url: str = "",
+    mark: str = "",
+    source: str = "",
+    outcomes: tuple[str, ...] = (),
+) -> Version | None:
+    """Emit the saved suite plus `additions` as the next version.
+
+    The kept suite grows here and nowhere else. `verify` may only *repair* what
+    is already on disk -- `pipeline._keep` says why at length: a suite that
+    recompiles itself from the app as it is now agrees with the app by
+    construction and can no longer catch a regression. Adding a test for a flow
+    that did not exist when the baseline was recorded is the one change to a
+    kept suite that does not have that problem, because nothing is being
+    replaced.
+
+    Returns None when there is nothing to add, so a caller can treat "no new
+    behaviour was found" as the ordinary outcome it is rather than as an error
+    or an empty version on disk.
+    """
+    if not additions:
+        return None
+
+    existing = load(directory)
+    tally: dict[str, int] = {}
+    for verdict in outcomes:
+        if verdict:
+            tally[verdict] = tally.get(verdict, 0) + 1
+
+    return emit(
+        existing + additions,
+        directory,
+        because=because,
+        credentials=credentials,
+        target_url=target_url,
+        mark=mark,
+        source=source,
+        # Positional, and only the additions were run just now: the inherited
+        # scenarios carry no verdict rather than a stale one copied forward. A
+        # verdict on a version says what *this* version's run proved.
+        outcomes=("",) * len(existing) + outcomes,
+        verdicts=tally,
+    )
+
+
 def path_of(root: Path, scenario: Scenario) -> Path | None:
     """The `.json` a scenario was loaded from, matched by name."""
     for path in sorted(
@@ -773,6 +883,7 @@ def verify(
     reverify: bool = True,
     rescue: bool = True,
     provider=None,
+    run_id: int | None = None,
 ) -> Report:
     """Replay the saved suite, and write back what healed.
 
@@ -828,7 +939,8 @@ def verify(
 
     for scenario in originals:
         result = runner.run(
-            page, scenario, target_url=url, credentials=credentials, on_event=on_event
+            page, scenario, target_url=url, credentials=credentials,
+            on_event=on_event, provider=provider, run_id=run_id,
         )
         report.results.append(result)
 
@@ -845,6 +957,11 @@ def verify(
                     page, scenario, result,
                     target_url=url, credentials=credentials,
                     provider=provider, on_event=on_event,
+                    # So the wave it may send files its transcripts under this
+                    # run rather than under `adhoc/`. A console run is the only
+                    # caller that has an id; the CLI passes None and keeps the
+                    # old destination.
+                    run_id=run_id,
                 )
             except Exception as exc:
                 # An exploration that fell over must not cost the rest of the
@@ -938,13 +1055,24 @@ def verify(
     # would recompute from zero, and the repair this run just made would teach
     # the system nothing.
     #
-    # Where a scenario failed, the region it stands in has moved, so the old
-    # reading of that region is the one thing here that is out of date --
-    # `rescue.look` crawls it (with one aimed colony wave when a provider
+    # A failed replay is the signal that something moved, so `moved` gates
+    # whether this happens at all -- a suite that replayed clean teaches
+    # nothing new and pays for no crawl. `rescue.look` then re-crawls a REGION
+    # budget from the entry (with one aimed colony wave when a provider
     # exists) and `behavior.refresh` re-reads it, carrying every claim about
-    # the rest of the app through untouched. With no provider there is nothing
-    # that can interpret anything, and the honest answer is what we already
-    # believed rather than an empty model.
+    # states the region did not reach through untouched.
+    #
+    # **The region is around the entry, not around the failing node.** `look`
+    # maps outward from a url and the failing node's url is not reliably known
+    # once the replay loop has finished -- the page is wherever the last
+    # scenario left it. So this refreshes the neighbourhood the crawl can reach
+    # in eight states rather than the precise screen that moved, and a failure
+    # deep in the app may re-read ground that did not change. Narrowing it
+    # needs the runner to report where each scenario was standing, which is a
+    # change to `Result` and not to this.
+    #
+    # With no provider there is nothing that can interpret anything, and the
+    # honest answer is what we already believed rather than an empty model.
     believed = version.behaviour
     moved = tuple({
         outcome.step.from_key
@@ -956,16 +1084,22 @@ def verify(
     if provider is not None and moved:
         try:
             region, how = rescue_agent.look(
-                page, url, moved[0], provider=provider,
-                credentials=credentials, on_event=on_event,
+                page, url,
+                intent=(
+                    "A saved test failed on this application. Describe what "
+                    "this part of it does now, so a reading of it taken before "
+                    "the change can be replaced rather than trusted."
+                ),
+                credentials=credentials, provider=provider, on_event=on_event,
+                run_id=run_id,
             )
             believed = behavior_refresh(believed, region, provider,
                                         on_event=on_event)
             if on_event:
                 on_event(
                     "decision",
-                    f"behaviour refreshed over the region that moved "
-                    f"[{moved[0][:8]}] by {how}: "
+                    f"behaviour refreshed by {how} after "
+                    f"{len(moved)} state(s) failed to replay: "
                     f"{len(believed.hypotheses)} claim(s) now held",
                 )
         except Exception as exc:
@@ -1051,6 +1185,7 @@ def keep(
     export_too: bool = True,
     provider=None,
     on_event=None,
+    run_id: int | None = None,
 ) -> Kept:
     """Record this run's plan as the baseline, or replay the kept suite and heal.
 
@@ -1138,6 +1273,7 @@ def keep(
         # `rescue.look` degrades to the crawl, which answers the common case.
         provider=provider,
         on_event=on_event,
+        run_id=run_id,
     )
     version = report.emitted or existing
     if export_too and version is not None:

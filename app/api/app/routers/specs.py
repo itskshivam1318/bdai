@@ -28,7 +28,7 @@ from sqlmodel import Session, select
 from agents import regression
 
 from ..db import get_session
-from ..models import Run, TestCase
+from ..models import Run, TestCase, TestSession
 
 router = APIRouter(prefix="/api/runs", tags=["specs"])
 
@@ -105,6 +105,18 @@ def _run_or_404(run_id: int, db: Session) -> Run:
     return run
 
 
+def _uid_of(run: Run, db: Session) -> str | None:
+    """The session's stable id, or None for a run that belongs to no session.
+
+    None is the CLI's answer and it is the right one: a run created outside the
+    console has no session, so it reads the target's own suite.
+    """
+    if run.session_id is None:
+        return None
+    row = db.get(TestSession, run.session_id)
+    return row.uid if row else None
+
+
 def _pick(run_id: int, run: Run, db: Session) -> tuple[Path, tuple[regression.Version, ...], regression.Version | None]:
     """The directory for this run's target, its lineage, and the run's version.
 
@@ -113,7 +125,12 @@ def _pick(run_id: int, run: Run, db: Session) -> tuple[Path, tuple[regression.Ve
     showing run 4's files against run 3's verdicts, which is a lie about which
     tests produced which result.
     """
-    directory = regression.directory_for(run.target_url)
+    # Scoped to the run's session, and that is what the writer does too: two
+    # sessions on one URL keep two suites, so serving the target's suite would
+    # hand this run somebody else's tests.
+    directory = regression.directory_for(
+        run.target_url, session_uid=_uid_of(run, db)
+    )
     known = regression.versions(directory)
     labelled = db.exec(
         select(TestCase.suite_version)
@@ -225,7 +242,9 @@ def download_suite(
         archive.writestr("README.md", _readme(chosen, len(specs)))
         archive.writestr("playwright.config.ts", _CONFIG)
 
-    slug = regression.directory_for(run.target_url).name
+    slug = regression.directory_for(
+        run.target_url, session_uid=_uid_of(run, db)
+    ).name
     return Response(
         content=buffer.getvalue(),
         media_type="application/zip",

@@ -153,6 +153,11 @@ class Colony:
     run_id: int | None = None
     shot: object = None
     synthesizer: object = None
+    # What this colony's transcripts are filed as. Empty is the colony itself
+    # ("orchestrator" and "ant"); `rescue.look` sets "healer", because the same
+    # machinery serving a different stage of the pipeline should not be
+    # indistinguishable from it in the record.
+    filed_as: str = ""
     # Scenarios a generator dispatch compiled, keyed by the state it was sent
     # to. The healer reads this: it is the only channel between the two, and
     # it is why "generate here, then test here" is a plan the orchestrator can
@@ -182,6 +187,7 @@ def _send_ant(colony: Colony, state: str, instruction: str, tag: str):
         run_id=colony.run_id,
         shot=colony.shot,
         synthesizer=colony.synthesizer,
+        role=colony.filed_as or "ant",
     )
 
 
@@ -406,6 +412,7 @@ def run(
     checkpoint=None,
     synthesizer=None,
     world: WorldMap | None = None,
+    filed_as: str = "",
 ) -> Exploration:
     """Explore `entry_url` until the orchestrator is satisfied or the budget ends.
 
@@ -475,6 +482,7 @@ def run(
         run_id=run_id,
         shot=shot,
         synthesizer=synthesizer,
+        filed_as=filed_as,
     )
 
     # The semantic layer, built once from the seeded map before any agent is
@@ -785,7 +793,8 @@ def run(
     try:
         result.transcript_path = str(
             save_transcript(
-                transcript, run_id=run_id, role="orchestrator", system=system
+                transcript, run_id=run_id, role=filed_as or "orchestrator",
+                system=system,
             )
         )
         emit("info", f"transcripts written to {result.transcript_path}")

@@ -46,6 +46,19 @@ const VERDICT_MARK: Record<string, string> = {
 const COMPILED = /^(.+?) \((\d+) steps?\)$/;
 /** `complete the Sign in form and submit it: defect (1 healed)` — the Runner's. */
 const VERDICT = /^(.+?): (passed|healed|defect|escalate)\b/;
+/** `3/8 replaying complete the Sign in form` — emitted before the replay. */
+const REPLAYING = /^(\d+)\/\d+ replaying (.+)$/;
+
+/** The database writes naive UTC; without the Z a browser reads it as local. */
+function stamp(iso: string): number {
+  return new Date(iso.endsWith("Z") ? iso : `${iso}Z`).getTime();
+}
+
+/** `47s`, `3m 20s` — how long this has been the newest thing that happened. */
+function ago(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  return `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, "0")}s`;
+}
 
 type Row = {
   name: string;
@@ -193,9 +206,51 @@ export default function SuitePane({
     return () => clearInterval(timer);
   }, [loadSuite, running]);
 
+  /*
+   * A clock, ticking only while the run is live.
+   *
+   * Measured on run 32 (2026-09-05): 97 lines over 507 seconds, with single
+   * silences of 86s, 65s, 62s and 54s — every one of them a model call the
+   * agent was waiting on. The console polled every second throughout and had
+   * nothing new to draw, so a working run and a dead one looked identical for
+   * a minute and a half at a time. Nothing here makes the model faster; the
+   * fix is that a silence has to be *legible* as one, which needs a number
+   * that moves while nothing else does.
+   */
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!running) return;
+    // No initial set: the first tick is a second away, `now` was read at mount,
+    // and `silent` floors at zero — so a stale clock shows 0s for one second
+    // rather than a negative age. Setting state here is also a lint error.
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [running]);
+
   const mine = events.filter((e) => e.run_id === runId);
   const suiteEvents = mine.filter((e) => e.surface === "suite" || e.surface === "run");
   const rows = rowsFor(suite, suiteEvents);
+
+  const last = mine.length ? mine[mine.length - 1] : null;
+  const silent = last ? Math.max(0, Math.round((now - stamp(last.created_at)) / 1000)) : 0;
+
+  /*
+   * The scenario on the page right now.
+   *
+   * `explore.py` emits "3/8 replaying <name>" before each replay and the
+   * verdict after it, so the newest replay line with no verdict behind it is
+   * the one being executed. Without this a row sat at "compiling" for the
+   * whole replay — the panel knew which test was running and did not say.
+   */
+  const replaying = (() => {
+    if (!running) return null;
+    for (let i = suiteEvents.length - 1; i >= 0; i -= 1) {
+      const hit = REPLAYING.exec(suiteEvents[i].message);
+      if (hit) return { ordinal: Number(hit[1]), name: hit[2] };
+      if (VERDICT.exec(suiteEvents[i].message)) return null;
+    }
+    return null;
+  })();
 
   useEffect(() => {
     if (logOpen) logEnd.current?.scrollIntoView({ block: "nearest" });
@@ -206,6 +261,22 @@ export default function SuitePane({
       mine.some((e) => e.surface && stage.surfaces.includes(e.surface)) ? i : last,
     -1,
   );
+
+  /*
+   * The ordinal, not the name. "5/8 replaying X" carries its own position in
+   * the plan, and one suite can hold two scenarios with the same name — this
+   * SUT compiles "complete the Sign in form and submit it" twice — so matching
+   * on the name alone marked the first of them, which had already passed, or
+   * nothing at all once both had. The name is kept as the guard: if the row at
+   * that position is not the one being replayed, the lists are not aligned and
+   * marking anything would be a guess.
+   */
+  const activeIndex = (() => {
+    if (!replaying) return -1;
+    const at = replaying.ordinal - 1;
+    if (rows[at]?.name === replaying.name) return at;
+    return rows.findIndex((r) => r.name === replaying.name && !r.status);
+  })();
 
   const version = suite?.version ?? null;
   const tally = rows.reduce<Record<string, number>>((acc, row) => {
@@ -244,6 +315,40 @@ export default function SuitePane({
           );
         })}
       </div>
+
+      {/*
+        What is happening right now, and how long it has been happening.
+        Only while the run is live — after it ends the last line is history and
+        a counter ticking beside it would be measuring the wrong thing.
+
+        The elapsed number is the point. The agent's longest legitimate silence
+        is a single model call, and "waiting on the model · 1m 26s" is a
+        different message from the same screen with nothing on it, even though
+        the pixels in between are identical.
+      */}
+      {running && last && (
+        <div className="flex items-baseline gap-2 border-b border-rule bg-paper px-3 py-2">
+          <span
+            aria-hidden
+            className="size-1.5 shrink-0 animate-pulse rounded-full bg-live"
+          />
+          <span className="min-w-0 flex-1 truncate text-[11px] leading-snug text-ink">
+            {last.message}
+          </span>
+          <span
+            title={
+              silent >= 30
+                ? "The agent is waiting on a model call. Runs of a minute or more are normal."
+                : undefined
+            }
+            className={`shrink-0 tabular-nums text-[11px] ${
+              silent >= 90 ? "text-fault" : "text-muted"
+            }`}
+          >
+            {ago(silent)}
+          </span>
+        </div>
+      )}
 
       <div className="flex items-baseline gap-2 border-b border-rule px-3 py-2">
         <h2 className="text-xs font-medium uppercase tracking-wide text-ink">
@@ -336,6 +441,10 @@ export default function SuitePane({
             {rows.map((row, i) => {
               const id = `${row.file ?? row.name}-${i}`;
               const open = expanded === id;
+              // The first unverdicted row of that name, not every row of it:
+              // one suite can hold two scenarios called the same thing, and
+              // only one of them is on the page.
+              const live = i === activeIndex;
               return (
                 <li
                   key={id}
@@ -354,18 +463,33 @@ export default function SuitePane({
                         row.status ? VERDICT_TONE[row.status] ?? "text-muted" : "text-muted/40"
                       }`}
                     >
-                      {row.status ? VERDICT_MARK[row.status] ?? "·" : "○"}
+                      {row.status ? (
+                        VERDICT_MARK[row.status] ?? "·"
+                      ) : live ? (
+                        <span
+                          aria-hidden
+                          className="inline-block size-1.5 animate-pulse rounded-full bg-live align-middle"
+                        />
+                      ) : (
+                        "○"
+                      )}
                     </span>
                     <span className="min-w-0 flex-1">
                       <span className="block truncate text-xs leading-snug text-ink">
                         {row.name}
                       </span>
                       <span className="mt-0.5 block truncate font-mono text-[10px] text-muted">
-                        {row.file
-                          ? `${row.file}.spec.ts`
-                          : row.steps !== null
-                            ? `${row.steps} step${row.steps === 1 ? "" : "s"} · compiling`
-                            : "compiling"}
+                        {live
+                          ? `${
+                              row.steps !== null
+                                ? `${row.steps} step${row.steps === 1 ? "" : "s"} · `
+                                : ""
+                            }replaying against the app now`
+                          : row.file
+                            ? `${row.file}.spec.ts`
+                            : row.steps !== null
+                              ? `${row.steps} step${row.steps === 1 ? "" : "s"} · compiled`
+                              : "compiled"}
                         {row.origin && row.origin !== "map" && ` · ${row.origin}`}
                       </span>
                     </span>
@@ -459,9 +583,16 @@ export default function SuitePane({
             className="flex w-full items-baseline gap-2 border-b border-rule px-3 py-2 text-left text-[11px] uppercase tracking-wide text-muted hover:text-ink"
           >
             <span aria-hidden>🐜</span>
-            <span>Transcripts</span>
+            {/*
+              Named after the agents rather than after the storage. "Transcripts"
+              is what is on disk; "which agent did what" is the question, and
+              the panel behind this now answers it for the deterministic stages
+              too — so the label that sent people looking for a Generator
+              transcript that never existed was the label itself.
+            */}
+            <span>Agents</span>
             <span className="ml-auto normal-case tracking-normal">
-              prompts &amp; replies
+              planner · generator · healer
             </span>
           </button>
         )}

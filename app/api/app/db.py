@@ -34,7 +34,7 @@ def init_db() -> None:
 # app.db` is still the tool for that.
 _ADDED_COLUMNS: dict[str, list[tuple[str, str]]] = {
     "chatmessage": [("thread_id", "INTEGER")],
-    "testsession": [("context", "TEXT")],
+    "testsession": [("context", "TEXT"), ("uid", "TEXT")],
     "testcase": [("node", "TEXT"), ("suite_version", "TEXT")],
 }
 
@@ -65,6 +65,38 @@ def _add_missing_columns(target=None) -> None:
                     conn.exec_driver_sql(
                         f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"
                     )
+            conn.commit()
+    _backfill_session_uids(target)
+
+
+def _backfill_session_uids(target=None) -> None:
+    """Give every session that predates `uid` one, and only those.
+
+    The rule above the column list still holds -- a row with a null `uid` is
+    *correct*, nothing crashes -- but it is not useful: `directory_for` falls
+    back to the target-only path for a session with no uid, which is the shared
+    suite this exists to stop. A random value is not computed from the old row,
+    so this stays a backfill rather than the real migration `make reset` is for.
+
+    One statement, and a no-op on a fresh database.
+    """
+    from uuid import uuid4
+
+    with (target or engine).connect() as conn:
+        names = {
+            row[1] for row in conn.exec_driver_sql("PRAGMA table_info(testsession)")
+        }
+        if "uid" not in names:
+            return
+        rows = conn.exec_driver_sql(
+            "SELECT id FROM testsession WHERE uid IS NULL OR uid = ''"
+        ).fetchall()
+        for (row_id,) in rows:
+            conn.exec_driver_sql(
+                "UPDATE testsession SET uid = ? WHERE id = ?",
+                (uuid4().hex[:12], row_id),
+            )
+        if rows:
             conn.commit()
 
 

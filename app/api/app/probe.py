@@ -452,6 +452,152 @@ def _suite_download() -> bool:
     return ok
 
 
+def _suites_are_per_session() -> bool:
+    """A second session on the same URL must not open the first one's tests.
+
+    Reported from the console: enter a URL, add a context box, press Start, and
+    the panel fills with scenarios from a session recorded hours earlier. The
+    cause was that `regression.keep` asks the *filesystem* whether a suite
+    exists for the target -- which is the right question for `make suite` at a
+    command line and the wrong one for a console where two people can be
+    pointed at the same staging URL.
+
+    Both halves are checked, because fixing only the writer leaves the reader
+    serving the shared directory and the bug is still on screen.
+    """
+    from agents import regression
+    from agents.generator import Expectation, Scenario, Step
+
+    from .models import TestSession
+
+    print("\nSESSIONS    a suite belongs to a session, not to a URL")
+    ok = True
+
+    url = "https://shared.example"
+    mine = regression.directory_for(url, session_uid="aaaa1111bbbb")
+    yours = regression.directory_for(url, session_uid="cccc2222dddd")
+    cli = regression.directory_for(url)
+
+    ok &= check(
+        "two sessions on one URL are two suites",
+        mine != yours,
+        f"both resolved to {mine}",
+    )
+    ok &= check(
+        "and neither is the command line's",
+        cli != mine and cli != yours and cli.name == "shared-example",
+        f"cli={cli.name} session={mine.name}",
+    )
+    # The whole reason it is the uid: `make reset` reissues row numbers and
+    # leaves `artifacts/` alone, so a directory named after `TestSession.id`
+    # is handed to the next database's first session.
+    ok &= check(
+        "a session's suite is named after something a reset cannot reissue",
+        "aaaa1111bbbb" in mine.name and "-s1" not in mine.name,
+        f"named {mine.name}",
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        engine = create_engine(
+            f"sqlite:///{tmp}/probe.db", connect_args={"check_same_thread": False}
+        )
+        SQLModel.metadata.create_all(engine)
+
+        def override():
+            with Session(engine) as session:
+                yield session
+
+        app.dependency_overrides[get_session] = override
+        client = TestClient(app)
+
+        with Session(engine) as session:
+            # Two sessions, the same URL, no context in common -- the report.
+            first, second = TestSession(target_url=url), TestSession(target_url=url)
+            session.add(first)
+            session.add(second)
+            session.commit()
+            session.refresh(first)
+            session.refresh(second)
+            recorded = Run(target_url=url, status="passed", session_id=first.id)
+            fresh = Run(target_url=url, status="running", session_id=second.id)
+            session.add(recorded)
+            session.add(fresh)
+            session.commit()
+            session.refresh(recorded)
+            session.refresh(fresh)
+            first_id, second_id = recorded.id, fresh.id
+            owner = first.uid
+            ok &= check(
+                "each session is issued its own id, unrelated to its row number",
+                bool(first.uid) and first.uid != second.uid
+                and first.uid != str(first.id),
+                f"{first.uid!r} / {second.uid!r}",
+            )
+
+        scenario = Scenario(
+            name="sign in",
+            target_url=url,
+            origin="map",
+            steps=(
+                Step(
+                    intent="sign in",
+                    action="button:Sign in",
+                    from_key="aaaa000000000000",
+                    fields=(),
+                    expect=Expectation(
+                        moved=True, mutating=True, added=(), removed=(),
+                        to_key="bbbb000000000000",
+                    ),
+                ),
+            ),
+        )
+
+        original = regression.SUITES
+        regression.SUITES = pathlib.Path(tmp) / "suites"
+        try:
+            # Only the first session ever recorded anything.
+            regression.emit(
+                (scenario,),
+                regression.directory_for(url, session_uid=owner),
+                because="recorded by the probe",
+                target_url=url,
+                source="map",
+                outcomes=("passed",),
+            )
+            ok &= check(
+                "the session that recorded it can download it",
+                client.get(f"/api/runs/{first_id}/suite").json()["version"] is not None,
+                "a session cannot see the suite it kept itself",
+            )
+            ok &= check(
+                "a new session on the same URL starts with nothing kept",
+                client.get(f"/api/runs/{second_id}/suite").json()["version"] is None,
+                "the console is serving another session's tests -- the "
+                "reported bug",
+            )
+            ok &= check(
+                "and its download is a 404 rather than someone else's zip",
+                client.get(f"/api/runs/{second_id}/suite/download").status_code == 404,
+                "a new session can download a suite it never compiled",
+            )
+            # The uid is the server's to hand out. Accepting one from the body
+            # would let a caller pin two sessions to the same suite, which is
+            # the single thing the column exists to prevent.
+            posted = client.post(
+                "/api/sessions", json={"target_url": url, "uid": owner}
+            ).json()
+            ok &= check(
+                "a uid supplied by the caller is ignored, not honoured",
+                posted.get("uid") not in (None, "", owner),
+                f"created with uid {posted.get('uid')!r}",
+            )
+        finally:
+            regression.SUITES = original
+            app.dependency_overrides.clear()
+
+    return ok
+
+
 def main() -> int:
     print("API         TestClient, throwaway database, no browser\n")
     ok = True
@@ -595,6 +741,7 @@ def main() -> int:
     ok &= _invariant_reporting()
     ok &= _status_policy()
     ok &= _suite_download()
+    ok &= _suites_are_per_session()
 
     print()
     return 0 if ok else 1

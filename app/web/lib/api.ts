@@ -68,6 +68,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export type TestSession = {
   id: number;
+  /**
+   * The session's own id, issued once and never reissued -- unlike `id`, which
+   * is a row number and starts at 1 again after `make reset`. Anything kept
+   * outside the database is keyed on this; see `regression.directory_for`.
+   */
+  uid: string;
   target_url: string;
   name: string | null;
   /**

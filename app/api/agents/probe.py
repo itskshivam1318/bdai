@@ -2373,6 +2373,7 @@ def main() -> int:
     ok &= _refresh_checks()
     ok &= _carry_checks()
     ok &= _rescue_checks()
+    ok &= _ladder_checks()
     ok &= _reverify_checks()
 
     print()
@@ -2488,6 +2489,31 @@ def _planner_checks() -> bool:
         "lets a label and its steps disagree after a heal",
     )
 
+    # The `only` filter: incremental generation stands entirely on it, and it
+    # has to hold for both halves of the planner. A believed flow that slipped
+    # past it would write a test for behaviour that is not new.
+    one_edge = {(a, "submit[valid]:button:Sign in")}
+    scoped = plan(world, believed, source="behaviour", limit=8, only=one_edge)
+    ok &= check(
+        "a plan scoped to one edge compiles only scenarios ending on it",
+        all(
+            (s.terminal.from_key, s.terminal.action) in one_edge
+            for s in scoped.scenarios
+        ),
+        f"got {[(s.terminal.from_key[:4], s.terminal.action) for s in scoped.scenarios]}",
+    )
+    ok &= check(
+        "an empty scope compiles nothing at all",
+        len(plan(world, believed, source="behaviour", limit=8, only=set())) == 0,
+        "a run that found no new edge must add no test; an empty filter that "
+        "fell through to the whole map would append the suite to itself",
+    )
+    ok &= check(
+        "and no scope is still the whole map",
+        len(plan(world, believed, source="behaviour", limit=8, only=None)) == len(rich),
+        "every caller from before incremental generation passes None",
+    )
+
     # No provider at all. This is the whole no-key path, and it must say so.
     silent = plan(world, None, source="behaviour", limit=8)
     ok &= check(
@@ -2521,6 +2547,58 @@ def _planner_checks() -> bool:
         "the comparison is computed from the two plans, not asserted",
         "scenarios" in compare(rich, plain) and "nodes covered" in compare(rich, plain),
     )
+
+    # --- the redundancy guard ------------------------------------------------
+    #
+    # `regression.unseen` is what stops the kept suite growing on every run.
+    # Measured before it existed: a re-crawl of the SUT reports 32 added edges
+    # against an application nobody touched, because `state_key` folds in
+    # accessible names and the crawl reaches the drift variants in a different
+    # order each time. Keyed on the state, those 32 would have appended 32
+    # duplicate tests; keyed on the action sequence, they append none.
+    import tempfile
+    from dataclasses import replace
+
+    from . import regression
+
+    with tempfile.TemporaryDirectory() as tmp:
+        saved = plan(world, believed, source="map", limit=8).scenarios
+        regression.emit(saved, tmp, because="probe baseline", target_url="http://sut/")
+
+        ok &= check(
+            "a candidate the saved suite already walks is not added again",
+            regression.unseen(saved, tmp) == (),
+            f"{len(regression.unseen(saved, tmp))} of {len(saved)} came back as new",
+        )
+
+        moved = tuple(
+            replace(s, name=f"{s.name} (renamed)") for s in saved
+        )
+        ok &= check(
+            "and renaming it does not make it new -- the actions are matched",
+            regression.unseen(moved, tmp) == (),
+            "matched on the name, a healed suite would re-add everything the "
+            "Healer had just renamed",
+        )
+
+        fresh = plan(world, believed, source="behaviour", limit=8).scenarios
+        genuinely_new = tuple(
+            s for s in fresh
+            if tuple(step.action for step in s.steps)
+            not in {tuple(step.action for step in k.steps) for k in saved}
+        )
+        ok &= check(
+            "a path the suite does not walk is added",
+            len(regression.unseen(fresh, tmp)) == len(genuinely_new),
+            "the guard must not be so strict it can never grow; a new flow is "
+            "the one change to a kept suite that cannot hide a regression",
+        )
+        ok &= check(
+            "extending an empty set of additions writes no version",
+            regression.extend(tmp, (), because="nothing") is None,
+            "a run that found nothing new must leave no version behind",
+        )
+
     return ok
 
 
@@ -2702,6 +2780,222 @@ def _rescue_checks() -> bool:
     ok &= check(
         "a rescue that found nothing changes nothing",
         repair is None and patched.steps[0].action == "button:Sign in",
+    )
+    return ok
+
+
+def _ladder_checks() -> bool:
+    """The bottom rung of the resolution ladder: a ranking, and its adjudicator.
+
+    `runner.resolve` walks exact -> structural -> similarity, and the file's own
+    docstring named the seam this closes: a model belongs *above* `escalate`,
+    not above `structural`, because every rung over it already produces evidence
+    and a model asked earlier would be overruling a deterministic answer.
+
+    So there are two properties here and they pull in opposite directions.
+
+    **It must speak when nothing else can.** Several structural candidates, none
+    similar enough to the recorded name to clear the margin, is the coin-flip
+    `resolve` refuses -- and refusing it costs a whole scenario. Choosing among
+    controls that all exist is exactly what the research says judges are good at.
+
+    **It must not speak anywhere else, and must never be believed on its own.**
+    It answers by index into a list it was given, so an invented control cannot
+    survive the return. It refuses outright below two candidates, so it cannot
+    reach past the rung above it. And a repair it proposes is still replayed:
+    `runner.run` classifies the step afterwards exactly as before, which is the
+    healing invariant -- healing cannot override a failed verification.
+    """
+    from .llm import ToolCall, Turn
+    from .runner import Step, ranked
+    from .generator import Expectation
+
+    print("LADDER      the ranked rung chooses, and cannot invent")
+    ok = True
+
+    step = Step(
+        intent="click the primary action",
+        action="button:Continue",
+        from_key="a" * 16,
+        fields=(),
+        expect=Expectation(moved=True, mutating=False, added=(), removed=(),
+                           to_key="b" * 16),
+    )
+    # Two controls that both exist, both of the right kind, and neither of which
+    # reads like "Continue". This is the input `resolve` currently escalates on.
+    tied = (("button:Proceed", "Proceed"), ("button:Next step", "Next step"))
+
+    class Picks:
+        name, model = "scripted:picks", "none"
+
+        def __init__(self, index):
+            self.index = index
+            self.asked = 0
+
+        def turn(self, system, transcript, tool_defs):
+            self.asked += 1
+            return Turn(
+                text="",
+                calls=(ToolCall(id="1", name="choose", arguments={
+                    "id": self.index,
+                    "why": "it carries the same position in the flow",
+                }),),
+            )
+
+    class Silent:
+        name, model = "scripted:silent", "none"
+
+        def turn(self, system, transcript, tool_defs):
+            return Turn(text="I cannot tell these two apart.", calls=())
+
+    class Broken:
+        name, model = "scripted:broken", "none"
+
+        def turn(self, system, transcript, tool_defs):
+            raise RuntimeError("402 insufficient credits")
+
+    class Exploding:
+        name, model = "scripted:exploding", "none"
+
+        def turn(self, system, transcript, tool_defs):
+            raise AssertionError("the model was consulted and must not have been")
+
+    # --- where the rung sits in the ladder --------------------------------
+    #
+    # The ordering property, checked by consulting a provider that raises if it
+    # is ever reached. `resolve`'s docstring reserved this position -- above
+    # `escalate`, below `structural` -- and an off-by-one rung here is not a
+    # worse repair, it is a model overruling an observable fact.
+    from .runner import ladder
+
+    fields = (("textbox", "Email"), ("textbox", "Password"))
+    exact_step = Step(intent="click Continue", action="button:Continue",
+                      from_key="a" * 16, fields=(), expect=step.expect)
+
+    verbatim = ladder(exact_step, ("button:Continue", "button:Proceed"), (),
+                      Exploding())
+    ok &= check(
+        "the recorded control still being there is not a question for a model",
+        verbatim.rung == "exact",
+        f"{verbatim.rung}: {verbatim.detail}",
+    )
+    only_one = ladder(exact_step, ("button:Proceed",), (), Exploding())
+    ok &= check(
+        "the only control of its kind is a structural answer, not a ranked one",
+        only_one.rung == "structural" and only_one.action == "button:Proceed",
+        f"{only_one.rung}: {only_one.detail}",
+    )
+    by_name = ladder(exact_step, ("button:Continue now", "button:Delete"), (),
+                     Exploding())
+    ok &= check(
+        "a name that plainly matches is a similarity answer, not a ranked one",
+        by_name.rung == "similarity" and by_name.action == "button:Continue now",
+        f"{by_name.rung}: {by_name.detail}",
+    )
+    nothing = ladder(
+        Step(intent="pay", action="submit[valid]:button:Place order",
+             from_key="a" * 16, fields=fields, expect=step.expect),
+        ("button:Continue",), (), Exploding(),
+    )
+    ok &= check(
+        "a step nothing on the page can play is rescue's problem, not a tie",
+        nothing.action is None,
+        f"{nothing.rung}: {nothing.detail}",
+    )
+
+    # --- and the tie that used to be the end of the road ------------------
+    tie = ("button:Proceed", "button:Next step")
+    ok &= check(
+        "the tie the ladder refuses is what reaches the model",
+        ladder(exact_step, tie, (), Picks(0)).action == "button:Proceed",
+        ladder(exact_step, tie, (), Picks(0)).detail,
+    )
+    ok &= check(
+        "and with no provider that tie still escalates, as it always did",
+        ladder(exact_step, tie, (), None).action is None,
+    )
+
+    # --- with no provider, nothing changes -------------------------------
+    ok &= check(
+        "no provider is the behaviour that shipped: the tie still escalates",
+        ranked(step, tied, None).action is None,
+    )
+
+    # --- the rung cannot reach past the one above it ----------------------
+    ok &= check(
+        "one candidate is the structural rung's answer, and is not asked about",
+        ranked(step, tied[:1], Exploding()).action is None,
+    )
+    ok &= check(
+        "no candidates is rescue's problem, and is not asked about",
+        ranked(step, (), Exploding()).action is None,
+    )
+
+    # --- it answers by index into the list it was given --------------------
+    chose = ranked(step, tied, Picks(1))
+    ok &= check(
+        "a tie the ladder refuses is decided by index into the candidates",
+        chose.action == "button:Next step" and chose.rung == "ranked",
+        f"got {chose.action!r} via {chose.rung}: {chose.detail}",
+    )
+    ok &= check(
+        "the repair carries the reason it was chosen, not just the choice",
+        "same position in the flow" in chose.detail,
+        chose.detail,
+    )
+
+    # --- and cannot answer with anything else ------------------------------
+    invented = ranked(step, tied, Picks(7))
+    ok &= check(
+        "an index that names no candidate is dropped, not resolved",
+        invented.action is None and invented.rung == "unresolved",
+        f"the model invented {invented.action!r}",
+    )
+    ok &= check(
+        "a model that declines to choose leaves the escalation standing",
+        ranked(step, tied, Silent()).action is None,
+    )
+
+    # --- the rung has to actually be reachable from a run ------------------
+    #
+    # A rung nobody threads a provider to is a rung that never fires, and that
+    # failure is silent: every check above still passes and every replay still
+    # escalates exactly as it did before. This asserts the wiring, and only the
+    # wiring -- the live replays in section 4 are what show the ladder still
+    # heals and still refuses.
+    import inspect
+
+    from . import regression, runner as runner_mod
+
+    ok &= check(
+        "a replay can be given the provider its ladder would rank with",
+        "provider" in inspect.signature(runner_mod.run).parameters,
+    )
+    # Exactly one forward, and which one it is matters. The first replay is
+    # where a repair is *proposed* and is allowed to rank; the re-verification
+    # below it is where that repair is *confirmed*, and handing a provider to a
+    # confirmation would let a bad repair be rescued by a second guess during
+    # its own check -- the definition of shopping for a verdict.
+    body = inspect.getsource(regression.verify)
+    proposal, _, confirmation = body.partition("if reverify:")
+    proposing = proposal.split("result = runner.run(")[1].split(")")[0]
+    ok &= check(
+        "the replay that proposes a repair is given the provider",
+        "provider=provider" in proposing,
+        proposing,
+    )
+    ok &= check(
+        "the replay that confirms one is not: a check may not repair itself",
+        "provider" not in confirmation.split("report.reverified")[0],
+        confirmation.split("report.reverified")[0][-200:],
+    )
+
+    # --- losing the model must never cost the escalation -------------------
+    refused = ranked(step, tied, Broken())
+    ok &= check(
+        "a provider that raises escalates and names why it could not rank",
+        refused.action is None and "402" in refused.detail,
+        refused.detail,
     )
     return ok
 
@@ -4814,6 +5108,59 @@ def _carry_checks() -> bool:
             return ok
 
         carried = report.emitted.behaviour
+
+    # The branch that only runs when a provider exists. Nothing above reaches
+    # it -- these checks run without a key -- so `verify`'s call into
+    # `rescue.look` was never executed by anything, and when `look` changed its
+    # signature on main the break was invisible: every check passed and the
+    # refresh would have raised `TypeError` on the first real WATCH run with a
+    # key set. A scripted provider cannot say anything useful about the region,
+    # and does not need to. What is under test is that the call is made and
+    # survives.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp) / "suite"
+        spoke: list[str] = []
+        try:
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch()
+                page = browser.new_page()
+                from .explorer.crawler import Budget, crawl
+                from .planner import plan as make_plan
+
+                world = crawl(page, f"{SUT}?v=1",
+                              Budget(max_states=6, max_actions=12,
+                                     max_seconds=60))
+                planned = make_plan(world, None, source="map", limit=3)
+                if planned.scenarios:
+                    regression.emit(
+                        planned.scenarios, root, because="probe baseline",
+                        credentials=Credentials("u", "p"),
+                        target_url=f"{SUT}?v=1", behaviour=believed,
+                    )
+                    regression.verify(
+                        page, root, target_url=f"{SUT}?v=2",
+                        credentials=Credentials("u", "p"),
+                        reverify=False, rescue=False,
+                        provider=Colony(),
+                        on_event=lambda level, message: spoke.append(message),
+                    )
+                browser.close()
+        except PlaywrightError as exc:
+            print(f"        SKIPPED -- needs `make dev` for the SUT ({exc})")
+            return ok
+        except TypeError as exc:
+            return ok & check(
+                "the refresh path runs when a provider is configured",
+                False,
+                f"verify raised {exc} -- the branch no check had ever entered",
+            )
+
+    ok &= check(
+        "the refresh path runs when a provider is configured",
+        any("behaviour refreshed" in line for line in spoke),
+        "verify never reported a refresh, so the provider branch was skipped "
+        "and would still be unexercised",
+    )
 
     ok &= check(
         "the emitted version carries the model the last one held",
