@@ -147,6 +147,7 @@ def plan(
     source: str = DEFAULT_SOURCE,
     limit: int = 8,
     node: str = "",
+    only: set[tuple[str, str]] | None = None,
 ) -> Plan:
     """What to test, best first, capped at `limit`.
 
@@ -155,6 +156,12 @@ def plan(
     coverage of a region answerable. The filter runs before the cap, so asking
     for a node does not return the whole map's best eight and then discard
     seven of them.
+
+    `only` narrows it to scenarios whose *terminal* edge is one of a given set
+    of `(from_key, action)` pairs -- what incremental generation needs, so a
+    run that found one new flow compiles a test for that flow rather than
+    recompiling the suite. It is applied to both halves of the planner by the
+    same rule: a believed flow qualifies when the edge it ends on qualifies.
     """
     if source not in SOURCES:
         source = DEFAULT_SOURCE
@@ -189,7 +196,7 @@ def plan(
                 continue
             believed.append(scenario)
 
-    computed = list(scenarios(world, limit=max(limit, 8)))
+    computed = list(scenarios(world, limit=max(limit, 8), only=only))
 
     # Deduplicated on the action sequence, not the name: a believed flow and a
     # computed scenario can walk the same edges under different names, and
@@ -198,6 +205,16 @@ def plan(
     ordered = believed + [
         s for s in computed if tuple(step.action for step in s.steps) not in seen
     ]
+
+    if only is not None:
+        # `scenarios()` already honoured this for the computed half; the
+        # believed half has not been filtered yet, and one rule applied to the
+        # whole ordered list is easier to reason about than two.
+        ordered = [
+            s
+            for s in ordered
+            if s.steps and (s.terminal.from_key, s.terminal.action) in only
+        ]
 
     if node:
         ordered = [

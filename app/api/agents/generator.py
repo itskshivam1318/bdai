@@ -443,18 +443,31 @@ def from_flow(world: WorldMap, hypothesis) -> Scenario | None:
     )
 
 
-def scenarios(world: WorldMap, limit: int = 8) -> tuple[Scenario, ...]:
+def scenarios(
+    world: WorldMap,
+    limit: int = 8,
+    only: set[tuple[str, str]] | None = None,
+) -> tuple[Scenario, ...]:
     """Every recorded edge, as a runnable scenario. Best first, capped.
 
     One scenario per distinct terminal action rather than per destination
     state: two actions landing in the same place are still two behaviours, and
     collapsing them would quietly delete `submit[empty]` on any app whose
     validation error renders in a state something else also reaches.
+
+    `only` restricts which `(from_key, action)` edges may be the *terminal* step
+    -- the edge the scenario exists to exercise. Earlier steps are unrestricted,
+    because a scenario still has to reach its subject: a test for a newly added
+    checkout button must log in first, and the login edge is not new. `None`
+    means every recorded edge is a candidate, which is what every caller before
+    incremental generation existed wanted and still gets.
     """
     routes = world.paths()
     best: dict[tuple, tuple[tuple[int, int, int], Scenario]] = {}
 
     for (from_key, action), taken in world.transitions.items():
+        if only is not None and (from_key, action) not in only:
+            continue
         route = routes.get(from_key)
         if route is None or not taken:
             continue
