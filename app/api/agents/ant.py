@@ -31,6 +31,7 @@ from . import tools
 from .explorer import forms
 from .explorer.forms import Credentials
 from .explorer.observer import Observation, Observer
+from .explorer.synth import Synthesizer
 from .explorer.worldmap import WorldMap
 from .llm import Exchange, Provider, ToolResult, Transcript, load
 from .shots import Shot
@@ -88,6 +89,7 @@ def navigate(
     entry_url: str,
     target_key: str,
     credentials: Credentials,
+    synthesizer=None,
 ) -> Observation | None:
     """Walk an ant to its assigned state. None if it could not be reached.
 
@@ -113,7 +115,11 @@ def navigate(
 
     for step in route:
         observer.start_window()
-        if not forms.perform(page, step, observation, credentials):
+        # The synthesizer matters on the way *to* a state as much as at it: a
+        # route that crosses a `submit[invalid]` edge cannot be replayed
+        # without one, and an ant that silently fails to arrive reports
+        # `stuck` for a reason that is ours, not the application's.
+        if not forms.perform(page, step, observation, credentials, synthesizer):
             return None
         observation = observer.observe()
         if world.record(observation) == target_key:
@@ -134,6 +140,7 @@ def explore(
     budget: int = 5,
     run_id: int | None = None,
     shot: Shot | None = None,
+    synthesizer=None,
 ) -> Report:
     """Run one ant to completion.
 
@@ -146,7 +153,9 @@ def explore(
     observer = Observer(page)
     report = Report(start_key=start_key)
 
-    here = navigate(page, observer, world, entry_url, start_key, credentials)
+    here = navigate(
+        page, observer, world, entry_url, start_key, credentials, synthesizer
+    )
     if here is None:
         report.ended = "stuck"
         report.uncertain = "could not reach the assigned state; it may no longer exist"
@@ -237,8 +246,46 @@ def explore(
                 )
                 continue
 
+            if not forms.is_safe(action):
+                # The guard the crawler has always had and the colony never
+                # did. It lived in `crawler.py`, so the engine the console
+                # actually runs walked unguarded past every Delete on the page.
+                # Refused before the click, and recorded, so the map says the
+                # action exists and was deliberately not taken.
+                world.skipped[(here_key, action)] = (
+                    "refused: the name suggests it destroys something"
+                )
+                report.trail.append(f"{action}  (refused: destructive)")
+                results.append(
+                    ToolResult(
+                        call_id=call.id,
+                        name=call.name,
+                        content=(
+                            "That action is refused by the safety guard -- its "
+                            "name suggests it destroys or ends something, and "
+                            "this run is unattended. It is recorded as offered "
+                            "and not taken. Choose something else."
+                        ),
+                    )
+                )
+                continue
+
             observer.start_window()
-            if not forms.perform(page, action, here, credentials):
+            if not forms.perform(
+                page, action, here, credentials, synthesizer, here_key
+            ):
+                # Recorded on the map, in the crawler's own words, not just in
+                # this ant's prose. `brief()` reads `skipped`, so without this
+                # the orchestrator saw the action as still untried and sent the
+                # next wave to retry it -- measured twice on saucedemo, where
+                # `submit[invalid]` was reassigned wave after wave and returned
+                # zero actions every time.
+                world.skipped[(here_key, action)] = (
+                    "nothing here could be filled -- the fields have no "
+                    "accessible name, or the button is in no <form>"
+                    if action.startswith("submit[")
+                    else "the control did not resolve, or did not respond"
+                )
                 report.trail.append(f"{action}  (would not run)")
                 results.append(
                     ToolResult(
@@ -248,13 +295,15 @@ def explore(
                             "That action could not be performed -- the element "
                             "did not resolve, or a form had nothing to fill. "
                             "That is a fact about the application, not your "
-                            "mistake. Try something else."
+                            "mistake, and it is now recorded on the map so "
+                            "nobody is sent to retry it. Try something else."
                         ),
                     )
                 )
                 # The page may have half-changed; re-anchor before continuing.
                 here = navigate(
-                    page, observer, world, entry_url, here_key, credentials
+                    page, observer, world, entry_url, here_key, credentials,
+                    synthesizer,
                 ) or here
                 continue
 
@@ -373,6 +422,14 @@ def main(entry_url: str, instruction: str | None = None) -> int:
     print()
 
     world = WorldMap(actions_of=None)
+    # Same reason as the colony: without one, `submit[invalid]` is offered to
+    # the ant and then refused by `forms.perform`, which reads as the app
+    # rejecting it rather than as a missing dependency.
+    synthesizer = Synthesizer(
+        cache_path=Path(__file__).resolve().parent.parent
+        / "artifacts"
+        / "invalid-payloads.json"
+    )
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch()
@@ -392,6 +449,7 @@ def main(entry_url: str, instruction: str | None = None) -> int:
             start_key=entry_key,
             instruction=instruction,
             credentials=credentials,
+            synthesizer=synthesizer,
         )
         browser.close()
 

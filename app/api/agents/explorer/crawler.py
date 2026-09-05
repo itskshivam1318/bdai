@@ -37,7 +37,9 @@ from urllib.parse import urlparse
 from playwright.sync_api import Page, sync_playwright
 
 from . import forms
-from .forms import Credentials
+# `DESTRUCTIVE`/`is_safe` moved to forms.py so both walkers can honour them;
+# re-exported here because this module's callers and probes name them.
+from .forms import DESTRUCTIVE, Credentials, is_safe  # noqa: F401
 from .observer import Observation, Observer
 from .statekey import state_key
 from .synth import Synthesizer
@@ -79,13 +81,6 @@ def autosave(world, url: str, **meta):
         return None
 
 
-DESTRUCTIVE = re.compile(
-    r"\b(delete|remove|destroy|deactivate|cancel|unsubscribe|revoke|archive|"
-    r"reset|clear|purge|close account|log ?out|sign ?out)\b",
-    re.IGNORECASE,
-)
-
-
 @dataclass(frozen=True)
 class Budget:
     """Hard caps. Every crawler in the literature has these and no crawler
@@ -113,14 +108,6 @@ class Budget:
     # structure is near its entry, and anything past this is reachable on a
     # later pass with a deeper budget once the shallow map is known.
     max_depth: int = 4
-
-
-def is_safe(descriptor: str) -> bool:
-    """Default guard. Sign-out is excluded for a boring reason as well as a
-    safe one: it ends the session and every subsequent replay lands on a login
-    page, so one click poisons the rest of the crawl.
-    """
-    return not DESTRUCTIVE.search(descriptor)
 
 
 def _same_origin(entry: str, url: str) -> bool:
