@@ -98,6 +98,38 @@ uv run python -m agents.explorer.probe     # is the state projection right? (no 
 uv run python -m agents.explorer.crawler <url>   # map an app, print states/transitions/gaps
 ```
 
+### Credentials are redacted at record time, and only there
+
+An `Observation` is persisted verbatim, and it has **three** fields that can
+carry what a form was filled with — `snapshot`, `url`, and `network` — all
+reaching `StateObservation`, with `url` reaching `AppState` and
+`artifacts/runs/*.json` as well. Measured on this workspace's own database on
+2026-09-05, before `observer.redact_snapshot` / `redact_url` existed:
+
+| Path | Rows | What was in them |
+|---|---|---|
+| `snapshot` | 108 | a `Password` node's value — the a11y tree *does* expose it while the field holds one |
+| `url` | 48 | a GET form's `password=`; two distinct values, **neither** producible by `synth.py` |
+| `network` | 39 | the same credential again, in a recorded request URL |
+
+Nothing masked any of it and no browser behaviour was protecting it. Redaction
+happens in `observe()`, before the `Observation` is constructed, so plaintext
+never enters one and no consumer has to know — masking at render time would be
+too late, because by then it is in `app.db`.
+
+Two properties hold it together, and `agents.probe` checks both. The placeholder
+must be **non-empty**: `statekey.field_value` maps `""` to `""` and anything
+else to `filled`, so an empty redaction would collapse a filled field into an
+unfilled one and merge the post-rejection error state with the pristine form.
+And a URL carrying no secret is returned **byte-identical** rather than
+re-encoded, because the URL is evidence.
+
+`make scrub` fixes what was recorded before this existed. It rewrites rather
+than deletes, so every run, state key and transition survives — `make reset`
+also removes the credentials, by removing the evidence. It reads through raw
+SQL on purpose: the databases that need scrubbing are old ones, and an old
+database is exactly the one whose schema has drifted, so the ORM cannot open it.
+
 ### Every model call leaves a transcript
 
 `agents/tracing.py:save_transcript` is called by all five: the orchestrator, each
@@ -155,10 +187,22 @@ OPENROUTER_API_KEY                  # probed FIRST by llm.load(), on cost. One
                                     # 2026-09-04 at $0.089 on qwen3-coder-next
                                     # vs ~$3.42 on claude-opus-5 — 112 runs per
                                     # $10 against 3. Optional companions:
-                                    # OPENROUTER_MODEL (any model string) and
+                                    # OPENROUTER_MODEL (any model string),
                                     # OPENROUTER_BASE_URL, which repoints the
                                     # same OpenAICompat class at DeepSeek,
-                                    # Groq, Cerebras or a local Ollama
+                                    # Groq, Cerebras or a local Ollama, and
+                                    # OPENROUTER_MAX_TOKENS. That last one
+                                    # exists because OpenRouter refuses a
+                                    # request it cannot afford *at the
+                                    # requested cap* rather than at the tokens
+                                    # produced: on a nearly-empty balance
+                                    # max_tokens=4096 is a 402 while the same
+                                    # call at 512 succeeds for a fraction of a
+                                    # cent — and the key still reports $9.81 of
+                                    # $10 left, so it reads as a broken key
+                                    # rather than an empty account. Default
+                                    # 4096; lower it only when the alternative
+                                    # is not running at all
 ANTHROPIC_API_KEY / GEMINI_API_KEY  # llm.load() picks a provider by whichever
                                     # is present. With none of the three, a
                                     # console run degrades to
@@ -377,6 +421,7 @@ make probe     # 149 observable checks. No API key, no quota
 make gaps      # crawl an app and rank what the crawl did not cover
 make specs     # write generated .spec.ts, then run them with Playwright
 make check     # typecheck + lint — run before handing work off
+make scrub     # redact credentials already recorded (keeps every run)
 make reset     # wipe the database and artifacts
 make stop      # kill the servers
 ```

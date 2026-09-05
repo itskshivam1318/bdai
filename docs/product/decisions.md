@@ -488,3 +488,59 @@ serving the second identical form shape from cache, and the critic filing a
 transcript under its run that can reconstruct the call.
 
 **Who:** shivam + Claude, on `work/agent-forensics`.
+
+## 2026-09-05 09:20 — Credentials are redacted at record time, in the observer
+
+`Observation` is persisted verbatim and has three fields that can carry what a
+form was filled with. All three were carrying credentials, and nothing masked
+any of them. Measured on this workspace's `app.db`:
+
+    snapshot   108 rows, a Password node's value, one distinct value, synthetic
+    url         48 rows, a GET form's password=, two distinct values, NEITHER
+                producible by synth.py -- both from a configured AIVAR_PASSWORD
+    network     39 rows, the same credential again in a request URL
+
+**The decision:** redact in `Observer.observe()`, before the `Observation` is
+constructed. It is the one point where all three fields are built, so plaintext
+never enters an `Observation` and every downstream consumer — `store`,
+`autosave`, the transcripts, the console — is covered without knowing redaction
+exists. Render-time masking was rejected: by then the plaintext is in `app.db`.
+
+**Keyed on names, not values.** A field's accessible name and a query
+parameter's name are matched against a secret-name pattern. Value-matching is
+the backstop only, and only for a configured `AIVAR_PASSWORD` of four
+characters or more — `synth.py`'s fallback password is `x`, and redacting every
+letter x would destroy the evidence the record exists for.
+
+**Two constraints, both checked:**
+
+- The placeholder must be non-empty. `statekey.field_value` maps `""` to `""`
+  and anything else to `filled`, so an empty redaction merges the post-rejection
+  error state with the pristine form. `state_key` hashes the snapshot alone, so
+  the URL half cannot move identity at all.
+- A URL with no secret comes back byte-identical. The URL is evidence, and a
+  round trip through `urlencode` would rewrite every other parameter's escaping
+  for nothing.
+
+**`make scrub` rewrites; it does not delete.** `make reset` also removes the
+credentials — by removing the runs, which makes remediation and history loss the
+same button. Scrubbing keeps every row and changes only the secret: verified at
+108/48/39 → 0/0/0 on a copy, with all 57 state keys and 258 transitions
+identical, and idempotent on a second run. It reads through raw SQL because the
+databases that need scrubbing are old ones, and this workspace's own `app.db`
+predates `AppState.fields` — `select(AppState)` raises `no such column` on
+exactly the data that most needs the fix.
+
+**How this was found, because the method matters more than the finding.** Three
+sessions converged on it from three directions and the first two answers were
+both wrong. Reasoning from `statekey.field_value` — which reduces input to
+presence — says values are not stored; that is the projection, and
+`StateObservation` is the record. Testing it *after* a submit shows no password;
+that is the navigation having cleared the input. The window is mid-fill, which
+is when the crawler observes a rejected or non-navigating submit.
+
+**Severity:** local disk only. `artifacts/` is gitignored bar `.gitkeep` and
+`app.db` is untracked, so nothing reached git.
+
+**Who:** shivam + Claude on `work/agent-forensics`; snapshot path found by
+bdai-68, URL path by bdai-16, network path and the fix by this session.

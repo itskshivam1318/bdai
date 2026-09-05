@@ -25,7 +25,7 @@ export API_PORT
 endif
 
 .DEFAULT_GOAL := help
-.PHONY: help setup dev api web smoke probe pipeline loop generate specs gaps explore crawl trace diff runs mcp mcp-probe worktree list rm check reset stop
+.PHONY: help setup dev api web smoke probe pipeline loop generate specs gaps explore crawl trace diff runs mcp mcp-probe worktree list rm check scrub reset stop
 
 PY_VERSION := 3.12
 
@@ -108,6 +108,9 @@ rm: ## Remove a worktree, keeping its branch (add force=1 if dirty)
 
 check: ## Typecheck and lint the frontend
 	cd web && npx tsc --noEmit && npm run lint
+
+scrub: ## Redact credentials already recorded in the database (keeps every run)
+	cd api && uv run python -m agents.explorer.store
 
 reset: ## Wipe this worktree's database and artifacts (no migrations here)
 	rm -f api/app.db

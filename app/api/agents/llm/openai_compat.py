@@ -225,13 +225,34 @@ class OpenAICompat:
 
         raise RuntimeError("unreachable")
 
+    @property
+    def max_tokens(self) -> int:
+        """Output cap, overridable by `OPENROUTER_MAX_TOKENS`.
+
+        A knob because OpenRouter refuses a request it cannot afford *at the
+        requested cap*, not at the tokens actually produced: with a nearly-empty
+        balance, `max_tokens=4096` is rejected with "you requested up to 4096
+        tokens, but can only afford 2311" while the identical call at 512
+        succeeds and costs a fraction of a cent. So a run can die on a 402 with
+        the key reporting $9.81 of $10 still available, which reads as a broken
+        key rather than an empty account.
+
+        4096 stays the default because lowering it silently truncates a long
+        tool call. Set it deliberately, and only when the alternative is not
+        running at all.
+        """
+        import os
+
+        raw = os.environ.get("OPENROUTER_MAX_TOKENS", "")
+        return int(raw) if raw.isdigit() and int(raw) > 0 else 4096
+
     def turn(
         self, system: str, transcript: Transcript, tools: list[Tool]
     ) -> Turn:
         body = self._post(
             {
                 "model": self.model,
-                "max_tokens": 4096,
+                "max_tokens": self.max_tokens,
                 "messages": self._messages(system, transcript),
                 "tools": self._tools(tools),
                 "tool_choice": "auto",
