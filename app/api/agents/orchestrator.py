@@ -87,6 +87,16 @@ class Exploration:
     flows: tuple[dict, ...] = ()
     gaps: tuple[str, ...] = ()
     stopped: str = "budget"  # covered | plateau | budget | error
+    #: Why, in the words a human should read, when `stopped` alone does not say
+    #: enough. Empty on every clean ending -- `covered` explains itself.
+    #:
+    #: It exists because `stopped` is a *category* and the console needs a
+    #: *sentence*. A provider 402 arrives carrying the number that would have
+    #: worked and the URL that fixes it; collapsing that to `"error"` and
+    #: putting the sentence only in `gaps` left `run.summary` reading
+    #: "stopped: error" -- see `routers/explore.summary_for`, which is the one
+    #: consumer that matters and the reason this is a field and not a log line.
+    stopped_because: str = ""
     waves: int = 0
     transcript_path: str | None = None
 
@@ -281,10 +291,18 @@ def run(
             # better answered by ending the run with what it has.
             emit("error", f"orchestrator call failed: {type(exc).__name__}: {exc}")
             result.stopped = "error"
-            result.gaps = result.gaps + (
+            # One sentence, two homes, because they answer different questions.
+            # `gaps` is the coverage story -- what the suite does not cover and
+            # why. `stopped_because` is the health story, and it is the one the
+            # console's status disclosure reads. Writing it only into `gaps`
+            # made a run that died on an exhausted key indistinguishable, in
+            # the header, from one that finished.
+            reason = (
                 f"The colony stopped early: the model call failed ({exc}). "
-                "The map below is what had been walked when it did.",
+                "The map below is what had been walked when it did."
             )
+            result.stopped_because = reason
+            result.gaps = result.gaps + (reason,)
             break
 
         if turn.done:

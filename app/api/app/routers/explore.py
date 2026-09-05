@@ -130,6 +130,7 @@ def status_for(
     incomplete: bool,
     modelled: bool,
     unmatched: int = 0,
+    halted: bool = False,
 ) -> str:
     """The badge, from everything the run learned. One place, so it is checkable.
 
@@ -145,6 +146,14 @@ def status_for(
     proven = sum(1 for violation in violations if violation.rule in _PROVABLE)
     if tally[runner.DEFECT] or tally[runner.ESCALATE] or proven or incomplete:
         return "failed"
+    if halted:
+        # The colony stopped on a provider error -- an exhausted key, a dead
+        # route -- and the map is whatever it had walked by then. Green would
+        # claim a full exploration happened. `failed` is the other wrong
+        # answer: it is red, it reads as "your application is broken", and
+        # nothing about the application misbehaved. Same argument as the
+        # uncovered claim below, same verdict.
+        return "degraded"
     if unmatched:
         # A claim the user typed that no scenario exercises. Not `failed`:
         # nothing about the application misbehaved, and saying otherwise libels
@@ -154,6 +163,38 @@ def status_for(
         # full one" case it already exists for.
         return "degraded"
     return "passed" if modelled else "degraded"
+
+
+def summary_for(
+    result: orchestrator.Exploration,
+    states: int,
+    scenarios: int,
+    needing_attention: int,
+    modelled: bool,
+) -> str:
+    """The one line the console's status disclosure shows. One place, so it is
+    checkable -- the same argument `status_for` makes one function above.
+
+    The order is the point. A run that *stopped* explains itself before a run
+    that *finished* does, because `Exploration.summary` is only ever written by
+    the colony's own `finish` call and is therefore empty on exactly the paths
+    a human most needs a sentence for. Before this existed the expression was
+    inline and read `result.summary or f"stopped: {result.stopped}"`, so a 402
+    that had named the affordable token count and the URL to fix it reached the
+    header as the word "error".
+    """
+    if result.stopped_because:
+        return result.stopped_because
+    if result.summary:
+        return result.summary
+    if not modelled:
+        return (
+            f"{states} states, {scenarios} scenarios, {needing_attention} "
+            f"needing attention -- crawled without a model. Set "
+            f"OPENROUTER_API_KEY (cheapest), ANTHROPIC_API_KEY or "
+            f"GEMINI_API_KEY for flows and a summary."
+        )
+    return f"stopped: {result.stopped}"
 
 
 def _crawl_only(
@@ -806,16 +847,19 @@ def _explore(
                 # browser.
                 incomplete = not plan or len(results) != len(plan)
                 run.status = status_for(
-                    tally, violations, incomplete, provider is not None, len(unmatched)
+                    tally,
+                    violations,
+                    incomplete,
+                    provider is not None,
+                    len(unmatched),
+                    halted=bool(result.stopped_because),
                 )
-                run.summary = result.summary or (
-                    f"{len(result.world.states)} states, {len(plan)} scenarios, "
-                    f"{tally[runner.DEFECT] + tally[runner.ESCALATE]} needing "
-                    f"attention -- crawled without a model. Set "
-                    f"OPENROUTER_API_KEY (cheapest), ANTHROPIC_API_KEY or "
-                    f"GEMINI_API_KEY for flows and a summary."
-                    if provider is None
-                    else f"stopped: {result.stopped}"
+                run.summary = summary_for(
+                    result,
+                    states=len(result.world.states),
+                    scenarios=len(plan),
+                    needing_attention=tally[runner.DEFECT] + tally[runner.ESCALATE],
+                    modelled=provider is not None,
                 )
                 if unmatched:
                     # The header disclosure reads `run.summary`, and it is the
