@@ -266,6 +266,77 @@ AGENTS = {
 }
 
 
+# How many unanswered questions one wave may add to the run's report. A filter
+# that is right about the common case still needs a bound for the run where it
+# is wrong -- the same argument as `ASSERTION_CAP`.
+DOUBT_CAP = 5
+
+
+def standing_doubts(reports, wave: int) -> tuple[tuple[str, str, str], ...]:
+    """(ant tag, state key, doubt) for every ant that raised one. Pure.
+
+    These reach the run's **report**, and deliberately not the orchestrator's
+    prompt. Both halves were built; the second was measured and removed.
+
+    **Why not the prompt.** The obvious move is to restate unanswered doubts
+    every wave, the way `perished` is restated, and the argument looks
+    identical: a fact mentioned in wave 2 competes with everything since. Two
+    measurements from a peer session's saucedemo run say otherwise.
+
+    First, a doubt is not lost. `transcript.exchanges` only ever appends, so
+    wave 1's feedback -- reports and all -- is still in context at wave 3. The
+    failure is dilution, not disappearance, and the decisive case shows
+    restatement would not have fixed it: the wave-2 ant at 3cada78a asked
+    "whether cb977164 is genuinely the inventory page", that doubt *was* in the
+    wave-3 dispatch context by the mechanism above, and the orchestrator opened
+    wave 3 with "the login door is cracked (standard_user -> 5a98e093 =
+    inventory)" regardless. The refutation was present and was not heeded.
+
+    Second, the volume is wrong for a standing list. All 12 ants in that run
+    raised `uncertain`, and most of it reports the ant's own limits rather than
+    a doubt about the application -- "I cannot read the rendered page content",
+    "I never actually saw the field labels". Nine of the twelve cite a state
+    key, so the citation rule that works in `behavior.admit` does not separate
+    them here either. Restating a dozen of those under a heading calling each
+    one worth settling would add noise to the exact context window whose
+    signal-to-noise had already lost to a fabricated premise.
+
+    `perished` is the precedent and the contrast: it is computed (`navigate`
+    returned None), rare, and machine-checkable. A doubt is self-reported model
+    prose and is apparently universal. The two do not belong in the same
+    mechanism.
+
+    What survives is the honest half: an unanswered question is a coverage gap
+    of the most useful kind, because it names where to look, and it belongs in
+    the report where a human reads it.
+
+    **And only when it is the ant's whole output.** The volume problem does not
+    disappear by moving one layer down -- `Exploration.gaps` renders as "WHAT
+    WE DID NOT REACH", which in that saucedemo run is a single line, and folding
+    in twelve self-reported limitations would make it thirteen in the section
+    whose entire job is an honest account of the run's blind spots. A judge
+    reads that section; at least the prompt had a model reading it.
+
+    So the gate is `actions_taken == 0`: computed, not semantic. An ant that
+    acted has told us something whether or not it was also uncertain. An ant
+    that produced nothing but a doubt is reporting that the assignment was
+    impossible, and that is a gap by any definition. Measured against the same
+    12 ants -- every one of which took between one and four actions -- this
+    carries none of them, and the section stays the one honest line it was.
+
+    Capped as well as filtered, on the `ASSERTION_CAP` precedent: a filter that
+    is right about the common case still has to be bounded for the run where it
+    is wrong.
+    """
+    carried = tuple(
+        (f"w{wave}a{index + 1}", report.start_key, report.uncertain.strip())
+        for index, report in enumerate(reports)
+        if getattr(report, "uncertain", "").strip()
+        and not getattr(report, "actions_taken", 0)
+    )
+    return carried[:DOUBT_CAP]
+
+
 def ant_provider_for(budget: Budget, provider: Provider) -> Provider:
     """Which model drives the ants. Called once, before the first wave.
 
@@ -416,6 +487,7 @@ def run(
             waves_left=budget.max_waves,
             ants_left=budget.max_ants,
             behaviour=result.behaviour,
+            credentials=credentials,
         )
     )
     ants_left = budget.max_ants
@@ -436,6 +508,11 @@ def run(
     # a `Add to cart` had already destroyed -- a third of the colony's budget
     # spent arriving nowhere.
     perished: set[str] = set()
+
+    # Every doubt any ant raised, accumulated across waves for the report. Not
+    # fed back into the prompt -- see `standing_doubts` for the measurements
+    # that decided that.
+    unsettled: list[tuple[str, str, str]] = []
 
     for wave in range(budget.max_waves):
         if time.monotonic() > deadline or ants_left <= 0:
@@ -494,7 +571,9 @@ def run(
             # One gate for the state id and the agent name, shared with the
             # probe so an agent advertised in the schema and missing from
             # `AGENTS` fails a check rather than a demo.
-            refusal = tools.refuse_assignment(world, assignment)
+            refusal = tools.refuse_assignment(
+                world, assignment, credentials=credentials
+            )
             if refusal is not None:
                 rejected.append(refusal)
                 continue
@@ -595,6 +674,7 @@ def run(
 
         result.reports += wave_reports
         result.waves = wave + 1
+        unsettled += standing_doubts(wave_reports, wave=wave + 1)
 
         # The wave is the honest unit: ants mutate `world` as they go, but only
         # here is it a settled account of what the colony knows. Failure to save
@@ -614,6 +694,7 @@ def run(
             ants_left=ants_left,
             behaviour=result.behaviour,
             results=result.experiments,
+            credentials=credentials,
         )
         if perished:
             # Stated every wave, not once. The orchestrator's context is the
@@ -649,6 +730,13 @@ def run(
         )
 
     result.results = colony.verdicts
+
+    # Carried into the run's own account. An unanswered question is a coverage
+    # gap of the most useful kind -- it names where to look -- and reporting it
+    # only to the model that could have acted on it wastes it.
+    result.gaps = result.gaps + tuple(
+        f"unsettled by {tag} at [{key[:8]}]: {doubt}" for tag, key, doubt in unsettled
+    )
 
     # Ruled on at the end rather than at synthesis, because the map is bigger
     # now: an invariant about an edge no ant had walked when it was proposed is

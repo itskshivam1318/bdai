@@ -20,6 +20,8 @@ the colony's knowledge as two numbers.
 
 from __future__ import annotations
 
+import re
+
 from .explorer.observer import Observation
 from .explorer.worldmap import WorldMap
 from .llm import Tool
@@ -234,15 +236,66 @@ FINISH = Tool(
 ORCHESTRATOR_TOOLS = [DISPATCH, FINISH]
 
 
-def refuse_assignment(world: WorldMap, assignment: dict) -> str | None:
+# A literal credential pair written into an instruction: `standard_user /
+# secret_sauce`, `admin:hunter2`. Both tokens have to be substantial, so an
+# ordinary sentence with a stray slash does not match.
+_PAIR = re.compile(
+    r"[A-Za-z0-9._\-@+]{3,}\s*[/:]\s*[A-Za-z0-9._\-@+!$%^&*]{3,}"
+)
+# Anything that looks like a URL or a path is removed before scanning, because
+# `example.com/login` is a pair by shape and not by meaning.
+# `\S+` after the slash, not `\S*`: a bare " / " between two words is the most
+# common way a person writes a credential pair, and a pattern that allowed an
+# empty tail deleted exactly that slash and let the pair through.
+_URLISH = re.compile(r"\S*://\S*|(?<![A-Za-z0-9])/\S+")
+_CREDENTIAL_WORDS = re.compile(
+    r"\b(log ?in|sign ?in|credential|username|user name|password|account)\b",
+    re.IGNORECASE,
+)
+
+
+def names_credentials(instruction: str) -> bool:
+    """Does this instruction spell out a username and password to type?
+
+    Both signals are required -- a literal pair *and* a credential word -- and
+    that is deliberate. This gate reads free text written by a model, and a
+    rule that fires on a slash alone would refuse "follow the /cart link" and
+    silently forbid ordinary exploration. A false refusal costs a wave; the
+    thing it is guarding against costs a wave too, so there is no reason to
+    trade one for several.
+    """
+    text = _URLISH.sub(" ", instruction or "")
+    return bool(_PAIR.search(text)) and bool(_CREDENTIAL_WORDS.search(text))
+
+
+def refuse_assignment(
+    world: WorldMap, assignment: dict, credentials=None
+) -> str | None:
     """Why this assignment cannot be run, or None if it can.
 
-    One gate for both halves of a dispatch, because they fail the same way and
+    One gate for every half of a dispatch, because they fail the same way and
     used to fail differently: an unresolvable state id was refused with a
     message the orchestrator could act on, and an unrecognised agent name was
     not checked at all -- there was only one kind of agent, so there was nothing
     to check. Adding kinds without adding this would make a typo run an ant and
     report it as a generator.
+
+    **The third check is about what an ant can physically do.** Measured on a
+    saucedemo run: the orchestrator instructed three separate ants to "submit
+    standard_user / secret_sauce", and an ant has no mechanism for that --
+    `forms.value_for` fills every field from the `Credentials` the run was
+    constructed with, which come from `AIVAR_USERNAME` / `AIVAR_PASSWORD`. With
+    those unset each ant typed the built-in default, failed to log in, and
+    returned "3 actions, 0 new states". The orchestrator read three identical
+    dead ends as a fact about the application rather than about its own plan.
+
+    `behavior.admit` catches a false *claim* after the fact. This catches a
+    false *plan* before the ants are spent, which is the only moment the budget
+    is still recoverable.
+
+    `credentials=None` means the caller did not say, and the gate stays inert
+    rather than guessing -- refusing on an unknown is how a guard starts costing
+    more than the bug.
 
     A missing `agent` is an ant. The field is required by the schema, but the
     schema is advice to a model and this is the runtime.
@@ -262,6 +315,19 @@ def refuse_assignment(world: WorldMap, assignment: dict) -> str | None:
             f"{kind!r} is not an agent this colony has. Choose one of: "
             + ", ".join(AGENT_KINDS)
         )
+
+    instruction = str(assignment.get("instruction", ""))
+    if credentials is not None and not credentials and names_credentials(instruction):
+        return (
+            "this instruction names a username and password to type, and an "
+            "agent cannot do that -- every field is filled from the "
+            "credentials the run was started with (AIVAR_USERNAME / "
+            "AIVAR_PASSWORD), and this run holds none. An agent sent anyway "
+            "will type a built-in placeholder, fail to log in, and come back "
+            "with nothing, which looks exactly like a dead end in the "
+            "application. Send it to explore what is reachable without logging "
+            "in, and record the login wall as a gap"
+        )
     return None
 
 
@@ -273,6 +339,7 @@ def brief(
     ants_left: int,
     behaviour=None,
     results: list | None = None,
+    credentials=None,
 ) -> str:
     """The orchestrator's view: the whole map, coarsely, plus the last wave.
 
@@ -307,8 +374,29 @@ def brief(
         f"world map: {len(world.states)} states, {edges} transitions, "
         f"{len(world.frontier())} actions never tried",
         "",
-        "states:",
     ]
+
+    # Stated up front rather than only in a refusal. An orchestrator that has
+    # to be refused before it learns the run holds no credentials has already
+    # spent the wave it was refused on.
+    if credentials is not None:
+        lines += [
+            "credentials: "
+            + (
+                "configured -- an agent sent at a login form will use them. Do "
+                "not write the username or password into an instruction; they "
+                "are filled automatically."
+                if credentials
+                else "NONE. Nothing behind a login wall is reachable this run. "
+                "Do not instruct an agent to log in with particular values -- "
+                "it cannot type them, and it will come back empty in a way that "
+                "looks like a dead end in the application. Treat the login wall "
+                "as a gap and explore what is in front of it."
+            ),
+            "",
+        ]
+
+    lines += ["states:"]
 
     for key, node in world.states.items():
         tried = sum(
@@ -339,6 +427,7 @@ def brief(
             lines += ["", report.render()]
     else:
         lines += ["", "no ants have reported yet -- this is the first wave."]
+
 
     # The semantic layer, when one exists. This is what turns the orchestrator
     # from a walker into something that reasons: the map says where it has not

@@ -197,6 +197,13 @@ class Budget:
     # wave left after exploring.
     colony_waves: int = 4
     colony_ants: int = 6
+    # The colony's own wall-clock, and it must not be the crawl's. It was, and
+    # that was the bug: `explore_seconds` bounds page loads, while a colony
+    # second buys one model call. Measured 2026-09-05 on a free route -- with
+    # 180s the colony finished ONE wave of four ants and stopped on budget with
+    # `experiments=0`, so raising `colony_waves` to 4 changed nothing. Waves are
+    # not the binding constraint; time is.
+    colony_seconds: float = 420.0
 
 
 def addressable(gaps: tuple[Gap, ...], has_synthesizer: bool) -> tuple[Gap, ...]:
@@ -292,7 +299,7 @@ def run(
             budget=ColonyBudget(
                 max_waves=budget.colony_waves,
                 max_ants=budget.colony_ants,
-                max_seconds=max(30, int(budget.explore_seconds)),
+                max_seconds=budget.colony_seconds,
             ),
             credentials=credentials,
             synthesizer=synthesizer,

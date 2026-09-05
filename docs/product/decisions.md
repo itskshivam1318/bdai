@@ -1159,4 +1159,68 @@ map produced a claim, the claim produced a mission.
   is 4 waves rather than 3 — a prompt-level fix for a budget-level problem, and
   it is not guaranteed.
 
+**Found by a peer session, after the fact, and worth recording as fixtures.**
+A read-only session running the pipeline against seven public targets at HEAD
+produced two things this design should have caught and one it did:
+
+- *A false plan.* The orchestrator instructed three ants to "submit
+  standard_user / secret_sauce". An ant cannot do that -- `forms.value_for`
+  fills every field from `Credentials.from_env()` -- so each typed the built-in
+  placeholder, failed, and returned "3 actions, 0 new states", which the
+  orchestrator read as a fact about the application. Now refused by
+  `tools.refuse_assignment` before the ants are spent, and stated up front in
+  `brief()`, because being refused still costs the wave you were refused on.
+- *A false premise nothing catches.* The same wave opened "the login door is
+  cracked (standard_user -> 5a98e093 = inventory)" when 5a98e093 is the login
+  page and the crawl never left `/`. It names no credential, so the mission gate
+  passes it; it cites a state that exists, so `admit()` admits it. **`admit`
+  checks that a citation exists, not that the sentence about it is true.** No
+  rule in `RULES` can express "state X is post-login", and none was added.
+- *A refutation that arrived, was in context, and was ignored.* An ant asked
+  "whether cb977164 is genuinely the inventory page, or is still the login
+  page" and flagged it in `uncertain`. **The colony detected the fabrication.**
+  My first reading was that the doubt had gone stale -- `brief(reports=...)`
+  renders the latest wave only -- and I built a standing list on that basis.
+  That reading was wrong and the peer caught it: `transcript.exchanges` only
+  ever appends, so wave N's feedback is still in context at wave N+2. The doubt
+  was in the wave-3 dispatch context and the orchestrator opened wave 3 with
+  the fabrication anyway. The failure is dilution and inattention, not
+  disappearance, and restating the doubt would not have fixed it.
+
+  **So the prompt half was built and then removed**, which is the entry worth
+  keeping. Two measurements killed it: the decisive doubt was already present
+  and unheeded, and *all 12* ants in that run raised `uncertain` -- mostly
+  their own limits ("I cannot read the rendered page content"), with 9 of 12
+  citing a state key, so the citation rule that works in `admit()` does not
+  separate signal from noise here. Restating a dozen of those every wave adds
+  noise to the one context window whose signal-to-noise had already lost.
+  `perished` is the precedent and the contrast: computed, rare, machine-checkable.
+  A doubt is self-reported prose and universal.
+
+  What survives is `standing_doubts()` folding unanswered questions into
+  `Exploration.gaps` -- **and only when the doubt is the ant's whole output.**
+  The volume problem does not disappear by moving one layer down: that section
+  renders as "WHAT WE DID NOT REACH" and is a single line in the measured run,
+  so twelve self-reported limitations would make it thirteen in the part of the
+  report whose entire job is an honest account of the blind spots, read by a
+  judge rather than by a model. The gate is `actions_taken == 0` -- computed,
+  not semantic. An ant that acted has told us something either way; an ant that
+  produced nothing but a doubt is saying the assignment was impossible, which
+  is a gap by any definition. Measured against the same 12 ants, every one of
+  which took between one and four actions: it carries none of them. Capped at
+  five as well as filtered, on the `ASSERTION_CAP` precedent -- a filter that is
+  right about the common case still needs a bound for the run where it is not.
+
+**The fixture for whoever builds reconciliation.** In that one wave, one ant
+refuted the fabrication and another repeated it -- "on the initial page,
+submit[valid] leads to inventory (5a98e093)" -- same state key, same wave,
+nothing to reconcile them. Two cited claims about one key that cannot both hold
+is the shape of the check, and it needs a `RULES` entry that can express the
+claim before it can rule on the pair.
+
+**Also observed, not fixed:** a seeded map of 4 states produced 53 transitions
+across those same 4 states, the same edge recorded up to five times. The ants
+re-walked known edges and added nothing. That is a cost bug, not a correctness
+one, and it is untouched.
+
 **Who:** shivam + Claude.
