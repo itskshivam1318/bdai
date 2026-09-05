@@ -603,6 +603,27 @@ def _source(module, needle: str) -> str:
     return text if needle in text else ""
 
 
+def _function_source(module, name: str) -> str:
+    """Just one function's body, not the module it lives in.
+
+    `_source` answers "does this text appear anywhere in the file", which is
+    the right question for some checks and the wrong one for any check that
+    counts. A count over the whole module sees the helper *definitions* too --
+    `redact_url` appears in observer.py whether or not anything calls it -- so
+    a check written on `_source` would report a passing count for a function
+    that redacts nothing. Found exactly that way: the redaction check below
+    read 3 and 2 over the module where the function contains 2 and 1.
+    """
+    import ast
+    import inspect
+
+    text = inspect.getsource(module)
+    for node in ast.walk(ast.parse(text)):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return ast.get_source_segment(text, node) or ""
+    return ""
+
+
 def main() -> int:
     print("AGENTS      scripted provider, real browser, no API key\n")
     ok = True
@@ -1463,6 +1484,42 @@ def main() -> int:
             f"{plain} -> {redact_url(plain)}",
         )
 
+        # Scrubbing the database is not the whole remediation, and believing it
+        # was is the mistake this check exists to stop repeating. `autosave`
+        # writes the same url into artifacts/runs/*.json, and a model repeats
+        # what it read into a transcript -- 17 files here still carried a
+        # credential after `make scrub` reported the database clean.
+        import json as _json
+        import tempfile
+
+        from .explorer.store import scrub_artifacts
+
+        yard = Path(tempfile.mkdtemp())
+        (yard / "runs").mkdir()
+        (yard / "runs" / "a.json").write_text(
+            _json.dumps({"url": "http://x/sut?email=a%40b.com&password=hunter2"})
+        )
+        (yard / "runs" / "clean.json").write_text(_json.dumps({"url": "http://x/sut?v=1"}))
+        (yard / "note.png").write_bytes(b"\x89PNG not text")
+
+        touched = scrub_artifacts(yard)
+        after = (yard / "runs" / "a.json").read_text()
+        ok &= check(
+            "a credential in an artifact file is redacted too",
+            "hunter2" not in after and touched["files"] == 1,
+            f"{touched} :: {after}",
+        )
+        ok &= check(
+            "the scrubbed artifact is still valid JSON",
+            _json.loads(after).get("url", "").startswith("http://x/sut?email="),
+            after,
+        )
+        ok &= check(
+            "a second scrub changes nothing",
+            scrub_artifacts(yard)["files"] == 0,
+            "scrubbing is not idempotent -- re-running would churn every file",
+        )
+
         # 6. The meta-agent. The brief's headline requirement is that nobody
         #    chooses the stages, so what these check is the *deciding*, not the
         #    stages -- each of which is already covered above.
@@ -2126,12 +2183,32 @@ def _navigation_checks() -> bool:
     # forget, and it does not exist yet to be tested behaviourally.
     from .explorer import observer as observer_mod
 
+    body = _function_source(observer_mod, "_observation")
     built = _source(observer_mod, "_observation").count("return Observation(")
     ok &= check(
         "an Observation is constructed in exactly one place",
         built == 1,
         f"{built} construction sites; a property that must hold of all of them "
         "now has to be repeated, and repeated is where it drifts",
+    )
+    # The check above counts construction sites. It does not say what that one
+    # site *does*, and the comment above it claims redaction -- so an empty
+    # `_observation` returning `self.page.url` raw satisfies it perfectly.
+    # That is not hypothetical: it is precisely the shape this function had on
+    # the branch that introduced it, because the redaction helpers lived on the
+    # other branch. Each half was covered and the join between them was not,
+    # which is where two independent merges landed today.
+    #
+    # Counted rather than parsed because position matters and arity does not:
+    # two `redact_url` -- the page's own url and each network event's -- and
+    # one `redact_snapshot`, whose result must also be what `parse_snapshot`
+    # reads, since a parsed Element carries the node's value too.
+    urls, snapshots = body.count("redact_url("), body.count("redact_snapshot(")
+    ok &= check(
+        "every Observation is built from redacted parts",
+        urls == 2 and snapshots == 1,
+        f"redact_url x{urls}, redact_snapshot x{snapshots} in _observation -- "
+        "wanted the page url, every network event's url, and the snapshot",
     )
 
     ok &= check(
