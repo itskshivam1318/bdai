@@ -7,6 +7,7 @@ else here is ordinary CRUD; the interesting scoping lives in `canvas.py` and
 """
 
 from typing import Optional
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
@@ -55,6 +56,11 @@ def list_sessions(session: Session = Depends(get_session)):
 @router.post("", response_model=TestSession, status_code=201)
 def create_session(body: TestSession, session: Session = Depends(get_session)):
     body.id = None
+    # Issued here, never accepted from the caller. Two sessions sharing a uid
+    # would share a kept suite, which is the whole thing the uid prevents --
+    # and `id = None` above already establishes that identity is the server's
+    # to hand out.
+    body.uid = uuid4().hex[:12]
     session.add(body)
     session.commit()
     session.refresh(body)

@@ -457,8 +457,8 @@ def _suites_are_per_session() -> bool:
     ok = True
 
     url = "https://shared.example"
-    mine = regression.directory_for(url, session_id=1)
-    yours = regression.directory_for(url, session_id=2)
+    mine = regression.directory_for(url, session_uid="aaaa1111bbbb")
+    yours = regression.directory_for(url, session_uid="cccc2222dddd")
     cli = regression.directory_for(url)
 
     ok &= check(
@@ -470,6 +470,14 @@ def _suites_are_per_session() -> bool:
         "and neither is the command line's",
         cli != mine and cli != yours and cli.name == "shared-example",
         f"cli={cli.name} session={mine.name}",
+    )
+    # The whole reason it is the uid: `make reset` reissues row numbers and
+    # leaves `artifacts/` alone, so a directory named after `TestSession.id`
+    # is handed to the next database's first session.
+    ok &= check(
+        "a session's suite is named after something a reset cannot reissue",
+        "aaaa1111bbbb" in mine.name and "-s1" not in mine.name,
+        f"named {mine.name}",
     )
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -486,6 +494,7 @@ def _suites_are_per_session() -> bool:
         client = TestClient(app)
 
         with Session(engine) as session:
+            # Two sessions, the same URL, no context in common -- the report.
             first, second = TestSession(target_url=url), TestSession(target_url=url)
             session.add(first)
             session.add(second)
@@ -500,7 +509,13 @@ def _suites_are_per_session() -> bool:
             session.refresh(recorded)
             session.refresh(fresh)
             first_id, second_id = recorded.id, fresh.id
-            owner = first.id
+            owner = first.uid
+            ok &= check(
+                "each session is issued its own id, unrelated to its row number",
+                bool(first.uid) and first.uid != second.uid
+                and first.uid != str(first.id),
+                f"{first.uid!r} / {second.uid!r}",
+            )
 
         scenario = Scenario(
             name="sign in",
@@ -526,7 +541,7 @@ def _suites_are_per_session() -> bool:
             # Only the first session ever recorded anything.
             regression.emit(
                 (scenario,),
-                regression.directory_for(url, session_id=owner),
+                regression.directory_for(url, session_uid=owner),
                 because="recorded by the probe",
                 target_url=url,
                 source="map",
@@ -547,6 +562,17 @@ def _suites_are_per_session() -> bool:
                 "and its download is a 404 rather than someone else's zip",
                 client.get(f"/api/runs/{second_id}/suite/download").status_code == 404,
                 "a new session can download a suite it never compiled",
+            )
+            # The uid is the server's to hand out. Accepting one from the body
+            # would let a caller pin two sessions to the same suite, which is
+            # the single thing the column exists to prevent.
+            posted = client.post(
+                "/api/sessions", json={"target_url": url, "uid": owner}
+            ).json()
+            ok &= check(
+                "a uid supplied by the caller is ignored, not honoured",
+                posted.get("uid") not in (None, "", owner),
+                f"created with uid {posted.get('uid')!r}",
             )
         finally:
             regression.SUITES = original

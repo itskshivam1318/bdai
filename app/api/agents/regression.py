@@ -84,7 +84,7 @@ def _now() -> str:
 
 
 def directory_for(
-    target_url: str, root: Path | None = None, session_id: int | None = None
+    target_url: str, root: Path | None = None, session_uid: str | None = None
 ) -> Path:
     """One suite per target -- and per session, wherever there is one.
 
@@ -101,14 +101,21 @@ def directory_for(
     the second run replays the first one's suite, heals it, and emits v002. That
     is the drift story, and it is why this scopes rather than disables.
 
-    `session_id=None` keeps the target-only path, which is what every CLI entry
+    `session_uid=None` keeps the target-only path, which is what every CLI entry
     point (`make suite`, `make pipeline`, `rescue.py`) has and should have --
     there is no session at a command line, and one suite per target is the right
     answer there.
+
+    **The session's `uid`, not its row number.** `TestSession.id` is 1 on a
+    fresh database and 1 again after `make reset`, which does not clear
+    `artifacts/` -- so a suite directory named after the row number is handed to
+    whichever session is first in the *next* database. That is the same bug one
+    level down: tests belonging to a session that no longer exists, presented as
+    this one's history.
     """
     slug = _slug(target_url.split("://", 1)[-1])
-    if session_id is not None:
-        slug = f"{slug}-s{session_id}"
+    if session_uid:
+        slug = f"{slug}-{_slug(session_uid)}"
     return (root or SUITES) / slug
 
 

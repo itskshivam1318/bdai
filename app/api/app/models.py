@@ -9,6 +9,7 @@ you have nowhere to put evidence at hour 6 is not.
 
 from datetime import datetime, timezone
 from typing import Optional
+from uuid import uuid4
 
 from sqlmodel import Field, SQLModel
 
@@ -26,6 +27,21 @@ class TestSession(SQLModel, table=True):
     """
 
     id: Optional[int] = Field(default=None, primary_key=True)
+    # The identity that leaves this database.
+    #
+    # `id` is a row number: it is 1 on a fresh checkout, and `make reset` makes
+    # it 1 again. Anything outside the database keyed on it -- and the kept
+    # suite under `artifacts/suites/` is exactly that -- inherits the artifacts
+    # of whatever session happened to be first last time. A wiped database plus
+    # a surviving artifacts directory is not a corner case here; it is what
+    # `make reset` does, and `artifacts/` is not what it clears.
+    #
+    # So the row number stays the primary key (every foreign key, route and
+    # canvas node is built on it) and this is what anything outside is keyed
+    # on. Twelve hex characters rather than thirty-two: it appears in directory
+    # names a person has to read, and 48 bits is a collision at sixteen million
+    # sessions.
+    uid: str = Field(default_factory=lambda: uuid4().hex[:12], index=True)
     target_url: str
     # Null until someone renames it; the UI shows "Untitled session".
     name: Optional[str] = None

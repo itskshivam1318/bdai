@@ -278,8 +278,11 @@ def _explore(
         # Captured now, beside the run it comes from: the kept suite is scoped
         # to the session (see `regression.directory_for`), and by the time the
         # suite is written this function is deep inside a browser context where
-        # re-reading the row would be a query in the middle of a crawl.
-        session_id = run.session_id if run else None
+        # re-reading the row would be a query in the middle of a crawl. The
+        # session's `uid` and not its row number -- `make reset` reissues row
+        # numbers and does not clear `artifacts/`.
+        owner = db.get(TestSession, run.session_id) if run and run.session_id else None
+        session_uid = owner.uid if owner else None
 
         traces = start_tracing()
         if traces:
@@ -800,7 +803,7 @@ def _explore(
                         # first one's baseline and reports tests it never
                         # compiled. See `regression.directory_for`.
                         root=regression.directory_for(
-                            target_url, session_id=session_id
+                            target_url, session_uid=session_uid
                         ),
                         # So a control the ladder cannot resolve is looked for
                         # by ants at the region that lost it, rather than only
