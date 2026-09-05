@@ -97,6 +97,43 @@ export type ChatTurn = {
   thread: ChatThread;
 };
 
+/**
+ * One agent conversation, as `agents/tracing.py` wrote it.
+ *
+ * The metadata comes from the filename; `url` addresses the file itself on the
+ * artifacts mount, which is where the exchanges live. Listing does not read
+ * them — a run writes one of these per ant and they are ~12KB each.
+ */
+export type TranscriptRow = {
+  name: string;
+  /** ant | orchestrator | ... — the role that held this conversation. */
+  role: string;
+  /** For an ant, the first 8 chars of the state it was sent to. */
+  label: string | null;
+  bytes: number;
+  written_at: string;
+  url: string;
+};
+
+/** One model turn: what it said, what it called, and what came back. */
+export type TranscriptExchange = {
+  text: string;
+  calls: { name: string; arguments: Record<string, unknown> }[];
+  results: { name: string; content: string }[];
+  provider_state: boolean;
+};
+
+/** The file itself. `system` is the prompt file that produced the run. */
+export type Transcript = {
+  role: string;
+  run_id: number | null;
+  label: string;
+  written_at: string;
+  system: string;
+  prompt: string;
+  exchanges: TranscriptExchange[];
+};
+
 /** Why one offered action could not be taken, and how often. */
 export type Refusal = { reason: string; count: number };
 
@@ -297,6 +334,27 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ intent: intent || null }),
     }),
+  listTranscripts: (runId: number) =>
+    request<TranscriptRow[]>(`/api/runs/${runId}/transcripts`),
+  /** The file, straight off the artifacts mount — no API route reads it. */
+  readTranscript: async (url: string): Promise<Transcript> => {
+    const res = await fetch(artifactUrl(url), { cache: "no-store" });
+    if (!res.ok) throw new Error(`transcript → ${res.status}`);
+    return (await res.json()) as Transcript;
+  },
+  /**
+   * Send one ant to a state on this run's map, optionally down a named action.
+   * Returns as soon as it is dispatched; what it finds arrives on the rail and
+   * on the map, like any other ant's work.
+   */
+  dispatchAnt: (
+    runId: number,
+    body: { state_key: string; action?: string | null; instruction?: string | null },
+  ) =>
+    request<{ run_id: number; state_key: string; status: string }>(
+      `/api/runs/${runId}/ant`,
+      { method: "POST", body: JSON.stringify(body) },
+    ),
   listEvents: (runId: number) =>
     request<AgentEvent[]>(`/api/runs/${runId}/events`),
   getMap: (runId: number) => request<WorldMapPayload>(`/api/runs/${runId}/map`),

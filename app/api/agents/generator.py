@@ -69,6 +69,9 @@ _FORM_ACTION = re.compile(r"^submit\[(?P<mode>\w+)\]:(?P<descriptor>.+)$")
 # navigation we have already recorded elsewhere.
 _RANK = {"valid": 0, "invalid": 1, "empty": 2}
 
+# How many recorded effects may become pass conditions. See `_assertable`.
+ASSERTION_CAP = 12
+
 
 @dataclass(frozen=True)
 class Expectation:
@@ -172,10 +175,35 @@ def expectation(world: WorldMap, from_key: str, action: str) -> Expectation | No
     return Expectation(
         moved=transition.to_key != from_key,
         mutating=transition.mutating,
-        added=_behavioural(diff.only_in_b),
+        added=_assertable(_behavioural(diff.only_in_b)),
         removed=_behavioural(diff.only_in_a),
         to_key=transition.to_key,
     )
+
+
+def _assertable(lines: tuple[str, ...]) -> tuple[str, ...]:
+    """The recorded effects that may become pass conditions. At most `ASSERTION_CAP`.
+
+    Measured 2026-09-05 on practicesoftwaretesting.com: `button:Testing Guide`
+    opens a modal holding a testing handbook, and every one of its **469** lines
+    became a required effect. On replay 52 returned and 417 did not, so a modal
+    that opened correctly was reported as a DEFECT -- three times, because three
+    scenarios share that step as a path prefix. The subset rule in `_met` lets
+    an app render *more* than it did; nothing bounded how much it had to render
+    *again*.
+
+    A cap rather than a role filter, and the distinction is load-bearing. The
+    obvious fix is to drop `paragraph` and `text` lines as "content, not
+    behaviour" -- but `- paragraph: Invalid credentials` is a paragraph, and it
+    is the single most valuable assertion an unhappy path produces. Volume is
+    what separates a claim from a transcript; role does not.
+
+    Document order, because an a11y snapshot is depth-first and the lines that
+    identify a newly revealed region -- its dialog and its heading -- come
+    before the prose inside it. That is a property of the format, not a ranking
+    we impose, and it is why the truncated assertion still names what appeared.
+    """
+    return lines[:ASSERTION_CAP]
 
 
 def _behavioural(lines: tuple[str, ...]) -> tuple[str, ...]:

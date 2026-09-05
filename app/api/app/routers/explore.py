@@ -23,6 +23,7 @@ back to this decision -- hence the note.
 
 from __future__ import annotations
 
+import json
 import traceback
 from datetime import datetime, timezone
 
@@ -32,8 +33,8 @@ from sqlmodel import Session, select
 
 # Absolute, not relative: `agents/` is a sibling of `app/` under `api/`, so a
 # relative import would climb above this package and fail at import time.
-from agents import orchestrator, runner, suite
-from agents.explorer import crawler, store
+from agents import ant, orchestrator, runner, suite
+from agents.explorer import crawler, forms, store
 from agents.explorer.forms import Credentials
 from agents.explorer.synth import Synthesizer
 from agents.generator import scenarios
@@ -42,7 +43,7 @@ from agents.shots import shooter
 from agents.tracing import start as start_tracing
 from ..config import settings
 from ..db import engine, get_session
-from ..models import Event, Run, TestCase
+from ..models import AppState, Event, Run, TestCase
 
 router = APIRouter(prefix="/api/runs", tags=["explore"])
 
@@ -192,7 +193,7 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
             store.save(world, run_id, db)
             if len(world.states) > seen:
                 seen = len(world.states)
-                emit("info", f"  crawled {seen} state(s)")
+                emit("info", f"crawled {seen} state(s)", surface="explore")
 
         # Assigned inside the `with` block below but read after it, and the
         # `except` path must still find a list rather than a NameError.
@@ -258,7 +259,11 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
 
                 # --- plan --------------------------------------------
                 for flow in result.flows:
-                    emit("decision", f"flow: {flow.get('name')} -- {flow.get('why', '')}")
+                    emit(
+                        "decision",
+                        f"flow: {flow.get('name')} -- {flow.get('why', '')}",
+                        surface="plan",
+                    )
                 emit(
                     "decision",
                     f"plan: {len(result.flows)} flows across "
@@ -268,7 +273,7 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
 
                 # --- coverage, before generation, as the brief requires
                 for gap in result.gaps:
-                    emit("warn", f"gap: {gap}")
+                    emit("warn", f"gap: {gap}", surface="coverage")
                 emit(
                     "warn" if result.gaps else "info",
                     f"coverage: {len(result.gaps)} gap(s) before generation",
@@ -277,6 +282,12 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
 
                 # --- suite -------------------------------------------
                 plan = scenarios(result.world)
+                for scenario in plan:
+                    emit(
+                        "info",
+                        f"{scenario.name} ({len(scenario.steps)} steps)",
+                        surface="suite",
+                    )
                 emit(
                     "warn" if not plan else "decision",
                     f"suite: {len(plan)} scenarios compiled from recorded paths",
@@ -285,20 +296,42 @@ def _explore(run_id: int, target_url: str, body: ExploreRequest) -> None:
 
                 # --- run and heal ------------------------------------
                 credentials = Credentials.from_env()
-                for scenario in plan:
+                for index, scenario in enumerate(plan, start=1):
+                    # Emitted *before* the replay, not after: a scenario takes
+                    # seconds and this is the only line that says which one is
+                    # on the page right now.
+                    emit(
+                        "info",
+                        f"{index}/{len(plan)} replaying {scenario.name}",
+                        surface="run",
+                    )
                     try:
-                        results.append(
-                            runner.run(
-                                page,
-                                scenario,
-                                credentials=credentials,
-                                on_event=emit,
-                            )
+                        outcome = runner.run(
+                            page,
+                            scenario,
+                            credentials=credentials,
+                            on_event=emit,
+                        )
+                        results.append(outcome)
+                        emit(
+                            "error" if outcome.verdict in {runner.DEFECT, runner.ESCALATE}
+                            else "decision",
+                            f"{scenario.name}: {outcome.verdict}"
+                            + (
+                                f" ({len(outcome.healed_steps)} healed)"
+                                if outcome.healed_steps
+                                else ""
+                            ),
+                            surface="run",
                         )
                     except Exception as exc:
                         # One scenario that cannot even be replayed must not
                         # cost the others their verdicts.
-                        emit("error", f"{scenario.name}: {type(exc).__name__}: {exc}")
+                        emit(
+                            "error",
+                            f"{scenario.name}: {type(exc).__name__}: {exc}",
+                            surface="run",
+                        )
 
                 browser.close()
 
@@ -401,3 +434,229 @@ def start_exploration(
 
     background.add_task(_explore, run_id, run.target_url, body)
     return {"run_id": run_id, "status": "running"}
+
+
+class AntRequest(BaseModel):
+    """One ant, aimed by hand at one state.
+
+    The colony decides where its own ants go; this is the override. `action` is
+    optional because the two useful questions are different ones: "take *this*
+    branch and tell me what is behind it" (an action, copied verbatim off the
+    map) and "look harder here" (no action, just a place).
+    """
+
+    state_key: str
+    action: str | None = None
+    instruction: str | None = None
+    # Smaller than a colony ant's five. A hand-dispatched ant is answering one
+    # question, and the person who asked it is watching the rail.
+    budget: int = 3
+
+
+def _manual_tag(world) -> str:
+    """`u1`, `u2`, ... -- the same shape as `w2a1`, and never colliding with it.
+
+    Attribution is what colours a node and an edge on the map, so an ant sent by
+    hand has to be tellable from the wave that found the state it started on.
+    """
+    # Edges as well as states: an ant that walked a branch the map already had
+    # discovers no new state, so counting states alone hands the next ant the
+    # same tag and two dispatches become one colour on the map.
+    used = {
+        node.found_by
+        for node in world.states.values()
+        if node.found_by and node.found_by.startswith("u")
+    } | {
+        edge.found_by
+        for edges in world.transitions.values()
+        for edge in edges
+        if edge.found_by and edge.found_by.startswith("u")
+    }
+    return f"u{len(used) + 1}"
+
+
+def _brief(action: str | None, instruction: str | None) -> str | None:
+    """What the ant is told. None when the caller said nothing at all.
+
+    The action is quoted verbatim and named as the *first* thing to do rather
+    than the only thing: `tools.ANT_TOOLS` validates every action against the
+    state's own list, so a paraphrase is rejected, and an ant that took the
+    branch and then stopped looking would waste the two actions it has left.
+    """
+    parts = []
+    if action:
+        parts.append(
+            f"Start by taking exactly this action, copied verbatim: {action}\n"
+            "Then report what changed -- whether it opened a state the map did "
+            "not have, and whether anything about it looks wrong."
+        )
+    if instruction:
+        parts.append(instruction)
+    return "\n\n".join(parts) or None
+
+
+def _dispatch_ant(run_id: int, target_url: str, body: AntRequest) -> None:
+    """The background job for one hand-aimed ant. Mirrors `_explore`'s shape.
+
+    Writes into the same run as the crawl that produced the map: a state this
+    ant discovers is a state of *this* application, and putting it in a run of
+    its own would mean a second graph that shares no nodes with the one the
+    person is looking at.
+    """
+    from playwright.sync_api import sync_playwright
+
+    with Session(engine) as db:
+
+        def emit(level: str, message: str, surface: str | None = "explore") -> None:
+            db.add(
+                Event(run_id=run_id, level=level, message=message[:2000], surface=surface)
+            )
+            db.commit()
+
+        try:
+            provider = load(notify=emit)
+        except RuntimeError as exc:
+            # Unlike the crawl, there is no deterministic fallback here: an ant
+            # *is* the model. Say so and stop rather than pretending.
+            emit("error", f"no model, so no ant: {exc}")
+            return
+
+        world = store.load(run_id, db)
+        node = world.states.get(body.state_key)
+        if node is None:
+            emit("error", f"no state {body.state_key[:8]} in this run")
+            return
+
+        tag = _manual_tag(world)
+        emit(
+            "decision",
+            f"ant {tag} -> {body.state_key[:8]}: "
+            + (f"take {body.action}" if body.action else "sent by hand"),
+        )
+
+        try:
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch()
+                page = browser.new_page(ignore_https_errors=True)
+                # `store.load` leaves this None on purpose -- it needs a live
+                # page. Without it `world.record` cannot compute a state's
+                # actions and every state the ant reaches looks empty.
+                world.actions_of = lambda obs: forms.available_actions(page, obs)
+                world.attribution = tag
+
+                report = ant.explore(
+                    page,
+                    world,
+                    provider,
+                    entry_url=target_url,
+                    start_key=body.state_key,
+                    instruction=_brief(body.action, body.instruction),
+                    credentials=Credentials.from_env(),
+                    budget=max(1, min(body.budget, 8)),
+                    run_id=run_id,
+                    shot=shooter(page, run_id, settings.artifacts_dir),
+                )
+                browser.close()
+
+            rows = store.save(world, run_id, db)
+            for step in report.trail:
+                emit("info", f"  {tag} {step}")
+            emit(
+                "decision",
+                f"  ant {tag} <- {report.actions_taken} action(s), "
+                f"{report.states_discovered} new state(s), ended: {report.ended}"
+                + (f" ({rows} rows)" if rows else ""),
+            )
+            if report.summary:
+                emit("info", f"  {tag}: {report.summary}")
+            if report.uncertain:
+                emit("warn", f"  {tag} uncertain: {report.uncertain}")
+            for branch in report.branches:
+                emit(
+                    "info",
+                    f"  {tag} branch [{branch.get('priority', '?')}] "
+                    f"{branch.get('action', '?')} -- {branch.get('why', '')}",
+                )
+        except Exception as exc:
+            emit("error", f"ant {tag}: {type(exc).__name__}: {exc}")
+            emit("error", traceback.format_exc()[-1500:])
+
+
+@router.post("/{run_id}/ant", status_code=202)
+def dispatch_ant(
+    run_id: int,
+    body: AntRequest,
+    background: BackgroundTasks,
+    session: Session = Depends(get_session),
+):
+    """Send one ant to a state on this run's map. Returns before it lands."""
+    run = session.get(Run, run_id)
+    if run is None:
+        raise HTTPException(404, "run not found")
+    if run.status == "running":
+        # Two browsers writing observations into one run would interleave the
+        # append-only evidence the transitions are indexed against.
+        raise HTTPException(409, "this run is still exploring; wait for it to finish")
+
+    state = session.exec(
+        select(AppState).where(
+            AppState.run_id == run_id, AppState.key == body.state_key
+        )
+    ).first()
+    if state is None:
+        raise HTTPException(404, "no such state on this run's map")
+
+    # Checked here rather than left to the ant: the ant would spend a model call
+    # discovering it, and the caller is a UI that has the list already.
+    if body.action:
+        try:
+            available = json.loads(state.actions or "[]")
+        except json.JSONDecodeError:
+            available = []
+        if body.action not in available:
+            raise HTTPException(400, "that action is not available on this state")
+
+    background.add_task(_dispatch_ant, run_id, run.target_url, body)
+    return {"run_id": run_id, "state_key": body.state_key, "status": "dispatched"}
+
+
+@router.get("/{run_id}/transcripts")
+def list_transcripts(run_id: int, session: Session = Depends(get_session)):
+    """Every agent conversation this run wrote, newest last.
+
+    Metadata comes from the filename rather than the file: `tracing.py` names
+    them `<stamp>-<role>[-<label>].json`, and a listing that opened all of them
+    would read every prompt and every tool result to render a list of names.
+
+    The content is not returned here -- the files are already served by the
+    static mount, so the viewer fetches the one it is showing and no more.
+    """
+    if session.get(Run, run_id) is None:
+        raise HTTPException(404, "run not found")
+
+    directory = settings.artifacts_dir / "transcripts" / f"run-{run_id}"
+    if not directory.is_dir():
+        return []
+
+    out = []
+    for path in sorted(directory.glob("*.json")):
+        stem = path.stem
+        # <YYYYmmdd-HHMMSS-ffffff>-<role>[-<label>]
+        parts = stem.split("-")
+        role = parts[3] if len(parts) > 3 else "agent"
+        label = "-".join(parts[4:]) if len(parts) > 4 else None
+        out.append(
+            {
+                "name": path.name,
+                "role": role,
+                "label": label,
+                "bytes": path.stat().st_size,
+                "written_at": datetime.fromtimestamp(
+                    path.stat().st_mtime, tz=timezone.utc
+                ).isoformat(),
+                # Relative to the artifacts mount, which is how every other
+                # artifact in this API is addressed (see `shots.py`).
+                "url": f"transcripts/run-{run_id}/{path.name}",
+            }
+        )
+    return out

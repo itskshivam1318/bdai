@@ -196,7 +196,8 @@ def run(
         max_actions=budget.explore_actions, max_seconds=budget.explore_seconds
     )
     world = crawl(page, target_url, explore_budget, credentials=credentials,
-                  synthesizer=synthesizer)
+                  synthesizer=synthesizer,
+                  trace=lambda line: emit("info", line))
     pipe.world = world
     pipe.rounds = 1
     announce(
@@ -304,7 +305,8 @@ def run(
             surface="plan",
         )
         world = crawl(page, target_url, explore_budget, credentials=credentials,
-                      synthesizer=synthesizer)
+                      synthesizer=synthesizer,
+                      trace=lambda line: emit("info", line))
         pipe.world = world
         pipe.rounds += 1
 

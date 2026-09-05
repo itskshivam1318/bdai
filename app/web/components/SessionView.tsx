@@ -85,49 +85,26 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
   const reasonOpen = latest != null && reasonFor === latest.id;
 
   /*
-   * The stage rail earns its 40% of the window while stages are advancing and
-   * stops earning it the moment they stop. So it follows the run by default and
-   * defers to the user the moment they say otherwise:
+   * The rail is open until someone shuts it, and it stays shut until they open
+   * it again. Nothing else moves it.
    *
-   *   pinned === null   follow the run
-   *   pinned === true   held open
-   *   pinned === false  held shut
+   *   open === null   never touched -- open
+   *   open === true    held open
+   *   open === false   held shut
    *
-   * A new run clears the pin. A preference expressed about the last run is not
-   * a preference about this one, and the start of a run is the single moment
-   * the rail is certainly worth looking at.
+   * It used to hide itself four seconds after a run finished, on the theory
+   * that a finished stage has stopped earning its width. That was wrong twice
+   * over: the finished rail is the *report* -- eight verdicts, the gaps, the
+   * scenario names -- and a panel that empties itself while you are reading it
+   * is indistinguishable from a panel with nothing in it. It was reported as
+   * exactly that. The map has a toggle in the header for anyone who wants the
+   * width back.
    */
-  const [pinned, setPinned] = useState<boolean | null>(null);
-  const [autoHidden, setAutoHidden] = useState(false);
+  const [open, setOpen] = useState<boolean | null>(null);
 
   const running = latest?.status === "running";
   const latestId = latest?.id ?? null;
-  const runKey = latest ? `${latest.id}:${latest.status}` : "none";
-  const [seenRunKey, setSeenRunKey] = useState(runKey);
-
-  // Adjusting state during render rather than in an effect: React re-renders
-  // immediately with the corrected value, so the rail never paints one frame
-  // shut on the run that just started. `runKey` carries the status, so this
-  // fires on a transition and not on every three-second poll.
-  if (runKey !== seenRunKey) {
-    setSeenRunKey(runKey);
-    if (running) {
-      setPinned(null);
-      setAutoHidden(false);
-    }
-  }
-
-  // Terminal status: let the verdict sit long enough to read, then give the
-  // width back to the map. Keyed on the run's id rather than the run object,
-  // which `refreshRuns` replaces every three seconds -- depending on the object
-  // would restart this timer forever and it would never fire.
-  useEffect(() => {
-    if (running || latestId == null || pinned !== null) return;
-    const t = setTimeout(() => setAutoHidden(true), 4000);
-    return () => clearTimeout(t);
-  }, [running, latestId, pinned]);
-
-  const railOpen = pinned ?? !autoHidden;
+  const railOpen = open ?? true;
 
   // Runs are scoped maps, not versions of one map: re-crawling after the app
   // changes writes a second graph beside the first, which is the drift story.
@@ -387,7 +364,7 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
         </button>
         <button
           type="button"
-          onClick={() => setPinned(!railOpen)}
+          onClick={() => setOpen(!railOpen)}
           aria-expanded={railOpen}
           aria-controls="stage-rail"
           aria-label={railOpen ? "Hide stage rail" : "Show stage rail"}
@@ -429,9 +406,11 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
           </div>
           {railOpen && (
             <div id="stage-rail" className="min-w-0 overflow-hidden">
-              {/* The rail's `running` prop lands with the rail that accepts
-                  it -- see decisions.md 2026-09-05 01:45. */}
-              <StageRail sessionId={sessionId} runId={shownRunId} />
+              <StageRail
+                sessionId={sessionId}
+                runId={shownRunId}
+                running={running && shownRunId === latestId}
+              />
             </div>
           )}
         </div>

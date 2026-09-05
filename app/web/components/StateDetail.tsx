@@ -1,6 +1,13 @@
 "use client";
-import { useEffect } from "react";
-import { artifactUrl, type MapState, type MapTransition, type Verdict } from "@/lib/api";
+import { useEffect, useState } from "react";
+import TranscriptViewer from "@/components/TranscriptViewer";
+import {
+  api,
+  artifactUrl,
+  type MapState,
+  type MapTransition,
+  type Verdict,
+} from "@/lib/api";
 import { antColour } from "@/lib/map";
 
 const VERDICT_GLYPH: Record<Verdict, { glyph: string; tone: string }> = {
@@ -27,6 +34,7 @@ export default function StateDetail({
   transitions,
   states,
   ants,
+  runId,
   onClose,
 }: {
   state: MapState;
@@ -35,8 +43,45 @@ export default function StateDetail({
   /** Every state, so an edge's destination can be named rather than hashed. */
   states: MapState[];
   ants: string[];
+  /** The run this state belongs to — an ant is dispatched into it. */
+  runId: number;
   onClose: () => void;
 }) {
+  /*
+   * Sending an ant from here is the one thing on this panel that changes the
+   * application rather than describing it, so it reports its own outcome: the
+   * API answers in milliseconds and the ant takes a minute, and a button that
+   * went quiet would look broken for the whole of it.
+   */
+  const [note, setNote] = useState("");
+  const [sending, setSending] = useState<string | null>(null);
+  const [sent, setSent] = useState<string | null>(null);
+  const [failed, setFailed] = useState<string | null>(null);
+  const [transcripts, setTranscripts] = useState(false);
+
+  async function send(action: string | null) {
+    setSending(action ?? "");
+    setFailed(null);
+    setSent(null);
+    try {
+      await api.dispatchAnt(runId, {
+        state_key: state.key,
+        action,
+        instruction: note.trim() || null,
+      });
+      setSent(
+        action
+          ? `sent — taking ${action}. Watch the rail.`
+          : "sent. Watch the rail; new states land on the map.",
+      );
+      setNote("");
+    } catch (e) {
+      setFailed(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSending(null);
+    }
+  }
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
     window.addEventListener("keydown", onKey);
@@ -115,14 +160,42 @@ export default function StateDetail({
         </div>
       )}
 
+      {/*
+        Every action the crawl found, and the ones with no edge beside them in
+        "Goes to" are the unexplored ones — which is exactly where sending an
+        ant is worth doing. Walked is marked rather than filtered out: an action
+        can be worth re-walking after the app changes.
+      */}
       <Section title="Actions" count={state.actions.length}>
         {state.actions.length ? (
           <ul className="space-y-0.5">
-            {state.actions.map((action) => (
-              <li key={action} className="break-all font-mono text-[11px] text-ink">
-                {action}
-              </li>
-            ))}
+            {state.actions.map((action) => {
+              const walked = outgoing.some((t) => t.action === action);
+              return (
+                <li key={action} className="group flex items-baseline gap-1.5">
+                  <span
+                    aria-hidden
+                    title={walked ? "an ant has walked this" : "never walked"}
+                    className={walked ? "text-live" : "text-muted"}
+                  >
+                    {walked ? "·" : "○"}
+                  </span>
+                  <span className="min-w-0 flex-1 break-all font-mono text-[11px] text-ink">
+                    {action}
+                  </span>
+                  <button
+                    type="button"
+                    disabled={sending !== null}
+                    onClick={() => send(action)}
+                    title={`Send an ant from here, taking ${action}`}
+                    aria-label={`Send an ant taking ${action}`}
+                    className="shrink-0 rounded px-1 text-[11px] text-muted opacity-0 hover:bg-paper hover:text-ink focus:opacity-100 group-hover:opacity-100 disabled:opacity-40"
+                  >
+                    {sending === action ? "…" : "🐜→"}
+                  </button>
+                </li>
+              );
+            })}
           </ul>
         ) : (
           <Empty>nothing here could be pressed</Empty>
@@ -176,6 +249,52 @@ export default function StateDetail({
           <Empty>no recorded way out of this state</Empty>
         )}
       </Section>
+
+      {/*
+        The colony picks its own targets; this is the override, and it is at the
+        bottom because reading the state comes first. An ant sent from here
+        writes into the same run, so what it finds appears on the map behind
+        this panel rather than in a graph of its own.
+      */}
+      <Section title="Send an ant" count={state.actions.length}>
+        <textarea
+          value={note}
+          onChange={(e) => setNote(e.target.value)}
+          rows={2}
+          placeholder="Optional: what should it look for here?"
+          className="w-full resize-none rounded border border-rule bg-paper px-2 py-1.5 text-[11px] text-ink outline-none placeholder:text-muted focus:border-ink"
+        />
+        <div className="mt-1.5 flex items-center gap-2">
+          <button
+            type="button"
+            disabled={sending !== null}
+            onClick={() => send(null)}
+            className="rounded-md bg-ink px-2.5 py-1 text-[11px] text-paper disabled:opacity-50"
+          >
+            {sending === "" ? "sending…" : "🐜 Send from here"}
+          </button>
+          <button
+            type="button"
+            onClick={() => setTranscripts(true)}
+            className="rounded-md border border-rule px-2.5 py-1 text-[11px] text-muted hover:text-ink"
+          >
+            Transcript
+          </button>
+        </div>
+        <p className="mt-1.5 text-[11px] leading-snug text-muted">
+          Or hover an action above and press 🐜→ to send one down that branch.
+        </p>
+        {sent && <p className="mt-1 text-[11px] text-live">{sent}</p>}
+        {failed && <p className="mt-1 text-[11px] text-fault">{failed}</p>}
+      </Section>
+
+      {transcripts && (
+        <TranscriptViewer
+          runId={runId}
+          initial={state.key}
+          onClose={() => setTranscripts(false)}
+        />
+      )}
     </aside>
   );
 }

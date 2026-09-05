@@ -616,6 +616,69 @@ def main() -> int:
             sorted(interleave({"a": ["x"], "b": ["y"]}, 8)) == ["x", "y"],
         )
 
+        # 3i. An assertion is a claim, not a snapshot. Measured 2026-09-05
+        #     against practicesoftwaretesting.com: `button:Testing Guide` opens
+        #     a modal holding an entire black-box-testing handbook, and
+        #     `_behavioural` recorded all **469** of its lines as required
+        #     effects. On replay 52 came back and 417 did not, so the Runner
+        #     read a modal that opened correctly as a DEFECT -- three times,
+        #     because three scenarios share that step as a path prefix.
+        #
+        #     The subset rule already lets an app render *more* than it did.
+        #     Nothing protected against one omission out of 469. A delta that
+        #     large is a document, and a document is content, not behaviour.
+        #
+        #     The cap truncates: the dropped effects are not retained anywhere,
+        #     so the report cannot yet say "asserting on 12 of 469". That is a
+        #     real loss of evidence and the next thing to add here.
+        from .generator import ASSERTION_CAP, expectation as _expectation
+        from .explorer.observer import Observation as _Obs
+
+        def _mapped(before: str, after: str):
+            """A two-state map with one edge, built from real observations."""
+            world = _WM()
+            a = world.record(_Obs(url="/", title="t", snapshot=before))
+            b = world.record(_Obs(url="/", title="t", snapshot=after))
+            world.transitions[(a, "button:Testing Guide")] = [
+                _T(a, "button:Testing Guide", b, False, 1)
+            ]
+            return world, a
+
+        # Distinct *words* per line, not distinct numbers: `explain` normalises
+        # digits to `#`, so 469 numbered lines collapse to one and the fixture
+        # passes without the fix. The real handbook's lines differ by prose.
+        def _word(n: int) -> str:
+            out = ""
+            while True:
+                out, n = "abcdefghijklmnopqrstuvwxyz"[n % 26] + out, n // 26
+                if n == 0:
+                    return out
+
+        chrome = "\n".join(f'- button "b{_word(i)}"' for i in range(3))
+        handbook = "\n".join(
+            f"- paragraph: chapter {_word(i)} body text" for i in range(469)
+        )
+        big, big_from = _mapped(chrome, chrome + "\n" + handbook)
+        huge = _expectation(big, big_from, "button:Testing Guide")
+        ok &= check(
+            "a 469-line document does not become a 469-line assertion",
+            huge is not None and len(huge.added) <= ASSERTION_CAP,
+            f"asserting on {len(huge.added) if huge else 0} lines -- a modal that "
+            f"opens correctly will be reported as a defect",
+        )
+
+        # The other direction, and the reason this is a cap rather than a role
+        # filter: "Invalid credentials" is a `paragraph`, it is the single most
+        # valuable unhappy-path assertion we generate, and a rule that dropped
+        # body text to solve the handbook would drop it too.
+        small, small_from = _mapped(chrome, chrome + '\n- paragraph: Invalid credentials')
+        tiny = _expectation(small, small_from, "button:Testing Guide")
+        ok &= check(
+            "a small delta is still asserted in full",
+            tiny is not None and any("Invalid credentials" in ln for ln in tiny.added),
+            "the error message an unhappy path exists to catch was dropped",
+        )
+
         # 4. The executable layer: a path through the map becomes a test, and
         #    the test's failure classifies itself. These six checks are the
         #    acceptance experiment for the whole product claim, so they drive
@@ -636,7 +699,27 @@ def main() -> int:
 
         browser = pw.chromium.launch()
         page = browser.new_page()
-        mapped = crawl(page, SUT, CrawlBudget(max_actions=10, max_seconds=90))
+        # A crawl reports each action as it takes it. `checkpoint` fires per
+        # edge but receives only the map, so it can say the crawl advanced and
+        # not what it did -- which is why a stalled run against a remote target
+        # is indistinguishable from a slow one. Measured 2026-09-05: a
+        # reproduction against practicesoftwaretesting.com printed nothing for
+        # 3m20s and there was no way to tell progress from a hang.
+        walked: list[str] = []
+        mapped = crawl(
+            page, SUT, CrawlBudget(max_actions=10, max_seconds=90),
+            trace=walked.append,
+        )
+        ok &= check(
+            "a crawl says what it is doing while it does it",
+            len(walked) >= len(mapped.transitions),
+            f"{len(walked)} traced against {len(mapped.transitions)} edges walked",
+        )
+        ok &= check(
+            "a traced line names the action, not just a counter",
+            any("Sign in" in line for line in walked),
+            f"first lines: {walked[:3]}",
+        )
 
         # 4b. One picture per state, and not one more. A revisit that shoots
         #     again is invisible in the UI and quadratic in a real crawl.
@@ -1052,7 +1135,6 @@ def _chat_transcript_checks() -> bool:
         f"answering turn held {blocks}",
     )
     return ok
-
 
 
 if __name__ == "__main__":
