@@ -959,3 +959,31 @@ and the Sarvam no-free-tier path. 70 PASS / 0 FAIL across all offline sections.
 which lives in the browser under BYOK and never reaches this process.
 
 **Who:** shivam + Claude.
+
+## 2026-09-05 10:50 — Remediation covers the artifacts, not only the database
+
+`make scrub` cleaned `app.db` and reported it clean, and 17 files under
+`artifacts/` still carried a non-empty `password=` — two distinct values across
+`runs/` and `transcripts/`. `crawler.autosave` writes `Observation.url` into
+`runs/*.json`, and a model that read a url off the page repeats it into a
+transcript, which no database scrub can reach.
+
+**The decision:** `scrub_artifacts` walks the artifacts tree in the same command,
+so "scrubbed" means the whole workspace rather than one store of it.
+
+**Text substitution, not URL parsing.** A transcript is prose with urls embedded
+in it — a tool result quoting a state, an ant's summary — so there is no field to
+parse. What is stable is the `password=<value>` query form itself, which is how
+the credential reached every one of these files. Verified: 17 files changed, 0
+credentials remaining, 634 JSON files still valid, and a second run changes
+nothing.
+
+**How this was missed, which is the part worth keeping.** The audit that declared
+the database remediation complete queried the database. The artifacts were never
+in the sample. That is the same shape as three earlier errors in this branch —
+reading the projection instead of the record, observing after the navigation had
+cleared the field, and a fingerprint that only saw set membership. A green check
+means what its sample covered and nothing else, and the sample is the part
+nobody writes down.
+
+**Who:** shivam + Claude on `work/agent-forensics`.

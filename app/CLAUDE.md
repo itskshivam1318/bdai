@@ -131,6 +131,14 @@ unfilled one and merge the post-rejection error state with the pristine form.
 And a URL carrying no secret is returned **byte-identical** rather than
 re-encoded, because the URL is evidence.
 
+**Scrubbing the database is not the whole remediation.** `make scrub` also walks
+`artifacts/`, because `crawler.autosave` writes the same url into
+`runs/*.json` and a model repeats what it read into a transcript — 17 files here
+still carried a credential after the database came back clean, which is exactly
+the misreading the tool has to prevent rather than cause. Text substitution on
+the `password=<value>` form, not URL parsing: a transcript is prose with urls
+embedded in it, so there is no field to parse.
+
 `make scrub` fixes what was recorded before this existed. It rewrites rather
 than deletes, so every run, state key and transition survives — `make reset`
 also removes the credentials, by removing the evidence. It reads through raw

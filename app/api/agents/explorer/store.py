@@ -27,6 +27,10 @@ from __future__ import annotations
 
 import json
 
+import re
+from pathlib import Path
+from urllib.parse import quote
+
 from sqlmodel import Session, select
 
 from app.models import AppState, SkippedAction, StateObservation, StateTransition
@@ -408,6 +412,61 @@ def scrub(session: Session) -> dict[str, int]:
     return changed
 
 
+def scrub_artifacts(root: Path) -> dict[str, int]:
+    """Redact credentials in the files beside the database. Returns files changed.
+
+    `scrub` reaches `app.db`, and that is not all of it. An `Observation.url`
+    also lands in `artifacts/runs/*.json` via `crawler.autosave`, and a model
+    that read a URL off the page repeats it into `artifacts/transcripts/*.json`.
+    Measured here after scrubbing the database and believing the job done: 17
+    files still carried a non-empty `password=`, two distinct values, across
+    `runs/` and `transcripts/`.
+
+    **Text substitution, not URL parsing.** A transcript is prose with URLs
+    embedded in it -- a tool result quoting a state, an ant's summary -- so
+    there is no field to parse. What is stable is the query-string form itself,
+    `password=<value>`, which is how the credential got into all of these in the
+    first place.
+
+    Files are rewritten only when they change, so re-running touches nothing and
+    the mtimes stay meaningful.
+    """
+    from .observer import REDACTED, _SECRET_NAME, _configured_secrets
+
+    # `name=value` inside a URL, where the name reads as a secret and the value
+    # is neither empty nor already redacted. Stops at the delimiters a query
+    # string can end on plus the ones JSON and prose add around it.
+    pattern = re.compile(r'(\b[A-Za-z_][\w.\-]*)=([^&"\'\\\s]+)')
+
+    def hide(match: re.Match) -> str:
+        name, value = match.group(1), match.group(2)
+        if not _SECRET_NAME.search(name) or value in ("", quote(REDACTED)):
+            return match.group(0)
+        return f"{name}={quote(REDACTED)}"
+
+    changed = {"files": 0}
+    if not root.exists():
+        return changed
+
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in {".json", ".txt", ".md"}:
+            continue
+        try:
+            before = path.read_text()
+        except (OSError, UnicodeDecodeError):
+            continue
+
+        after = pattern.sub(hide, before)
+        for secret in _configured_secrets():
+            after = after.replace(secret, REDACTED).replace(quote(secret), REDACTED)
+
+        if after != before:
+            path.write_text(after)
+            changed["files"] += 1
+
+    return changed
+
+
 def main() -> int:
     """Scrub this checkout's database. Prints what it changed and nothing else.
 
@@ -427,8 +486,17 @@ def main() -> int:
     print(f"SCRUBBED    {settings.database_url}")
     for field, count in changed.items():
         print(f"  {field:<9} {count} row(s) redacted")
-    if not any(changed.values()):
-        print("  nothing to do -- no credential survived in this database")
+
+    # The database was never the whole of it. `autosave` writes the same url
+    # into artifacts/runs, and a model that read one off the page repeats it
+    # into a transcript -- 17 files here still carried a credential after the
+    # database came back clean.
+    files = scrub_artifacts(settings.artifacts_dir)
+    print(f"            {settings.artifacts_dir}")
+    print(f"  files     {files['files']} file(s) redacted")
+
+    if not any(changed.values()) and not files["files"]:
+        print("  nothing to do -- no credential survived here")
     return 0
 
 
