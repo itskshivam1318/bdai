@@ -19,19 +19,22 @@ Needs `make dev` for the SUT at :3000.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
+from pathlib import Path
 
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
 
 from . import tools
 from .ant import Report, explore, instructions
-from .explorer import forms
+from . import ant, orchestrator
+from .explorer import crawler, forms
 from .explorer.forms import Credentials
 from .explorer.observer import Observer
 from .explorer.worldmap import WorldMap
-from .llm import ToolCall, Turn
+from .llm import Exchange, ToolCall, ToolResult, Transcript, Turn
 from .orchestrator import Budget, run
 
 # The Makefile reads WEB_PORT from `.worktree-env` so several stacks can run at
@@ -477,6 +480,89 @@ def check(label: str, condition: bool, detail: str = "") -> bool:
     return condition
 
 
+def _parity_checks() -> bool:
+    """The colony must honour what the crawler honours, and start where it stopped.
+
+    Every check here is a capability that existed in `explorer/crawler.py` and
+    silently did not exist in `orchestrator.py` + `ant.py`. The measured cost of
+    the worst one: `forms.perform` refuses `submit[invalid]` when handed no
+    synthesizer, the ant was told "that is a fact about the application, not
+    your mistake" -- which was false -- nothing was recorded, so `brief()` still
+    showed the action as untried and the orchestrator reassigned it. Two
+    separate saucedemo runs handed it to a fresh ant and got zero actions back.
+    """
+    from .explorer.worldmap import WorldMap
+
+    print("PARITY      the colony honours what the crawler honours")
+    ok = True
+
+    ok &= check(
+        "one guard, reachable from both walkers",
+        crawler.is_safe is forms.is_safe
+        and not forms.is_safe("button:Delete account")
+        and forms.is_safe("button:Sign in"),
+        "the destructive-action denylist is not shared",
+    )
+
+    ok &= check(
+        "an ant refuses a destructive action instead of clicking it",
+        "world.skipped" in _source(ant, "refused: the name suggests"),
+        "ant.py does not consult the guard before acting",
+    )
+
+    ok &= check(
+        "an ant is handed the synthesizer",
+        "synthesizer" in _signature(ant.explore)
+        and "synthesizer" in _signature(orchestrator.run),
+        "submit[invalid] is structurally impossible for every ant",
+    )
+
+    ok &= check(
+        "the orchestrator accepts a map the crawler already built",
+        "world" in _signature(orchestrator.run),
+        "the colony can only start from a blank map",
+    )
+
+    # A refused action must reach the orchestrator's view, or it is reassigned.
+    world = WorldMap()
+    world.states["abc12345deadbeef"] = __import__(
+        "agents.explorer.worldmap", fromlist=["StateNode"]
+    ).StateNode(
+        key="abc12345deadbeef", url="/", title="t",
+        actions=("submit[invalid]:button:Login",),
+    )
+    world.skipped[("abc12345deadbeef", "submit[invalid]:button:Login")] = (
+        "nothing here could be filled"
+    )
+    rendered = tools.brief(world, waves_left=3, ants_left=8)
+
+    ok &= check(
+        "a refused action is shown to the orchestrator, not hidden",
+        "REFUSED" in rendered and "submit[invalid]:button:Login" in rendered,
+        "brief() renders no refused section; the orchestrator cannot tell "
+        "'never tried' from 'tried and impossible'",
+    )
+    ok &= check(
+        "the refused action carries the reason it failed",
+        "nothing here could be filled" in rendered,
+        "a refusal with no reason is a to-do nobody can action",
+    )
+    return ok
+
+
+def _signature(fn) -> str:
+    import inspect
+
+    return str(inspect.signature(fn))
+
+
+def _source(module, needle: str) -> str:
+    import inspect
+
+    text = inspect.getsource(module)
+    return text if needle in text else ""
+
+
 def main() -> int:
     print("AGENTS      scripted provider, real browser, no API key\n")
     ok = True
@@ -861,6 +947,76 @@ def main() -> int:
             sorted(interleave({"a": ["x"], "b": ["y"]}, 8)) == ["x", "y"],
         )
 
+        # 3i. An assertion is a claim, not a snapshot. Measured 2026-09-05
+        #     against practicesoftwaretesting.com: `button:Testing Guide` opens
+        #     a modal holding an entire black-box-testing handbook, and
+        #     `_behavioural` recorded all **469** of its lines as required
+        #     effects. On replay 52 came back and 417 did not, so the Runner
+        #     read a modal that opened correctly as a DEFECT -- three times,
+        #     because three scenarios share that step as a path prefix.
+        #
+        #     The subset rule already lets an app render *more* than it did.
+        #     Nothing protected against one omission out of 469. A delta that
+        #     large is a document, and a document is content, not behaviour.
+        #
+        #     The cap truncates: the dropped effects are not retained anywhere,
+        #     so the report cannot yet say "asserting on 12 of 469". That is a
+        #     real loss of evidence and the next thing to add here.
+        from .generator import ASSERTION_CAP, expectation as _expectation
+        from .explorer.observer import Observation as _Obs
+
+        def _mapped(before: str, after: str):
+            """A two-state map with one edge, built from real observations."""
+            world = _WM()
+            a = world.record(_Obs(url="/", title="t", snapshot=before))
+            b = world.record(_Obs(url="/", title="t", snapshot=after))
+            world.transitions[(a, "button:Testing Guide")] = [
+                _T(a, "button:Testing Guide", b, False, 1)
+            ]
+            return world, a
+
+        # Real snapshots, not a generated stand-in. The target is
+        # nondeterministic -- 11, 5, 6 and 2 state maps across four runs of the
+        # same URL on 2026-09-05 -- so re-running it cannot attribute a change
+        # to this code: the variance is larger than the effect. Pinning the
+        # captured pair is what makes the failure repeatable.
+        #
+        # `fixtures/capture.py` refreshes it and records where it came
+        # from. A generated fixture was tried first and was worse than useless:
+        # 469 lines reading `chapter {i}` collapse to one under `explain`'s
+        # digit normalisation, so the check passed before the fix existed.
+        _fixture = json.loads(
+            (Path(__file__).resolve().parent / "fixtures"
+             / "testing-guide-modal.json").read_text(encoding="utf-8")
+        )
+        big, big_from = _mapped(_fixture["before"], _fixture["after"])
+        huge = _expectation(big, big_from, "button:Testing Guide")
+        ok &= check(
+            "a captured modal does not become a 410-line assertion",
+            # A literal, deliberately not `ASSERTION_CAP`. Written against the
+            # constant, the check compares the cap to itself and passes for any
+            # value of it -- verified 2026-09-05 by setting the cap to 10**9 and
+            # watching this still pass. A check that cannot fail is not evidence.
+            huge is not None and len(huge.added) <= 20,
+            f"asserting on {len(huge.added) if huge else 0} lines -- a modal that "
+            f"opens correctly will be reported as a defect",
+        )
+
+        # The other direction, and the reason this is a cap rather than a role
+        # filter: "Invalid credentials" is a `paragraph`, it is the single most
+        # valuable unhappy-path assertion we generate, and a rule that dropped
+        # body text to solve the handbook would drop it too.
+        small, small_from = _mapped(
+            _fixture["before"],
+            _fixture["before"] + '\n- paragraph: Invalid credentials',
+        )
+        tiny = _expectation(small, small_from, "button:Testing Guide")
+        ok &= check(
+            "a small delta is still asserted in full",
+            tiny is not None and any("Invalid credentials" in ln for ln in tiny.added),
+            "the error message an unhappy path exists to catch was dropped",
+        )
+
         # 4. The executable layer: a path through the map becomes a test, and
         #    the test's failure classifies itself. These six checks are the
         #    acceptance experiment for the whole product claim, so they drive
@@ -881,7 +1037,27 @@ def main() -> int:
 
         browser = pw.chromium.launch()
         page = browser.new_page()
-        mapped = crawl(page, SUT, CrawlBudget(max_actions=10, max_seconds=90))
+        # A crawl reports each action as it takes it. `checkpoint` fires per
+        # edge but receives only the map, so it can say the crawl advanced and
+        # not what it did -- which is why a stalled run against a remote target
+        # is indistinguishable from a slow one. Measured 2026-09-05: a
+        # reproduction against practicesoftwaretesting.com printed nothing for
+        # 3m20s and there was no way to tell progress from a hang.
+        walked: list[str] = []
+        mapped = crawl(
+            page, SUT, CrawlBudget(max_actions=10, max_seconds=90),
+            trace=walked.append,
+        )
+        ok &= check(
+            "a crawl says what it is doing while it does it",
+            len(walked) >= len(mapped.transitions),
+            f"{len(walked)} traced against {len(mapped.transitions)} edges walked",
+        )
+        ok &= check(
+            "a traced line names the action, not just a counter",
+            any("Sign in" in line for line in walked),
+            f"first lines: {walked[:3]}",
+        )
 
         # 4b. One picture per state, and not one more. A revisit that shoots
         #     again is invisible in the UI and quadratic in a real crawl.
@@ -1370,8 +1546,129 @@ def main() -> int:
         "a tool requires a property it does not declare",
     )
 
+    # 8. The console's chat is the one caller with a *person* in the loop, and
+    # the only one whose transcript has to alternate user/assistant turns. It
+    # used to render its whole history into a single user message; these checks
+    # are what stops that regressing quietly, since a stateless chat still
+    # answers -- just without remembering anything you said.
+    print()
+    ok &= _chat_transcript_checks()
+
+    # 9. The two walkers had drifted: every guard, the input synthesizer and
+    # the refused-action notebook lived in `crawler.py` and the colony -- the
+    # engine the console runs whenever an API key is present -- had none of
+    # them. These checks are what stops that reopening.
+    print()
+    ok &= _parity_checks()
+
     print()
     return 0 if ok else 1
+
+
+def _chat_transcript_checks() -> bool:
+    """Does a chat thread reach the providers as a real conversation?
+
+    Imported inside the function on purpose: `app.routers.chat` imports
+    `agents.llm`, and doing this at module scope would make the agent layer
+    depend on the API layer that depends on it.
+    """
+    from app.models import ChatMessage  # noqa: PLC0415 -- see docstring
+    from app.routers.chat import _build_transcript  # noqa: PLC0415
+
+    from .llm.claude import Claude
+    from .llm.openai_compat import OpenAICompat
+
+    def message(id: int, role: str, content: str, keys: str = "[]") -> ChatMessage:
+        return ChatMessage(id=id, role=role, content=content, node_keys=keys, run_id=1)
+
+    def claude_roles(transcript) -> list[str]:
+        serialise = Claude.__dict__["_messages"]
+        return [m["role"] for m in serialise(object.__new__(Claude), transcript)]
+
+    def alternates(roles: list[str]) -> bool:
+        return all(a != b for a, b in zip(roles, roles[1:]))
+
+    ok = True
+
+    thread = [
+        message(1, "user", "why did sign-in split?", '["abc12345"]'),
+        message(2, "assistant", "the abstraction split them"),
+        message(3, "user", "which one has the password field?"),
+        message(4, "assistant", "the second"),
+    ]
+    live = _build_transcript("http://x", None, [], [], {}, thread, "and untested?", [])
+
+    ok &= check(
+        "a chat thread becomes turns, not one prompt",
+        len(live.exchanges) == 2 and all(e.follow_up for e in live.exchanges[:-1]),
+        f"{len(live.exchanges)} exchange(s) for a four-message thread",
+    )
+    ok &= check(
+        "the transcript alternates user and assistant",
+        alternates(claude_roles(live)) and claude_roles(live)[-1] == "user",
+        f"roles were {claude_roles(live)}",
+    )
+    ok &= check(
+        "the live question is the last turn, not buried in the first",
+        "and untested?" in live.exchanges[-1].follow_up
+        and "and untested?" not in live.prompt,
+    )
+    ok &= check(
+        "an older question keeps its attachment names, not its rows",
+        "[attached: abc12345]" in live.prompt and "edges leaving" not in live.prompt,
+    )
+    openai_roles = [
+        m["role"]
+        for m in OpenAICompat.__dict__["_messages"](
+            object.__new__(OpenAICompat), "sys", live
+        )
+    ]
+    ok &= check(
+        "the same transcript alternates for chat-completions too",
+        alternates(openai_roles) and openai_roles[0] == "system",
+        f"roles were {openai_roles}",
+    )
+
+    # Two questions in a row is what a deleted reply leaves behind, and what a
+    # thread adopted from before threads existed can look like. Every provider
+    # rejects consecutive user messages, so the rows cannot be trusted as-is.
+    torn = [
+        message(1, "user", "first"),
+        message(2, "user", "second"),
+        message(3, "assistant", "answer"),
+    ]
+    patched = _build_transcript("http://x", None, [], [], {}, torn, "third", [])
+    ok &= check(
+        "a torn thread still alternates, and loses no question",
+        alternates(claude_roles(patched))
+        and "first" in patched.prompt
+        and "second" in patched.prompt,
+        f"roles were {claude_roles(patched)}",
+    )
+
+    # The whole reason `follow_up` was added to `Exchange` rather than
+    # `Transcript` being widened: an ant's round must serialise exactly as it
+    # did before, with tool results and nothing else in the answering turn.
+    ant = Transcript(
+        prompt="go",
+        exchanges=[
+            Exchange(
+                text="thinking",
+                calls=(ToolCall("1", "look", {}),),
+                results=(ToolResult("1", "look", "saw a page"),),
+            )
+        ],
+    )
+    blocks = [
+        c["type"]
+        for c in Claude.__dict__["_messages"](object.__new__(Claude), ant)[-1]["content"]
+    ]
+    ok &= check(
+        "an ant's transcript is untouched by the chat's seam",
+        blocks == ["tool_result"],
+        f"answering turn held {blocks}",
+    )
+    return ok
 
 
 if __name__ == "__main__":

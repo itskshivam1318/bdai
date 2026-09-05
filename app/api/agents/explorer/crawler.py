@@ -37,7 +37,9 @@ from urllib.parse import urlparse
 from playwright.sync_api import Page, sync_playwright
 
 from . import forms
-from .forms import Credentials
+# `DESTRUCTIVE`/`is_safe` moved to forms.py so both walkers can honour them;
+# re-exported here because this module's callers and probes name them.
+from .forms import DESTRUCTIVE, Credentials, is_safe  # noqa: F401
 from .observer import Observation, Observer
 from .statekey import state_key
 from .synth import Synthesizer
@@ -79,13 +81,6 @@ def autosave(world, url: str, **meta):
         return None
 
 
-DESTRUCTIVE = re.compile(
-    r"\b(delete|remove|destroy|deactivate|cancel|unsubscribe|revoke|archive|"
-    r"reset|clear|purge|close account|log ?out|sign ?out)\b",
-    re.IGNORECASE,
-)
-
-
 @dataclass(frozen=True)
 class Budget:
     """Hard caps. Every crawler in the literature has these and no crawler
@@ -115,14 +110,6 @@ class Budget:
     max_depth: int = 4
 
 
-def is_safe(descriptor: str) -> bool:
-    """Default guard. Sign-out is excluded for a boring reason as well as a
-    safe one: it ends the session and every subsequent replay lands on a login
-    page, so one click poisons the rest of the crawl.
-    """
-    return not DESTRUCTIVE.search(descriptor)
-
-
 def _same_origin(entry: str, url: str) -> bool:
     """Never leave the app under test. QA Wolf's rule -- explore discovered
     addresses only, never invent one -- with the corollary that a link to
@@ -140,6 +127,7 @@ def crawl(
     synthesizer: Synthesizer | None = None,
     checkpoint: Callable[[WorldMap], None] | None = None,
     shot: Shot | None = None,
+    trace: Callable[[str], None] | None = None,
 ) -> WorldMap:
     """Explore from `entry_url` until the frontier empties or the budget runs out."""
     budget = budget or Budget()
@@ -326,6 +314,15 @@ def crawl(
         capture(here_key)
         here = after
 
+        if trace is not None:
+            # Per edge, beside `checkpoint`, because the two answer different
+            # questions: `checkpoint` persists the map so it can be *watched*,
+            # `trace` says what was just done so a run can be *read*. Measured
+            # 2026-09-05: a crawl against a remote target printed nothing for
+            # 3m20s, and a stall was indistinguishable from slow progress.
+            arrow = "->" if here_key != from_key else "stays"
+            trace(f"[{actions_taken:>3}] {from_key[:8]} {action} {arrow} {here_key[:8]}")
+
         if checkpoint is not None:
             # After every edge, not at the end. A map that only appears when
             # the crawl finishes cannot be watched, and watching it is the
@@ -363,7 +360,10 @@ def main(entry_url: str) -> int:
         # `_tls_warning`.
         page = browser.new_page(ignore_https_errors=True)
         world = crawl(
-            page, entry_url, credentials=credentials, synthesizer=synthesizer
+            page, entry_url, credentials=credentials, synthesizer=synthesizer,
+            # Unbuffered, because the reason this exists is watching a remote
+            # crawl that has not finished. See `trace` in `crawl`.
+            trace=lambda line: print(line, flush=True),
         )
         browser.close()
 

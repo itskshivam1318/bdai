@@ -314,10 +314,17 @@ agent builds on sand:
   real thing is `agents/runner.py`; `agents.probe` has a check named "healing
   refuses a control it cannot justify" whose whole job is to stop that toy
   behaviour coming back. Run `make loop`, not `make smoke`.
-- No migrations. `make reset` is the migration tool. `db.init_db()` imports
-  `app.models` for a load-bearing reason — `create_all` only builds what has
-  registered itself on the metadata, so without that import it silently creates
-  nothing for any caller that has not already imported the models.
+- No migrations, with one narrow exception. `make reset` is still the tool.
+  `db._add_missing_columns()` adds columns `create_all` will never add, because
+  it only creates tables it cannot find — and a column may go on that list only
+  if an existing row is *correct* without it (nullable, or defaulted). Anything
+  needing a value computed from the old row is a real migration, and that is
+  `make reset`. `db.adopt_orphan_chat()` is the companion: it gives messages
+  written before `ChatThread` existed a thread to belong to.
+  `db.init_db()` imports `app.models` for a load-bearing reason — `create_all`
+  only builds what has registered itself on the metadata, so without that import
+  it silently creates nothing for any caller that has not already imported the
+  models.
 - The SUT's three variants are hand-written drift, not a real deploy.
 - `artifacts/invalid-payloads.json` is the replay log for `synth.py`: what the
   model chose to type, keyed by form shape. It makes a crawl reproducible and
@@ -381,6 +388,33 @@ the language switcher stay plain `button:` actions.
 
 If you loosen either stop rule, run `make probe` and watch that section: the two
 failures are opposite, and it is easy to fix one by causing the other.
+
+**Commits are checked against the index, not your working tree.** `git add
+<file>` stages the file as it *is*, not the change you made, so with a second
+session editing the same checkout you can commit a half of something and still
+pass `make check` — the other half is sitting on disk. `.githooks/pre-commit`
+materialises the staged tree and typechecks *that*. Enable it with `make hooks`
+(`make setup` does); bypass with `--no-verify` only for a WIP commit you intend
+to amend.
+
+It installs into the **shared** hooks directory (`$(git rev-parse
+--git-common-dir)/hooks`), not via `core.hooksPath`. That setting is written to
+the shared config so every worktree inherits it, but the path is relative and
+git resolves it against the *invoking* worktree -- so a worktree on a branch
+without `.githooks/` got the setting, found nothing, ran no hook and said
+nothing. Measured: two worktrees were in exactly that state. The shared
+directory is consulted by every worktree by construction and no branch can take
+it away.
+
+What lands there is a shim: it prefers `<worktree>/.githooks/pre-commit` so the
+version-controlled hook stays the source of truth, and falls back to a snapshot
+beside it on branches that have no such file. Edit `.githooks/pre-commit`, then
+`make hooks` to refresh the snapshot.
+
+A worktree that has never run `make setup` has no `node_modules` or `.venv`, so
+the hook **says which check it skipped and does not claim the tree is sound**.
+Refusing there would block a commit for a reason unrelated to it, and a guard
+that cries wolf is a guard someone turns off.
 
 **Widget config lives in local state**, not on the xyflow node's `data`.
 Mutating `data` is a lint error and causes stale renders; `WidgetNode` holds

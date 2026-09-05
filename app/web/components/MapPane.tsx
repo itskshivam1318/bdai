@@ -204,6 +204,7 @@ export default function MapPane({
             transitions={payload?.transitions ?? []}
             states={payload?.states ?? []}
             ants={ants}
+            runId={runId}
             onClose={() => setDetailKey(null)}
           />
         )}

@@ -82,6 +82,15 @@ class Exchange:
     calls: tuple[ToolCall, ...] = ()
     results: tuple[ToolResult, ...] = ()
     opaque: object | None = None
+    # What the *person* said next, for the one caller that has a person in the
+    # loop. An ant's round ends with tool results; a chat's round ends with a
+    # follow-up question, and both are "the user turn that answers the model".
+    # Modelling it here rather than widening `Transcript` into a flat message
+    # list keeps the round-trip shape the two serialisers depend on -- see the
+    # note above on why the round and not the message is the unit.
+    #
+    # Empty on every exchange an ant produces, so nothing in the colony changes.
+    follow_up: str = ""
 
     @property
     def acted(self) -> bool:

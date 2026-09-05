@@ -277,6 +277,103 @@ def collapse_siblings(lines: list[str]) -> list[str]:
     return out
 
 
+_ROLE = re.compile(r"^(?P<indent>\s*)-\s+(?P<role>[a-zA-Z][\w-]*)")
+
+
+def _shape(block: list[str]) -> tuple:
+    """A subtree's structure with every name and value discarded."""
+    return tuple(
+        (_depth(line) - _depth(block[0]), m.group("role") if (m := _ROLE.match(line)) else "")
+        for line in block
+    )
+
+
+def _blocks(lines: list[str], index: int) -> list[tuple[int, int]]:
+    """Consecutive sibling subtrees starting at `index`, as (start, end) spans."""
+    depth = _depth(lines[index])
+    spans, cursor = [], index
+    while cursor < len(lines) and _depth(lines[cursor]) == depth:
+        end = cursor + 1
+        while end < len(lines) and _depth(lines[end]) > depth:
+            end += 1
+        spans.append((cursor, end))
+        cursor = end
+    return spans
+
+
+def anonymise_rows(lines: list[str]) -> list[str]:
+    """Drop the names inside runs of structurally identical sibling subtrees.
+
+    `collapse_siblings` argues that the labels in a list are the user's data
+    and not the application's behaviour, and scopes itself to `listitem`
+    because "saucedemo has no list at all and is untouched". Measured
+    2026-09-05, that scope is where the next explosion came from: saucedemo
+    renders its six products as sibling `generic` divs, and each row's button
+    flips between `Add to cart` and `Remove` as the cart changes. One product
+    page keyed six different ways; **10 of 21 crawler states and 10 of 15
+    colony states were `/inventory.html`** differing only in cart contents.
+
+    Which items I have put in a cart is the purest case of the rule this module
+    is built on -- *app-decided state is identity, user-entered state is not,
+    its consequences are*. It is `checked` wearing a button's name instead of a
+    flag, which is why stripping `checked` did not reach it.
+
+    The consequence survives, which is what makes dropping the cause safe: an
+    empty cart renders no badge and a non-empty one renders `generic: #`,
+    outside the row group and untouched here. Empty-vs-populated -- the one
+    boundary `collapse_runs` and `collapse_siblings` both protect -- is still
+    identity. Only *which* rows and *how many* stop being.
+
+    **Two guards, and both are load-bearing.** `collapse_siblings` warns that
+    collapsing a bare `generic` run "would hide real controls", and it is
+    right, so this is stricter than that function in the way that matters:
+
+        identical shape   siblings are a group only if their subtrees have the
+                          same roles at the same depths. A row carrying a
+                          control its neighbours lack has a different shape,
+                          falls out of the group, and keeps its name -- which
+                          is exactly the page-swallowing case the grid pins.
+
+        more than one     a single subtree is not a repetition, and a one-line
+        line              sibling is a control, not a row. A toolbar of six
+                          differently-named buttons is six one-line blocks and
+                          is left alone.
+    """
+    out: list[str] = []
+    index = 0
+
+    while index < len(lines):
+        spans = _blocks(lines, index)
+        shapes = [_shape(lines[a:b]) for a, b in spans]
+
+        run_end = 1
+        while (
+            run_end < len(spans)
+            and shapes[run_end] == shapes[0]
+        ):
+            run_end += 1
+
+        first_len = spans[0][1] - spans[0][0]
+        if run_end > 1 and first_len > 1:
+            for a, b in spans[:run_end]:
+                out.append(lines[a])
+                out.extend(
+                    _NAME.sub(lambda m: m.group(0)[: m.start("name") - m.start() - 1].rstrip(), line)
+                    if _NAME.match(line)
+                    else line
+                    for line in anonymise_rows(lines[a + 1 : b])
+                )
+            index = spans[run_end - 1][1]
+            continue
+
+        a, b = spans[0]
+        out.append(lines[a])
+        out.extend(anonymise_rows(lines[a + 1 : b]))
+        index = b
+
+    return out
+
+
 def normalize(snapshot: str, *, keep_values: bool = False) -> str:
     """Reduce a snapshot to the part we treat as identity.
 
@@ -328,7 +425,7 @@ def normalize(snapshot: str, *, keep_values: bool = False) -> str:
         # case is identity.
         lines.append(line.rstrip().removesuffix(":").rstrip())
 
-    return "\n".join(collapse_runs(collapse_siblings(lines)))
+    return "\n".join(collapse_runs(collapse_siblings(anonymise_rows(lines))))
 
 
 def state_key(snapshot: str, *, keep_values: bool = False) -> str:

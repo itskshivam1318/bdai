@@ -199,6 +199,39 @@ class Event(SQLModel, table=True):
     created_at: datetime = Field(default_factory=utcnow)
 
 
+class ChatThread(SQLModel, table=True):
+    """One chat window: a conversation with its own history and its own state.
+
+    Threads exist because one question is rarely one subject. "Why did sign-in
+    split in two" and "what has no coverage" are two investigations, and running
+    them down a single transcript makes each the other's noise -- the model
+    carries the first into the second, and the person scrolls past one to read
+    the other.
+
+    Scoped to the **session**, like the messages in it, and for the same reason:
+    the investigation outlives the crawl that provoked it.
+
+    `open` and `minimised` are window state, deliberately on the row rather than
+    in the browser. A console reloaded mid-demo that comes back with an empty
+    right margin has lost work that looks like it was never there; closing a
+    window is meant to mean "put this away", and putting something away implies
+    finding it again. Closed is not deleted -- `DELETE /api/chat/threads/{id}`
+    is the only thing that destroys a thread.
+    """
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    session_id: Optional[int] = Field(
+        default=None, foreign_key="testsession.id", index=True
+    )
+    # Derived from the first question and editable after. Not model-generated:
+    # a second API call to name a window costs a real second on the one
+    # interaction that is already the slowest thing in the console.
+    title: str = "New chat"
+    open: bool = True
+    minimised: bool = False
+    created_at: datetime = Field(default_factory=utcnow)
+
+
 class ChatMessage(SQLModel, table=True):
     """One turn of the conversation held beside a session's map.
 
@@ -216,6 +249,12 @@ class ChatMessage(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     session_id: Optional[int] = Field(
         default=None, foreign_key="testsession.id", index=True
+    )
+    # Which conversation this belongs to. Nullable only because rows written
+    # before threads existed have no answer -- `db.adopt_orphan_chat()` gives
+    # them one at startup, so nothing live should carry a null.
+    thread_id: Optional[int] = Field(
+        default=None, foreign_key="chatthread.id", index=True
     )
     role: str  # user | assistant
     content: str

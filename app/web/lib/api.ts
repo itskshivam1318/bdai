@@ -61,6 +61,7 @@ export type CanvasNodeRow = {
 export type ChatMessage = {
   id: number;
   session_id: number | null;
+  thread_id: number | null;
   role: "user" | "assistant";
   content: string;
   node_keys: string;
@@ -68,8 +69,70 @@ export type ChatMessage = {
   created_at: string;
 };
 
-/** A question and the reply it produced. The API writes both or neither. */
-export type ChatTurn = { user: ChatMessage; assistant: ChatMessage };
+/**
+ * One chat window: its own history, its own attached states, its own place on
+ * screen.
+ *
+ * `open` and `minimised` live on the server rather than in the browser so a
+ * reload comes back to the same desk. Closing is not deleting — a closed thread
+ * is still listed, and reopening it restores the conversation.
+ */
+export type ChatThread = {
+  id: number;
+  session_id: number | null;
+  title: string;
+  open: boolean;
+  minimised: boolean;
+  created_at: string;
+};
+
+/**
+ * A question, the reply it produced, and the thread as it now stands. The API
+ * writes the pair or neither; the thread comes along because the first message
+ * names the window.
+ */
+export type ChatTurn = {
+  user: ChatMessage;
+  assistant: ChatMessage;
+  thread: ChatThread;
+};
+
+/**
+ * One agent conversation, as `agents/tracing.py` wrote it.
+ *
+ * The metadata comes from the filename; `url` addresses the file itself on the
+ * artifacts mount, which is where the exchanges live. Listing does not read
+ * them — a run writes one of these per ant and they are ~12KB each.
+ */
+export type TranscriptRow = {
+  name: string;
+  /** ant | orchestrator | ... — the role that held this conversation. */
+  role: string;
+  /** For an ant, the first 8 chars of the state it was sent to. */
+  label: string | null;
+  bytes: number;
+  written_at: string;
+  url: string;
+};
+
+/** One model turn: what it said, what it called, and what came back. */
+export type TranscriptExchange = {
+  text: string;
+  calls: { name: string; arguments: Record<string, unknown> }[];
+  results: { name: string; content: string }[];
+  provider_state: boolean;
+};
+
+/** The file itself. `system` is the prompt file that produced the run. */
+export type Transcript = {
+  role: string;
+  run_id: number | null;
+  label: string;
+  written_at: string;
+  system: string;
+  prompt: string;
+  exchanges: TranscriptExchange[];
+};
 
 /** Why one offered action could not be taken, and how often. */
 export type Refusal = { reason: string; count: number };
@@ -196,24 +259,46 @@ export const api = {
   listSessionEvents: (id: number, after = 0) =>
     request<AgentEvent[]>(`/api/sessions/${id}/events?after=${after}`),
 
-  listChat: (sessionId: number) =>
-    request<ChatMessage[]>(`/api/sessions/${sessionId}/chat`),
+  /** Every thread of a session, open and closed. Closed ones fill the reopen list. */
+  listThreads: (sessionId: number) =>
+    request<ChatThread[]>(`/api/sessions/${sessionId}/chat/threads`),
+  createThread: (sessionId: number, title?: string) =>
+    request<ChatThread>(`/api/sessions/${sessionId}/chat/threads`, {
+      method: "POST",
+      body: JSON.stringify({ title: title ?? null }),
+    }),
+  /** Rename, close, reopen, minimise, restore — every window edit is this one. */
+  patchThread: (
+    threadId: number,
+    patch: { title?: string; open?: boolean; minimised?: boolean },
+  ) =>
+    request<ChatThread>(`/api/chat/threads/${threadId}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+  /** Destroys the thread and everything said in it. Closing is the soft one. */
+  deleteThread: (threadId: number) =>
+    request<void>(`/api/chat/threads/${threadId}`, { method: "DELETE" }),
+
+  listChat: (threadId: number) =>
+    request<ChatMessage[]>(`/api/chat/threads/${threadId}/messages`),
   /**
    * Ask about the map. Blocks for as long as the model takes — there is no
    * event stream behind this, the reply *is* the response.
    */
   sendChat: (
-    sessionId: number,
+    threadId: number,
     text: string,
     node_keys: string[],
     run_id: number | null,
   ) =>
-    request<ChatTurn>(`/api/sessions/${sessionId}/chat`, {
+    request<ChatTurn>(`/api/chat/threads/${threadId}/messages`, {
       method: "POST",
       body: JSON.stringify({ text, node_keys, run_id }),
     }),
-  clearChat: (sessionId: number) =>
-    request<void>(`/api/sessions/${sessionId}/chat`, { method: "DELETE" }),
+  /** Empties a thread without closing its window. */
+  clearChat: (threadId: number) =>
+    request<void>(`/api/chat/threads/${threadId}/messages`, { method: "DELETE" }),
 
   listNodes: (sessionId: number) =>
     request<CanvasNodeRow[]>(`/api/canvas/nodes?session_id=${sessionId}`),
@@ -249,6 +334,27 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ intent: intent || null }),
     }),
+  listTranscripts: (runId: number) =>
+    request<TranscriptRow[]>(`/api/runs/${runId}/transcripts`),
+  /** The file, straight off the artifacts mount — no API route reads it. */
+  readTranscript: async (url: string): Promise<Transcript> => {
+    const res = await fetch(artifactUrl(url), { cache: "no-store" });
+    if (!res.ok) throw new Error(`transcript → ${res.status}`);
+    return (await res.json()) as Transcript;
+  },
+  /**
+   * Send one ant to a state on this run's map, optionally down a named action.
+   * Returns as soon as it is dispatched; what it finds arrives on the rail and
+   * on the map, like any other ant's work.
+   */
+  dispatchAnt: (
+    runId: number,
+    body: { state_key: string; action?: string | null; instruction?: string | null },
+  ) =>
+    request<{ run_id: number; state_key: string; status: string }>(
+      `/api/runs/${runId}/ant`,
+      { method: "POST", body: JSON.stringify(body) },
+    ),
   listEvents: (runId: number) =>
     request<AgentEvent[]>(`/api/runs/${runId}/events`),
   getMap: (runId: number) => request<WorldMapPayload>(`/api/runs/${runId}/map`),

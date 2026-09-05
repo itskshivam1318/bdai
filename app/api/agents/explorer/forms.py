@@ -256,6 +256,36 @@ def leaves_origin(here: str, href: str | None) -> bool:
     return bool(target.netloc) and target.netloc != urlparse(here).netloc
 
 
+DESTRUCTIVE = re.compile(
+    r"\b(delete|remove|destroy|deactivate|cancel|unsubscribe|revoke|archive|"
+    r"reset|clear|purge|close account|log ?out|sign ?out)\b",
+    re.IGNORECASE,
+)
+
+
+def is_safe(descriptor: str) -> bool:
+    """Default guard. Sign-out is excluded for a boring reason as well as a
+    safe one: it ends the session and every subsequent replay lands on a login
+    page, so one click poisons the rest of the crawl.
+
+    Lives here rather than in `crawler.py`, where it was written, because it is
+    a fact about *what an explorer may do to a page* and this module is the
+    hands. Keeping it in the crawler made it the crawler's private property:
+    `ant.py` never had it, so the colony -- the engine the console runs
+    whenever an API key is present -- walked unguarded. A guard that only one
+    of two walkers honours is not a guard.
+
+    A stub, and labelled as one: real coverage is Magentic-UI's ActionGuard
+    (arXiv:2507.22358), which classifies every action always/never/maybe
+    irreversible and routes "maybe" to a judge. This denylist is what stands
+    between an unattended run and someone else's data in the meantime --
+    `docs/research/exploration-landscape.md` records an agent in
+    ST-WebAgentBench creating an unwanted repository while trying to file an
+    issue.
+    """
+    return not DESTRUCTIVE.search(descriptor)
+
+
 def available_actions(page: Page, observation: Observation) -> tuple[str, ...]:
     """The action vocabulary of one state.
 

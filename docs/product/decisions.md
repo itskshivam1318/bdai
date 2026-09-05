@@ -381,6 +381,155 @@ them reporting `passed`.
 
 ---
 
+## 2026-09-05 01:45 — Commits are checked against the index, not against your disk
+
+`.githooks/pre-commit` materialises the staged tree with `git checkout-index`,
+runs `tsc --noEmit` on it, and imports the staged API. `make hooks` points git at
+it; `make setup` calls that, because `core.hooksPath` is clone-local config and
+cannot be committed.
+
+**Why:** `git add <file>` stages the file *as it is now*, not the edits you made.
+Two sessions were working in one worktree, and `d7270e8` committed a
+`SessionView` passing a prop to a `StageRail` that was still uncommitted in the
+other one. `make check` passed — the working tree had both halves. Checked out
+alone, HEAD did not compile, and nothing said so for two commits. The working
+tree is exactly the thing that cannot detect this, so the check had to move off
+it.
+
+**It found a second instance on its first run.** `StageRail.tsx` imports
+`@/components/TranscriptViewer`, which was untracked; staging the rail without
+it would have broken HEAD the same way.
+
+**The API half nearly shipped broken, which is the argument for testing a
+check against a known failure.** `python -c` puts the working directory first on
+`sys.path`, so running from the real `app/api` imported the real modules and the
+staged ones were shadowed — it passed an index with `SkippedAction` deliberately
+removed. It now runs from inside the materialised tree.
+
+**Generated types are carried in.** `next-env.d.ts` and `.next/dev/types/` come
+from `next dev` and are gitignored, so a materialised tree has neither and every
+run would report `Cannot find name 'LayoutProps'` — a fact about the checkout,
+not the commit. Copied in so a failure always means the commit is genuinely
+broken.
+
+**Cost is ~20s a commit**, most of it the APFS clone of `node_modules` — the
+same `cp -Rc` `scripts/worktree.sh` makes, for the same reason. `--no-verify`
+remains, for a WIP commit you intend to amend.
+
+**Not chosen: a worktree per session.** It removes the concurrent writer outright
+and the machinery already exists (`make worktree name=x`), but it splits
+`app.db`, so the crawls and threads this demo is built on would not follow.
+Worth revisiting after the hackathon.
+
+**Who:** shivam + Claude.
+
+## 2026-09-05 02:30 — The console's chat is a real conversation, in real windows
+
+Two changes, one cause. `Exchange.follow_up` in `agents/llm` lets a transcript
+carry a human's next message, so the chat now serialises to genuinely
+alternating user/assistant turns on all three providers. And `ChatThread` makes
+a conversation a first-class object with its own window, its own history and its
+own selection.
+
+**Why:** the chat was a single stateless completion wearing a chat's clothes. It
+rendered its whole history into one user message as `Them: … You: …` prose, so
+the model never saw its own replies as turns it had taken — the transcript was
+one question, forever. It answered a follow-up only because the answer was
+pasted into the question. Nothing about that is visible until you want caching,
+or a longer thread, or the model to reason about what it committed to earlier.
+
+**Why `Exchange` and not a flat message list.** `Transcript` models a *round* —
+what the model said and did, and what came back — and both serialisers depend on
+that shape: Anthropic echoes tool calls inside the assistant turn with results in
+the following user turn, Google wants function calls and responses as separate
+parts. Neither is reconstructible from the other's flattened form. An ant's round
+ends with tool results and a chat's ends with a follow-up question; those are the
+same slot. `follow_up` defaults to `""`, so every ant transcript serialises byte
+for byte as before, and the probe has a check that says so.
+
+**What each turn now carries.** The map index and the full detail of the attached
+states ride on the **current** question only; older questions keep just the names
+of what was attached. This is how a chat with attachments behaves — you do not
+re-send yesterday's document — and it is why the thread got *cheaper* as it got
+longer, not more expensive. What the model knew about an old state is already in
+its own reply, which is now actually in the transcript.
+
+**Why threads, and why they are windows.** One question is rarely one subject,
+and a selection belongs to a question: with one global set of attached states,
+opening a second conversation destroyed the first one's context. Each window
+owns its attachments, and the map's rings show the **focused** window's — a union
+across every open chat would draw rings that no single Send would honour.
+
+**Why an overlay and not a third column.** The console is a map beside a stage
+rail. A column would take width from the graph every time somebody opened a
+conversation — including the graph they are asking about. Windows float over the
+rail, which is also what makes "minimise" mean something.
+
+**`open` and `minimised` live on the row, not in the browser.** A console
+reloaded mid-demo that comes back to an empty right margin has lost work that
+looks like it was never there. Closed is not deleted; deleting asks first.
+
+**The intent box went back to doing one job.** It was the chat's input too — one
+draft read by both Send and "Start run", already a compromise with one
+conversation and not expressible with several, since two windows cannot share a
+draft without one typing into the other.
+
+**This adds the first real migration**, narrowly: `db._add_missing_columns()`
+adds a nullable column `create_all` will not, and `adopt_orphan_chat()` gives
+pre-threads messages a thread. `make reset` is still the tool for anything that
+needs a value computed from an old row. The rule is written where the list is:
+a column may go there only if an existing row is *correct* without it. A
+hackathon database is disposable right up until it holds the map of a
+twenty-minute crawl.
+
+**Checks:** 30 against the endpoints with a stub provider (thread lifecycle,
+transcript shape per turn, a failing provider writing no rows); 7 in
+`agents.probe` on the transcript itself, including a torn thread that would
+otherwise send two user messages in a row, and one asserting an ant's round is
+untouched; 31 driving the live console with Playwright, ending in a real
+two-turn exchange where the model quotes the previous question back from its own
+transcript.
+
+**Who:** shivam + Claude.
+
+---
+
+## 2026-09-05 02:00 — Correction: what actually makes a worktree per session expensive
+
+The 01:45 entry, "Commits are checked against the index, not against your disk",
+closes with a reason for deferring a worktree per session that is **wrong**. An
+append-only log carrying a wrong reason is worse than one carrying none, because
+the next reader believes it.
+
+**What it said:** worktrees would split `app.db`, so "the crawls and chat threads
+this demo is built on would not follow."
+
+**What is actually true:** `app/api/app/config.py` is a pydantic `BaseSettings`,
+so every field takes an environment override. Both of the ones that matter do:
+
+    DATABASE_URL=…  ARTIFACTS_DIR=…  →  database_url  = sqlite:////tmp/x.db
+                                        artifacts_dir = /tmp/shared-artifacts
+
+A second worktree can point at this database and these artifacts with two
+variables, and the data follows fine. The objection was soft and stated as if it
+were hard.
+
+**The real cost, which the original entry did not name:** two live stacks
+writing one SQLite file. `store.save` is called after *every edge* -- that is
+deliberate, it is what makes a crawl watchable -- so two concurrent crawls
+contend on the same file and meet `database is locked`. Sharing the database is
+what makes worktrees affordable and is also exactly what makes them risky; the
+two cannot be had together without moving off SQLite or serialising crawls.
+
+**The conclusion is unchanged: defer.** But it is deferred because concurrent
+writers contend, not because the data cannot be shared. Anyone revisiting this
+should start from that, and should note the alternative it implies -- separate
+worktrees with *separate* databases are cheap and safe, and cost only that a run
+recorded in one is not visible in the other.
+
+**Evidence:** the two-variable override above, run against `app.config` directly.
+
+**Who:** shivam + Claude.
 ## 2026-09-05 02:15 — Intent is derived over the map; no agent declares it at action time
 
 Actor, Action, Context, Intent and Outcome are five different things, and the

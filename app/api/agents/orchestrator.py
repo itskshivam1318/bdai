@@ -24,8 +24,10 @@ Prompt: `prompts/orchestrator.md`. That file is the tunable part.
 
 from __future__ import annotations
 
+import os
 import sys
 import time
+from pathlib import Path
 from dataclasses import dataclass, field
 
 from playwright.sync_api import sync_playwright
@@ -35,11 +37,16 @@ from .ant import Report, explore, instructions
 from .explorer import forms
 from .explorer.forms import Credentials
 from .explorer.observer import Observer
-from .explorer.crawler import autosave
+from .explorer.crawler import Budget as CrawlBudget, autosave, crawl
+from .explorer.synth import Synthesizer
 from .explorer.worldmap import WorldMap
 from .llm import Exchange, Provider, ToolResult, Transcript, load
 from .shots import Shot
 from .tracing import save_transcript, start as start_tracing
+
+# Resolved from __file__ like `crawler.RUNS`, so it follows `api/` wherever
+# that moves rather than depending on the caller's working directory.
+ARTIFACTS = Path(__file__).resolve().parent.parent / "artifacts"
 
 
 @dataclass(frozen=True)
@@ -158,6 +165,8 @@ def run(
     run_id: int | None = None,
     shot: Shot | None = None,
     checkpoint=None,
+    synthesizer=None,
+    world: WorldMap | None = None,
 ) -> Exploration:
     """Explore `entry_url` until the orchestrator is satisfied or the budget ends.
 
@@ -189,7 +198,17 @@ def run(
             f"orchestrator on {provider.model}, ants on {ant_provider.model}",
         )
 
-    world = WorldMap(actions_of=lambda obs: forms.available_actions(page, obs))
+    # A map handed in is a crawl that already happened. The colony's first
+    # wave then decides where *judgement* is needed rather than what the
+    # application is -- measured on saucedemo, waves 1-4 of an unseeded run go
+    # entirely on rediscovering structure `explorer.crawler` produces in 124
+    # seconds for nothing, and the budget is gone before `finish` is reached.
+    #
+    # `actions_of` is rebound either way: it closes over a page, and the page
+    # that crawled is not the page the ants will walk.
+    seeded = world is not None
+    world = world or WorldMap()
+    world.actions_of = lambda obs: forms.available_actions(page, obs)
     result = Exploration(world=world)
 
     observer = Observer(page)
@@ -198,6 +217,13 @@ def run(
     entry_key = world.record(observer.observe())
     if shot is not None:
         world.attach_screenshot(entry_key, shot(entry_key))
+    if seeded:
+        emit(
+            "info",
+            f"seeded with {len(world.states)} state(s), "
+            f"{sum(len(t) for t in world.transitions.values())} transition(s) "
+            f"and {len(world.skipped)} refused action(s) from the crawler",
+        )
     emit("info", f"entry {entry_url} -> state {entry_key[:8]}")
 
     system = instructions("orchestrator")
@@ -216,11 +242,50 @@ def run(
     )
     ants_left = budget.max_ants
 
+    # States an ant was sent to and could not reach. A state is a place the
+    # colony *stood*, not a place it can necessarily stand again: `navigate`
+    # replays the shortest path from the entry and verifies the landing, and on
+    # an app that carries data the replay stops reproducing the state the
+    # moment the data moves underneath it. saucedemo's inventory page is the
+    # measured case -- `Add to cart` re-keys it, so every state recorded behind
+    # one is gone as soon as the cart is not empty.
+    #
+    # `navigate` returning None is correct and the ant reporting `stuck` is
+    # correct. What was wrong is that nothing carried the fact back up: the
+    # orchestrator sees the map, the map still lists the state, and it kept
+    # spending ants on it. Measured 2026-09-05 against saucedemo: 4 of 12 ants
+    # ended `stuck`, all of them in the last two waves, all on inventory states
+    # a `Add to cart` had already destroyed -- a third of the colony's budget
+    # spent arriving nowhere.
+    perished: set[str] = set()
+
     for wave in range(budget.max_waves):
         if time.monotonic() > deadline or ants_left <= 0:
             break
 
-        turn = provider.turn(system, transcript, tools.ORCHESTRATOR_TOOLS)
+        try:
+            turn = provider.turn(system, transcript, tools.ORCHESTRATOR_TOOLS)
+        except Exception as exc:
+            # The same argument the dead-ant handler below makes, one level up
+            # and previously unmade. A provider failure here -- a 402, a
+            # transient 503 -- propagated out of `run` and took the whole
+            # exploration with it: the map, the wave that had already reported,
+            # the autosave, the summary. Measured 2026-09-05: a seeded run lost
+            # a 24-state crawl and a completed first wave to a credits error on
+            # the wave-3 call, and the process exited with a traceback rather
+            # than with the map it was holding.
+            #
+            # Breaking out rather than retrying, because the two failures worth
+            # surviving are opposite: a rate limit wants a wait this loop
+            # cannot afford, and an exhausted balance never recovers. Both are
+            # better answered by ending the run with what it has.
+            emit("error", f"orchestrator call failed: {type(exc).__name__}: {exc}")
+            result.stopped = "error"
+            result.gaps = result.gaps + (
+                f"The colony stopped early: the model call failed ({exc}). "
+                "The map below is what had been walked when it did.",
+            )
+            break
 
         if turn.done:
             emit("warn", "orchestrator said nothing actionable; stopping")
@@ -258,6 +323,18 @@ def run(
                 )
                 continue
 
+            if matches[0] in perished:
+                # Refused before the ant is built, not after it dies. The ant
+                # would cost a model call and a page load to rediscover what
+                # the last one already established.
+                rejected.append(
+                    f"{wanted!r} can no longer be reached -- an earlier ant "
+                    "tried and could not get back to it. Something the colony "
+                    "did has changed the application underneath that state. "
+                    "Send this ant somewhere reachable instead"
+                )
+                continue
+
             instruction = str(assignment.get("instruction", "")).strip()
             tag = f"w{wave + 1}a{ant_index + 1}"
             emit("info", f"  ant {tag} -> {matches[0][:8]}: {instruction}")
@@ -279,6 +356,7 @@ def run(
                     budget=budget.ant_actions,
                     run_id=run_id,
                     shot=shot,
+                    synthesizer=synthesizer,
                 )
             except Exception as exc:
                 # One ant dying must not take the colony with it. A transient
@@ -301,6 +379,18 @@ def run(
                 # bookkeeping, a later crawl -- belongs to no ant, and a stale
                 # tag would quietly credit it to the last one that ran.
                 world.attribution = None
+
+            if report.ended == "stuck":
+                # The one ending that says something about the *map* rather
+                # than about the ant. Recorded so the next wave cannot repeat
+                # it; not removed from the map, because the state was really
+                # observed and its transitions are still evidence.
+                perished.add(matches[0])
+                emit(
+                    "warn",
+                    f"  {matches[0][:8]} is no longer reachable -- not "
+                    f"assigning further ants to it",
+                )
 
             ants_left -= 1
             wave_reports.append(report)
@@ -330,6 +420,20 @@ def run(
             waves_left=budget.max_waves - wave - 1,
             ants_left=ants_left,
         )
+        if perished:
+            # Stated every wave, not once. The orchestrator's context is the
+            # transcript, and a fact mentioned in wave 2 competes with
+            # everything since; a standing list is what stops wave 5 proposing
+            # what wave 4 already learned was impossible.
+            feedback = (
+                "these states are recorded but NO LONGER REACHABLE -- the "
+                "colony changed the application and cannot get back to them. "
+                "Do not assign ants here: "
+                + ", ".join(sorted(k[:8] for k in perished))
+                + "\n\n"
+                + feedback
+            )
+
         if rejected:
             feedback = (
                 "some assignments were refused: "
@@ -366,9 +470,11 @@ def run(
     except Exception:
         pass
 
-    if not result.summary:
+    if not result.summary and result.stopped != "error":
         # Ran out of budget before the orchestrator chose to finish. Say so
-        # rather than presenting a partial map as a complete account.
+        # rather than presenting a partial map as a complete account. An error
+        # is excluded: it is also a run with no summary, and relabelling it
+        # "budget" would hide the reason it has none.
         result.stopped = "budget"
         result.gaps = result.gaps + (
             "Exploration was cut off by the budget before the orchestrator "
@@ -376,6 +482,30 @@ def run(
         )
 
     return result
+
+
+def seed_map(page, entry_url: str, credentials, synthesizer, budget=None):
+    """Walk the app deterministically, and hand the colony what it found.
+
+    The whole argument for the hybrid in one function. Measured on saucedemo at
+    equal action budgets: the crawler reaches 21 states for nothing in 124s,
+    the colony reaches 16 for ~$0.09 in ~1400s. An unseeded colony spends its
+    first four waves rebuilding what this returns, and in three complete runs
+    never had budget left to call `finish` -- so it produced no summary and no
+    flows, which is the only thing it can do that the crawler cannot.
+
+    The refused actions matter more than the states. `world.skipped` is the
+    list of things determinism tried and could not do -- login walls, forms
+    with no fillable field -- and that is precisely the work worth spending a
+    model on. `tools.brief` renders it for the orchestrator.
+    """
+    return crawl(
+        page,
+        entry_url,
+        budget or CrawlBudget(),
+        credentials=credentials,
+        synthesizer=synthesizer,
+    )
 
 
 def main(entry_url: str, intent: str | None = None) -> int:
@@ -395,6 +525,11 @@ def main(entry_url: str, intent: str | None = None) -> int:
         print(f"INTENT      {intent}")
     print()
 
+    # Seeding is the default because the hybrid is the product; `SEED=0` turns
+    # it off, which is what the crawler-vs-colony A/B needs to stay runnable.
+    seed = os.environ.get("SEED", "1") != "0"
+    synthesizer = Synthesizer(cache_path=ARTIFACTS / "invalid-payloads.json")
+
     with sync_playwright() as pw:
         browser = pw.chromium.launch()
         # Test and staging targets routinely serve self-signed or expired certs;
@@ -402,8 +537,20 @@ def main(entry_url: str, intent: str | None = None) -> int:
         # run still reports that transport security was not verified -- see
         # `_tls_warning`.
         page = browser.new_page(ignore_https_errors=True)
+
+        world = None
+        if seed:
+            print("SEED        crawling deterministically first...")
+            world = seed_map(page, entry_url, credentials, synthesizer)
+            print(
+                f"SEED        {len(world.states)} states, "
+                f"{sum(len(t) for t in world.transitions.values())} transitions, "
+                f"{len(world.skipped)} refused -- handing to the colony\n"
+            )
+
         result = run(
-            page, entry_url, provider, intent=intent, credentials=credentials
+            page, entry_url, provider, intent=intent, credentials=credentials,
+            synthesizer=synthesizer, world=world,
         )
         browser.close()
 

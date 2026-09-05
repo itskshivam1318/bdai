@@ -23,6 +23,80 @@ def init_db() -> None:
     from . import models  # noqa: F401
 
     SQLModel.metadata.create_all(engine)
+    _add_missing_columns()
+    adopt_orphan_chat()
+
+
+# Columns `create_all` will never add, because it only creates tables it cannot
+# find. The rule for this list: a column may go here only if an existing row is
+# *correct* without it -- adding a nullable field or one with a default. Anything
+# that needs a value computed from the old row is a real migration, and `rm
+# app.db` is still the tool for that.
+_ADDED_COLUMNS: dict[str, list[tuple[str, str]]] = {
+    "chatmessage": [("thread_id", "INTEGER")],
+}
+
+
+def _add_missing_columns() -> None:
+    """The narrowest thing that deserves the name migration.
+
+    A hackathon database is disposable right up until it holds the map of a
+    twenty-minute crawl, and then deleting it to add a nullable column costs the
+    demo. This adds the column instead, and does nothing at all on a fresh
+    database where `create_all` has already put it there.
+    """
+    with engine.connect() as conn:
+        for table, columns in _ADDED_COLUMNS.items():
+            existing = {
+                row[1]
+                for row in conn.exec_driver_sql(f"PRAGMA table_info({table})")
+            }
+            if not existing:  # table not created yet -- nothing to alter
+                continue
+            for name, ddl in columns:
+                if name not in existing:
+                    conn.exec_driver_sql(
+                        f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"
+                    )
+            conn.commit()
+
+
+def adopt_orphan_chat() -> None:
+    """Give pre-threads messages a thread, one per session, oldest first.
+
+    The alternative was to let them be: a null `thread_id` is not an error, and
+    nothing crashes. But those rows are somebody's actual questions about a map
+    that is still on screen, and a console that silently stops showing them is
+    indistinguishable from one that lost them.
+    """
+    from sqlmodel import Session as DbSession
+    from sqlmodel import select
+
+    from .models import ChatMessage, ChatThread
+
+    with DbSession(engine) as db:
+        orphans = db.exec(
+            select(ChatMessage)
+            .where(ChatMessage.thread_id == None)  # noqa: E711 -- SQL, not Python
+            .order_by(ChatMessage.id)
+        ).all()
+        if not orphans:
+            return
+
+        threads: dict[int | None, ChatThread] = {}
+        for message in orphans:
+            thread = threads.get(message.session_id)
+            if thread is None:
+                thread = ChatThread(
+                    session_id=message.session_id, title="Earlier questions"
+                )
+                db.add(thread)
+                db.commit()
+                db.refresh(thread)
+                threads[message.session_id] = thread
+            message.thread_id = thread.id
+            db.add(message)
+        db.commit()
 
 
 def get_session() -> Generator[Session, None, None]:

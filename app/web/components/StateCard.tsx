@@ -46,14 +46,33 @@ export default function StateCard({ data }: NodeProps) {
    */
   const ring = attached ? " ring-2 ring-ink ring-offset-2 ring-offset-paper" : "";
 
-  const frame = `rounded-md border bg-paper cursor-pointer ${
+  const frame = `group relative rounded-md border bg-paper cursor-pointer ${
     mark.dashed ? "border-dashed" : "border-solid"
   } ${state.verdict ? "border-current" : "border-rule"} ${mark.tone}${ring}`;
+
+  /*
+   * The only sign that a card opens. Double-click was already the gesture --
+   * single click attaches to the chat -- but an undiscoverable gesture is the
+   * same as no gesture, and "17 actions" printed on a card that looked inert
+   * read as a dead end rather than as a door.
+   *
+   * `pointer-events-none` on purpose: a real button here would sit inside
+   * xyflow's node, so pressing it would attach the state as well as open it.
+   */
+  const hint = (
+    <span
+      aria-hidden
+      className="pointer-events-none absolute right-1 top-1 rounded bg-paper/90 px-1 text-[10px] text-muted opacity-0 transition-opacity group-hover:opacity-100"
+    >
+      ⤢ double-click
+    </span>
+  );
 
   if (compact) {
     return (
       <div className={`${frame} px-3 py-2`} style={{ width: NODE_W }}>
         <Handle type="target" position={Position.Left} />
+        {hint}
         <span className="text-ink text-sm">{name}</span>
         <span className="ml-2">{mark.glyph}</span>
         {tint && (
@@ -73,6 +92,7 @@ export default function StateCard({ data }: NodeProps) {
   return (
     <div className={`${frame} overflow-hidden`} style={{ width: NODE_W, height: NODE_H }}>
       <Handle type="target" position={Position.Left} />
+      {hint}
       <div className="h-24 bg-hush">
         {state.screenshot ? (
           // artifacts are served by the API on another origin; next/image

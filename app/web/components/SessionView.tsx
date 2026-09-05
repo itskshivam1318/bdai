@@ -1,12 +1,18 @@
 "use client";
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useState } from "react";
-import ChatPanel from "@/components/ChatPanel";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import ChatDock from "@/components/ChatDock";
 import MapPane from "@/components/MapPane";
 import StageRail from "@/components/StageRail";
 import SettingsDialog from "@/components/SettingsDialog";
 import { sessionLabel } from "@/components/Sidebar";
-import { api, type MapState, type Run, type TestSession } from "@/lib/api";
+import {
+  api,
+  type ChatThread,
+  type MapState,
+  type Run,
+  type TestSession,
+} from "@/lib/api";
 
 const STATUS_TONE: Record<string, string> = {
   passed: "text-live",
@@ -27,16 +33,36 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
   const [intent, setIntent] = useState("");
   const [selectedRunId, setSelectedRunId] = useState<number | null>(null);
   /*
-   * The states attached to the next question. Whole states rather than keys:
-   * the chips need a name, and the map is the only place one exists -- keeping
-   * keys here would mean re-fetching the map to render a label.
+   * The chat windows, and which one the map is aimed at.
    *
-   * A key identifies a state only *within* a run, so this is cleared whenever
-   * the map being shown changes. Carrying a selection across a re-crawl would
-   * attach keys the new map has never heard of, and the answer would be about
-   * a graph the person is not looking at.
+   * Both live here rather than in `ChatDock` because the *map* needs them: a
+   * click on a state has to know which conversation it is attaching to, and
+   * the rings drawn on the canvas have to show that conversation's selection.
+   * Splitting focus from the selection it steers would put the two halves of
+   * one gesture in two components.
    */
-  const [attached, setAttached] = useState<MapState[]>([]);
+  const [threads, setThreads] = useState<ChatThread[]>([]);
+  const [focusedId, setFocusedId] = useState<number | null>(null);
+
+  /*
+   * The states attached to the next question, per window. Whole states rather
+   * than keys: the chips need a name, and the map is the only place one exists
+   * -- keeping keys here would mean re-fetching the map to render a label.
+   *
+   * Per window and not global because a selection belongs to a question. With
+   * one shared set, opening a second conversation to ask about something else
+   * destroyed the first one's context, which is the opposite of what a second
+   * window is for.
+   *
+   * Not persisted, unlike the windows themselves: a key identifies a state only
+   * *within* a run, and what an old selection meant is already on the messages
+   * that were sent with it (`ChatMessage.node_keys`). What is cleared on a run
+   * change is the *pending* selection, which would otherwise attach keys the
+   * new map has never heard of.
+   */
+  const [attachedByThread, setAttachedByThread] = useState<
+    Record<number, MapState[]>
+  >({});
 
   const refreshRuns = useCallback(() => {
     api.listSessionRuns(sessionId).then(setRuns).catch(() => {});
@@ -59,49 +85,26 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
   const reasonOpen = latest != null && reasonFor === latest.id;
 
   /*
-   * The stage rail earns its 40% of the window while stages are advancing and
-   * stops earning it the moment they stop. So it follows the run by default and
-   * defers to the user the moment they say otherwise:
+   * The rail is open until someone shuts it, and it stays shut until they open
+   * it again. Nothing else moves it.
    *
-   *   pinned === null   follow the run
-   *   pinned === true   held open
-   *   pinned === false  held shut
+   *   open === null   never touched -- open
+   *   open === true    held open
+   *   open === false   held shut
    *
-   * A new run clears the pin. A preference expressed about the last run is not
-   * a preference about this one, and the start of a run is the single moment
-   * the rail is certainly worth looking at.
+   * It used to hide itself four seconds after a run finished, on the theory
+   * that a finished stage has stopped earning its width. That was wrong twice
+   * over: the finished rail is the *report* -- eight verdicts, the gaps, the
+   * scenario names -- and a panel that empties itself while you are reading it
+   * is indistinguishable from a panel with nothing in it. It was reported as
+   * exactly that. The map has a toggle in the header for anyone who wants the
+   * width back.
    */
-  const [pinned, setPinned] = useState<boolean | null>(null);
-  const [autoHidden, setAutoHidden] = useState(false);
+  const [open, setOpen] = useState<boolean | null>(null);
 
   const running = latest?.status === "running";
   const latestId = latest?.id ?? null;
-  const runKey = latest ? `${latest.id}:${latest.status}` : "none";
-  const [seenRunKey, setSeenRunKey] = useState(runKey);
-
-  // Adjusting state during render rather than in an effect: React re-renders
-  // immediately with the corrected value, so the rail never paints one frame
-  // shut on the run that just started. `runKey` carries the status, so this
-  // fires on a transition and not on every three-second poll.
-  if (runKey !== seenRunKey) {
-    setSeenRunKey(runKey);
-    if (running) {
-      setPinned(null);
-      setAutoHidden(false);
-    }
-  }
-
-  // Terminal status: let the verdict sit long enough to read, then give the
-  // width back to the map. Keyed on the run's id rather than the run object,
-  // which `refreshRuns` replaces every three seconds -- depending on the object
-  // would restart this timer forever and it would never fire.
-  useEffect(() => {
-    if (running || latestId == null || pinned !== null) return;
-    const t = setTimeout(() => setAutoHidden(true), 4000);
-    return () => clearTimeout(t);
-  }, [running, latestId, pinned]);
-
-  const railOpen = pinned ?? !autoHidden;
+  const railOpen = open ?? true;
 
   // Runs are scoped maps, not versions of one map: re-crawling after the app
   // changes writes a second graph beside the first, which is the drift story.
@@ -115,13 +118,22 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
   const [seenMapRunId, setSeenMapRunId] = useState(shownRunId);
   if (shownRunId !== seenMapRunId) {
     setSeenMapRunId(shownRunId);
-    if (attached.length) setAttached([]);
+    if (Object.keys(attachedByThread).length) setAttachedByThread({});
   }
 
+  // The map shows the focused window's selection, and only that one. A union
+  // across every open chat would draw rings that no single Send would honour.
+  //
   // Memoised because `MapPane` builds a Set from this and `StateCard` reads it
   // through context -- a fresh array every render would re-render every card on
   // every three-second poll.
-  const attachedKeys = useMemo(() => attached.map((s) => s.key), [attached]);
+  const attachedKeys = useMemo(
+    () =>
+      focusedId == null
+        ? []
+        : (attachedByThread[focusedId] ?? []).map((s) => s.key),
+    [focusedId, attachedByThread],
+  );
 
   function commitName() {
     const next = name.trim();
@@ -144,16 +156,116 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
     void api.explore(run.id, intent.trim() || undefined).catch(() => {});
   }
 
-  const toggleAttached = useCallback((state: MapState) => {
-    setAttached((current) =>
-      current.some((s) => s.key === state.key)
-        ? current.filter((s) => s.key !== state.key)
-        : [...current, state],
-    );
+  /*
+   * Windows are loaded once, then owned locally. Unlike the runs above they are
+   * not polled: nothing but this console writes a thread, so a poll would be a
+   * request every three seconds that can never find anything new.
+   *
+   * A session with no chat at all opens one. An empty right margin reads as a
+   * feature that is not there, and the first thing anyone does with a map is
+   * ask about it.
+   */
+  const bootstrapped = useRef(false);
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .listThreads(sessionId)
+      .then(async (rows) => {
+        if (cancelled) return;
+        if (rows.length === 0) {
+          // Guarded because React runs effects twice in development, and two
+          // "New chat" windows on first open is a visible bug in the demo.
+          if (bootstrapped.current) return;
+          bootstrapped.current = true;
+          const created = await api.createThread(sessionId);
+          if (cancelled) return;
+          setThreads([created]);
+          setFocusedId(created.id);
+          return;
+        }
+        setThreads(rows);
+        const open = rows.filter((t) => t.open);
+        setFocusedId((open.at(-1) ?? rows.at(-1))?.id ?? null);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId]);
+
+  /*
+   * Window edits are applied locally and *then* sent. They are title, open and
+   * minimised -- none of which the server can refuse and none of which anything
+   * else writes -- so waiting for the round trip would only add a frame of lag
+   * to collapsing a panel.
+   */
+  const patchThread = useCallback(
+    (
+      id: number,
+      patch: { title?: string; open?: boolean; minimised?: boolean },
+    ) => {
+      setThreads((current) =>
+        current.map((t) => (t.id === id ? { ...t, ...patch } : t)),
+      );
+      void api.patchThread(id, patch).catch(() => {});
+    },
+    [],
+  );
+
+  const newThread = useCallback(async () => {
+    const created = await api.createThread(sessionId).catch(() => null);
+    if (!created) return null;
+    setThreads((current) => [...current, created]);
+    setFocusedId(created.id);
+    return created;
+  }, [sessionId]);
+
+  const deleteThread = useCallback((id: number) => {
+    setThreads((current) => current.filter((t) => t.id !== id));
+    setAttachedByThread((current) => {
+      const next = { ...current };
+      delete next[id];
+      return next;
+    });
+    // Focus falls to whatever is still open, so the map keeps a target.
+    setFocusedId((current) => (current === id ? null : current));
+    void api.deleteThread(id).catch(() => {});
   }, []);
 
+  /*
+   * A click on the map attaches to the **focused** window. With no window open
+   * there is nothing to attach to, so one is opened -- clicking a state and
+   * having nothing happen is the bug this whole surface replaced, and an empty
+   * dock is no excuse to bring it back.
+   */
+  const toggleAttached = useCallback(
+    (state: MapState) => {
+      const target = focusedId;
+      if (target == null) {
+        void newThread().then((thread) => {
+          if (thread) setAttachedByThread((c) => ({ ...c, [thread.id]: [state] }));
+        });
+        return;
+      }
+      setAttachedByThread((current) => {
+        const held = current[target] ?? [];
+        return {
+          ...current,
+          [target]: held.some((s) => s.key === state.key)
+            ? held.filter((s) => s.key !== state.key)
+            : [...held, state],
+        };
+      });
+    },
+    [focusedId, newThread],
+  );
+
   const detach = useCallback(
-    (key: string) => setAttached((current) => current.filter((s) => s.key !== key)),
+    (threadId: number, key: string) =>
+      setAttachedByThread((current) => ({
+        ...current,
+        [threadId]: (current[threadId] ?? []).filter((s) => s.key !== key),
+      })),
     [],
   );
 
@@ -252,7 +364,7 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
         </button>
         <button
           type="button"
-          onClick={() => setPinned(!railOpen)}
+          onClick={() => setOpen(!railOpen)}
           aria-expanded={railOpen}
           aria-controls="stage-rail"
           aria-label={railOpen ? "Hide stage rail" : "Show stage rail"}
@@ -275,36 +387,84 @@ export default function SessionView({ sessionId }: { sessionId: number }) {
         </button>
       </header>
 
-      {/* One column when the rail is away, so the graph reflows into the width
-          rather than staying crowded into the left two-thirds of the window. */}
-      <div
-        className={`grid min-h-0 flex-1 ${
-          railOpen ? "grid-cols-[3fr_2fr]" : "grid-cols-1"
-        }`}
-      >
-        <div className="min-w-0">
-          <MapPane
-            runId={shownRunId}
-            selectedKeys={attachedKeys}
-            onToggleSelect={toggleAttached}
-          />
-        </div>
-        {railOpen && (
-          <div id="stage-rail" className="min-w-0 overflow-hidden">
-            <StageRail sessionId={sessionId} runId={shownRunId} />
+      {/* `relative` because the chat dock floats inside this box rather than
+          taking a column of it -- see ChatDock for why an overlay. */}
+      <div className="relative min-h-0 flex-1">
+        {/* One column when the rail is away, so the graph reflows into the
+            width rather than staying crowded into the left two-thirds. */}
+        <div
+          className={`grid h-full min-h-0 ${
+            railOpen ? "grid-cols-[3fr_2fr]" : "grid-cols-1"
+          }`}
+        >
+          <div className="min-w-0">
+            <MapPane
+              runId={shownRunId}
+              selectedKeys={attachedKeys}
+              onToggleSelect={toggleAttached}
+            />
           </div>
-        )}
+          {railOpen && (
+            <div id="stage-rail" className="min-w-0 overflow-hidden">
+              <StageRail
+                sessionId={sessionId}
+                runId={shownRunId}
+                running={running && shownRunId === latestId}
+              />
+            </div>
+          )}
+        </div>
+
+        <ChatDock
+          threads={threads}
+          focusedId={focusedId}
+          attachedByThread={attachedByThread}
+          runId={shownRunId}
+          onFocus={setFocusedId}
+          onPatch={patchThread}
+          onDelete={deleteThread}
+          onNew={() => void newThread()}
+          onDetach={detach}
+          onClearAttached={(id) =>
+            setAttachedByThread((current) => ({ ...current, [id]: [] }))
+          }
+        />
       </div>
 
-      <ChatPanel
-        sessionId={sessionId}
-        runId={shownRunId}
-        attached={attached}
-        onDetach={detach}
-        onClearAttached={() => setAttached([])}
-        text={intent}
-        onTextChange={setIntent}
-      />
+      {/*
+        The intent box, back to doing one job.
+ 
+        It used to be the chat as well -- one input whose text was read both by
+        Send and by "Start run" -- and that was already a compromise when there
+        was one conversation. With a window per conversation it is not
+        expressible: two windows cannot share a draft without one of them
+        typing into the other. Each window owns its text now, and this owns the
+        run's.
+      */}
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          void startRun();
+        }}
+        className="flex items-center gap-2 border-t border-rule px-4 py-2.5"
+      >
+        <label htmlFor="intent" className="sr-only">
+          What the exploration should focus on
+        </label>
+        <input
+          id="intent"
+          value={intent}
+          onChange={(e) => setIntent(e.target.value)}
+          placeholder="What should the colony focus on? — “checkout and sign-in”. Optional; the URL alone is enough"
+          className="min-w-0 flex-1 rounded-md border border-rule bg-paper px-3 py-2 text-sm outline-none focus:border-ink"
+        />
+        <button
+          type="submit"
+          className="rounded-md border border-rule px-3 py-2 text-sm hover:bg-hush"
+        >
+          {runs.length ? "Run again" : "Start run"}
+        </button>
+      </form>
 
       {settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} />}
     </>
