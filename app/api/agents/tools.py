@@ -100,13 +100,35 @@ REPORT = Tool(
 ANT_TOOLS = [ACT, REPORT]
 
 
+# Every agent the colony can send, and what each is for. The orchestrator
+# picks one per assignment; `refuse_assignment` is the single gate both the
+# schema and the runtime go through, so an agent advertised here and unhandled
+# in `orchestrator.AGENTS` fails a probe check rather than a demo.
+AGENT_KINDS = {
+    "ant": (
+        "explore. Sends a short-lived explorer that decides its own actions "
+        "from the state you name. Use when the map has unknowns."
+    ),
+    "generator": (
+        "compile tests. Turns paths through the map at the state you name into "
+        "runnable scenarios. Use when a region is mapped well enough to test."
+    ),
+    "healer": (
+        "execute and classify. Replays the scenarios compiled for the state you "
+        "name and reports passed / healed / defect / escalate. Use to find out "
+        "whether what you believe about a region survives contact with the app."
+    ),
+}
+
 DISPATCH = Tool(
     name="dispatch",
     description=(
-        "Send a wave of ants. Each runs from the state you name, explores on its "
-        "own, and reports back before you are asked again. Send between one and "
-        "four; they cost time and money, and two sent to neighbouring states will "
-        "retrace each other."
+        "Send a wave of agents. Each runs from the state you name and reports "
+        "back before you are asked again. Send between one and four; they cost "
+        "time and money, and two sent to neighbouring states will retrace each "
+        "other. Choose the KIND of agent per assignment: exploring a region you "
+        "do not understand, compiling tests for one you do, and running those "
+        "tests are three different jobs."
     ),
     parameters={
         "type": "object",
@@ -122,15 +144,22 @@ DISPATCH = Tool(
                             "type": "string",
                             "description": "A state id from the map, as shown (8 characters).",
                         },
+                        "agent": {
+                            "type": "string",
+                            "enum": list(AGENT_KINDS),
+                            "description": " | ".join(
+                                f"{name}: {why}" for name, why in AGENT_KINDS.items()
+                            ),
+                        },
                         "instruction": {
                             "type": "string",
                             "description": (
-                                "What you want from this ant, in one sentence. "
+                                "What you want from this agent, in one sentence. "
                                 "'Get through the login form' beats 'explore'."
                             ),
                         },
                     },
-                    "required": ["state", "instruction"],
+                    "required": ["state", "agent", "instruction"],
                     "additionalProperties": False,
                 },
             },
@@ -205,12 +234,45 @@ FINISH = Tool(
 ORCHESTRATOR_TOOLS = [DISPATCH, FINISH]
 
 
+def refuse_assignment(world: WorldMap, assignment: dict) -> str | None:
+    """Why this assignment cannot be run, or None if it can.
+
+    One gate for both halves of a dispatch, because they fail the same way and
+    used to fail differently: an unresolvable state id was refused with a
+    message the orchestrator could act on, and an unrecognised agent name was
+    not checked at all -- there was only one kind of agent, so there was nothing
+    to check. Adding kinds without adding this would make a typo run an ant and
+    report it as a generator.
+
+    A missing `agent` is an ant. The field is required by the schema, but the
+    schema is advice to a model and this is the runtime.
+    """
+    wanted = str(assignment.get("state", "")).strip()
+    matches = [key for key in world.states if key.startswith(wanted)]
+    if len(matches) != 1:
+        return (
+            f"{wanted!r} is not a state in the map"
+            if not matches
+            else f"{wanted!r} is ambiguous"
+        )
+
+    kind = str(assignment.get("agent", "ant")).strip() or "ant"
+    if kind not in AGENT_KINDS:
+        return (
+            f"{kind!r} is not an agent this colony has. Choose one of: "
+            + ", ".join(AGENT_KINDS)
+        )
+    return None
+
+
 def brief(
     world: WorldMap,
     *,
     reports: list | None = None,
     waves_left: int,
     ants_left: int,
+    behaviour=None,
+    results: list | None = None,
 ) -> str:
     """The orchestrator's view: the whole map, coarsely, plus the last wave.
 
@@ -277,6 +339,32 @@ def brief(
             lines += ["", report.render()]
     else:
         lines += ["", "no ants have reported yet -- this is the first wave."]
+
+    # The semantic layer, when one exists. This is what turns the orchestrator
+    # from a walker into something that reasons: the map says where it has not
+    # been, and the model says what it does not yet know. An unexamined
+    # hypothesis is a better dispatch target than an untried action, because it
+    # names what the ant is *for*.
+    if behaviour is not None and behaviour.hypotheses:
+        lines += [
+            "",
+            "what the colony believes about this application "
+            f"({len(behaviour.open)} of {len(behaviour.hypotheses)} still "
+            "unexamined) -- these are claims, not facts, and an experiment is "
+            "how one becomes either:",
+        ]
+        if behaviour.summary:
+            lines.append(f"  {behaviour.summary}")
+        lines += [h.render() for h in behaviour.hypotheses]
+
+    # What has already been executed. Without this the orchestrator cannot tell
+    # a hypothesis nobody tested from one a test already settled, and it
+    # re-dispatches work that is done -- the same failure the `perished` list
+    # fixes for states, one layer up.
+    if results:
+        lines += ["", "experiments already run:"]
+        for result in results:
+            lines.append(f"  {result}")
 
     lines += [
         "",

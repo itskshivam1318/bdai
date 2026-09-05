@@ -506,6 +506,30 @@ def _explore(
                     f"transitions ({rows} new rows)",
                 )
 
+                # --- what the colony believes ------------------------
+                #
+                # The semantic layer, streamed before the plan because it is
+                # what the plan was chosen *from*. Every claim here survived
+                # `behavior.admit`, so each one cites a state or action this
+                # crawl actually observed; the discarded count is emitted too,
+                # because a guard the console hides is a guard nobody trusts.
+                for hypothesis in result.behaviour.hypotheses:
+                    emit(
+                        "decision",
+                        f"believes [{hypothesis.kind}] {hypothesis.claim}",
+                        surface="plan",
+                    )
+                if result.behaviour.dropped:
+                    emit(
+                        "warn",
+                        f"{result.behaviour.dropped} hypothesis(es) discarded: "
+                        "they described states or actions this crawl never "
+                        "observed",
+                        surface="plan",
+                    )
+                for line in result.experiments:
+                    emit("decision", line, surface="suite")
+
                 # --- plan --------------------------------------------
                 for flow in result.flows:
                     emit(

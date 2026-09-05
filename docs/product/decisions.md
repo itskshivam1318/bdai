@@ -1048,3 +1048,115 @@ assumption as above -- name as identity -- in a second place, and it belongs to
 whoever owns `claims.py`.
 
 **Who:** shivam + Claude.
+
+---
+
+## 2026-09-05 12:00 — The colony gets a semantic layer, and more verbs than "send an ant"
+
+**The shape we were missing.** The system had a deterministic crawler producing
+a factual World Map, and an LLM colony that walked it. What it did not have was
+anything in between: a *behavioural model*. `orchestrator.Exploration` carried a
+`summary` and a list of `flows`, and both had the same fatal property — nothing
+downstream read them. `critic.candidates()`, `generator.scenarios()` and
+`runner.run()` all took a `WorldMap` and nothing else. Grepping `result.flows`
+found exactly two consumers: a console display and a probe check. The most
+interesting output in the system was a string on a screen.
+
+The second gap was structural. There were **two orchestrators that never
+spoke**: `pipeline.py` routed the stages and `orchestrator.py` routed ants. So
+the decision *"stop exploring and start testing"* was made by neither — it was
+made by the order the stages happened to be written in. `make pipeline` called
+`crawl()` directly and never ran the colony at all.
+
+**What was built.**
+
+`agents/behavior.py` — `Hypothesis(claim, kind, cites, status)` over four kinds
+(`flow`, `invariant`, `mutation`, `uncertainty`), and one model call that turns
+a finished map into a set of them.
+
+`tools.AGENT_KINDS` / `orchestrator.AGENTS` — `dispatch` now sends an **`ant`, a
+`generator` or a `healer`**. What a generator compiled and what a healer found
+are appended to `Exploration.experiments` and rendered into the next wave's
+`brief()`, which is what makes the loop a loop rather than a sequence.
+
+`pipeline.run` — crawls first, always, then hands the seeded map to the colony.
+
+`generator.from_flow` — a `flow` hypothesis compiles into a multi-step scenario.
+
+**The citation guard is the whole design, and the reason is the same one
+`critic.py` gives.** A model asked to describe an app it has seen only as a state
+table will name a checkout page it never saw — not from malice, but because
+applications like this one usually have one. So `admit()` requires every
+citation to resolve to a state key in `world.states` or an action in
+`world.vocabulary()`; 8-character ids are widened to 16 and an ambiguous prefix
+is refused rather than guessed; a hypothesis left with no surviving citation is
+**dropped and counted**, and the count reaches the report. This is the Rulers
+extractive-quote rule (arXiv:2601.08654) one layer up from
+`critic.prioritise` — the difference being that the critic could hand the model
+indices into a computed list, and a behavioural claim is prose, so the handle
+has to be the map's own vocabulary.
+
+**A hypothesis starts `unexamined` and only evidence moves it.** Nothing in
+`behavior.py` decides that a claim is true; `runner.py` and `invariants.py` do
+that from observation, and this file has none. A model that could mark its own
+hypothesis `supported` would be exactly the 84.4%-false-positive verifier the
+2026-09-04 entry rejected.
+
+**Why this is not the thing that entry warned against.** The rule we held to is
+that the LLM *proposes experiments* and deterministic code *decides what
+happened*. `_send_healer` runs `runner.run`, whose verdict comes from crossing
+two observable signals; the model chose what to test and the browser decided the
+outcome. `from_flow` returns `None` the moment a consecutive pair of cited
+states has no edge the crawler actually walked, so no compiled assertion is ever
+one the model invented — which is the same refusal `claims.py` makes.
+
+**Trade-off accepted.** `synthesise` costs one model call per run and returns an
+**empty** model without a provider — not a degraded one. `critic.prioritise` can
+fall back to a computed order because its candidates were computed; there is no
+deterministic way to guess what an application *means*, so silence is the honest
+answer, and every stage below still runs on the crawl alone.
+
+**The verdict seam.** An `invariant` hypothesis also carries a **`rule`** from a
+four-entry vocabulary (`must-move`, `must-mutate`, `must-not-mutate`,
+`must-reach`) bound to real states and actions, and `examine()` decides it from
+the recorded transitions. The model picks the claim; code returns the verdict.
+The vocabulary is deliberately small: a richer language would let a claim be
+phrased so nothing on the map could falsify it, and then the checker has to
+guess. `inconclusive` is never collapsed into `supported` — an invariant about
+an edge nobody walked has not been upheld, it has not been tested. A contradicted
+invariant is a defect provable from the crawl alone, which is the blind spot
+`invariants.py` names for any target we cannot redeploy.
+
+**Checks:** 37 new in `agents.probe` across five sections — `BEHAVIOUR` (11),
+`DISPATCH` (7), `REPORT` (5), `FLOWS` (6), `VERDICT` (8). **242 PASS / 0 FAIL,
+exit 0**, up from a 205-check baseline. `make check` clean. The three that would
+have caught the bugs this design exists to prevent: *"the invented one is dropped
+and counted, not silently ignored"*, *"a flow with no recorded edge between two
+states compiles to nothing"*, and *"an invariant about an edge nobody walked is
+inconclusive, not passing"*.
+
+**Measured end to end** against our own SUT on a free route: the crawler mapped
+13 states / 40 transitions, and synthesis returned **10 grounded hypotheses with
+0 discarded** on one run and 24 on another. The ants' missions were visibly
+derived from the model — one was dispatched to check whether valid and invalid
+input "collapse to one, as the colony believes". That is the loop working: the
+map produced a claim, the claim produced a mission.
+
+**Still open, and named rather than hidden:**
+
+- `tools.brief` renders one line per state *plus* the whole behavioural model,
+  so the orchestrator's prompt now grows on two axes instead of one. Fine at 21
+  states; the unbounded-context problem sooner than before. Bucketing states
+  there is the next thing that function needs.
+- The model is synthesised **once**, before the first wave. Ants then grow the
+  map and no new hypotheses are proposed over what they found — only the
+  existing ones are re-examined. The target architecture's "new uncertainty →
+  new hypotheses → repeat" is therefore half-built: the verdicts loop, the
+  claims do not.
+- A first colony run spent both its waves on ants and dispatched no generator at
+  all (`experiments=0`), so the heterogeneous half of dispatch never fired. The
+  prompt now reserves the last wave for generating and healing and the default
+  is 4 waves rather than 3 — a prompt-level fix for a budget-level problem, and
+  it is not guaranteed.
+
+**Who:** shivam + Claude.

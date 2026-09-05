@@ -34,6 +34,7 @@ from playwright.sync_api import sync_playwright
 
 from . import tools
 from .ant import Report, explore, instructions
+from .behavior import BehaviorModel, examine, synthesise
 from .explorer import forms
 from .explorer.forms import Credentials
 from .explorer.observer import Observer
@@ -89,6 +90,16 @@ class Exploration:
     stopped: str = "budget"  # covered | plateau | budget | error
     waves: int = 0
     transcript_path: str | None = None
+    # The semantic layer this colony reasoned over. Kept beside the map rather
+    # than folded into it: the map must be identical on every crawl of an
+    # unchanged app, and this is an interpretation that will not be.
+    behaviour: BehaviorModel = field(default_factory=BehaviorModel)
+    # One line per non-ant agent the colony ran, in order. This is what makes
+    # the loop a loop: it is fed back into the next `brief`, so the orchestrator
+    # can see that a region it is about to test has already been tested.
+    experiments: list[str] = field(default_factory=list)
+    # Every verdict a healer dispatch produced, for the report.
+    results: list = field(default_factory=list)
 
     def render(self) -> str:
         lines = [
@@ -108,12 +119,151 @@ class Exploration:
                         "      " + " -> ".join(str(s)[:8] for s in path)
                     )
             lines.append("")
+        if self.behaviour.hypotheses:
+            lines += [self.behaviour.render(), ""]
+        if self.experiments:
+            lines.append("WHAT THE COLONY RAN")
+            lines += [f"  - {line}" for line in self.experiments]
+            lines.append("")
         if self.gaps:
             lines.append("WHAT WE DID NOT REACH")
             lines += [f"  ! {gap}" for gap in self.gaps]
             lines.append("")
         lines += [self.world.summary()]
         return "\n".join(lines)
+
+
+
+@dataclass
+class Colony:
+    """Everything a dispatched agent needs, gathered once instead of threaded.
+
+    `run()` used to pass six arguments into `explore` and there was one kind of
+    agent. With three, each wanting a different five of the same nine things,
+    a context object is the difference between a dispatch table and a switch
+    statement that grows a parameter every time an agent is added.
+    """
+
+    page: object
+    world: WorldMap
+    entry_url: str
+    ant_provider: object
+    credentials: object
+    budget: "Budget"
+    run_id: int | None = None
+    shot: object = None
+    synthesizer: object = None
+    # Scenarios a generator dispatch compiled, keyed by the state it was sent
+    # to. The healer reads this: it is the only channel between the two, and
+    # it is why "generate here, then test here" is a plan the orchestrator can
+    # make rather than an order the pipeline hardcodes.
+    compiled: dict = field(default_factory=dict)
+    # Every `runner.Result` a healer dispatch produced. The colony's evidence.
+    verdicts: list = field(default_factory=list)
+
+
+def _send_ant(colony: Colony, state: str, instruction: str, tag: str):
+    """Explore. Returns the ant's `Report` -- the one agent with a rich result."""
+    return explore(
+        colony.page,
+        colony.world,
+        colony.ant_provider,
+        entry_url=colony.entry_url,
+        start_key=state,
+        instruction=instruction,
+        credentials=colony.credentials,
+        budget=colony.budget.ant_actions,
+        run_id=colony.run_id,
+        shot=colony.shot,
+        synthesizer=colony.synthesizer,
+    )
+
+
+def _send_generator(colony: Colony, state: str, instruction: str, tag: str) -> str:
+    """Compile the paths through this state into runnable scenarios.
+
+    Filtered to scenarios that actually pass through the state the orchestrator
+    named, so "compile tests for checkout" does not silently return the login
+    tests. A generator sent at a state no scenario reaches says so rather than
+    reporting the whole suite -- an agent that answers a narrow question with a
+    broad answer is worse than one that answers nothing.
+    """
+    from .generator import scenarios
+
+    every = scenarios(colony.world, limit=colony.budget.ant_actions * 4)
+    here = tuple(
+        scenario
+        for scenario in every
+        if any(step.from_key == state for step in scenario.steps)
+    )
+    colony.compiled[state] = here
+    if not here:
+        return (
+            f"generator {tag}: no scenario passes through [{state[:8]}]. "
+            f"{len(every)} exist elsewhere in the map; this region has no "
+            "recorded transition worth compiling yet -- send an ant first."
+        )
+    names = "; ".join(scenario.name for scenario in here[:4])
+    return (
+        f"generator {tag}: compiled {len(here)} scenario(s) through "
+        f"[{state[:8]}] -- {names}"
+    )
+
+
+def _send_healer(colony: Colony, state: str, instruction: str, tag: str) -> str:
+    """Replay what was compiled here and report the verdicts.
+
+    **This is the only agent whose answer is not the model's.** It runs the
+    scenarios and `runner.run` classifies each step from two observable signals;
+    nothing here is asked to judge. That is the deterministic floor the colony
+    stands on: the orchestrator chooses *what* to test and the browser decides
+    what happened.
+    """
+    from .runner import run as replay
+
+    compiled = colony.compiled.get(state, ())
+    if not compiled:
+        return (
+            f"healer {tag}: nothing compiled for [{state[:8]}] yet. Send a "
+            "generator to this state before a healer."
+        )
+
+    counts: dict[str, int] = {}
+    ran = 0
+    for scenario in compiled[:3]:
+        result = replay(
+            colony.page,
+            scenario,
+            credentials=colony.credentials,
+            synthesizer=colony.synthesizer,
+        )
+        colony.verdicts.append(result)
+        counts[result.verdict] = counts.get(result.verdict, 0) + 1
+        ran += 1
+
+    summary = ", ".join(f"{n} {verdict}" for verdict, n in sorted(counts.items()))
+    detail = ""
+    if counts.get("defect"):
+        detail = (
+            " -- a DEFECT here means the locator resolved and the application "
+            "did something other than what it did when the crawler watched it. "
+            "There is no repair to make, and healing it would manufacture a "
+            "green run over a real bug."
+        )
+    return (
+        f"healer {tag}: ran {ran} scenario(s) through [{state[:8]}] "
+        f"-- {summary}{detail}"
+    )
+
+
+# Advertised in `tools.AGENT_KINDS` and handled here. A probe check asserts the
+# two sets are equal, because an agent the model is offered and the runtime
+# cannot run is a dispatch that burns a wave and reports nothing.
+AGENTS = {
+    "ant": _send_ant,
+    "generator": _send_generator,
+    "healer": _send_healer,
+}
 
 
 def ant_provider_for(budget: Budget, provider: Provider) -> Provider:
@@ -226,6 +376,33 @@ def run(
         )
     emit("info", f"entry {entry_url} -> state {entry_key[:8]}")
 
+    colony = Colony(
+        page=page,
+        world=world,
+        entry_url=entry_url,
+        ant_provider=ant_provider,
+        credentials=credentials,
+        budget=budget,
+        run_id=run_id,
+        shot=shot,
+        synthesizer=synthesizer,
+    )
+
+    # The semantic layer, built once from the seeded map before any agent is
+    # sent. This is the step that makes the orchestrator's job reasoning rather
+    # than graph traversal: without it the only thing it can see is which
+    # actions are untried, so the only plan it can form is "try them". With it
+    # the brief carries claims -- and an unexamined claim names what an agent
+    # would be *for*.
+    #
+    # It uses the orchestrator's own provider, not the ants': this is one call
+    # and it decides where the whole colony looks.
+    if world.states:
+        result.behaviour = synthesise(
+            world, provider, run_id=run_id,
+            on_event=lambda level, message: emit(level, message),
+        )
+
     system = instructions("orchestrator")
     if intent:
         # Natural-language intent is a "good to have" in the brief ("focus on
@@ -238,6 +415,7 @@ def run(
             world,
             waves_left=budget.max_waves,
             ants_left=budget.max_ants,
+            behaviour=result.behaviour,
         )
     )
     ants_left = budget.max_ants
@@ -313,17 +491,23 @@ def run(
 
         for ant_index, assignment in enumerate(assignments):
             wanted = str(assignment.get("state", "")).strip()
-            # The orchestrator sees 8-character ids; the map keys are 16.
-            matches = [k for k in world.states if k.startswith(wanted)]
-            if len(matches) != 1:
-                rejected.append(
-                    f"{wanted!r} is not a state in the map"
-                    if not matches
-                    else f"{wanted!r} is ambiguous"
-                )
+            # One gate for the state id and the agent name, shared with the
+            # probe so an agent advertised in the schema and missing from
+            # `AGENTS` fails a check rather than a demo.
+            refusal = tools.refuse_assignment(world, assignment)
+            if refusal is not None:
+                rejected.append(refusal)
                 continue
 
-            if matches[0] in perished:
+            matches = [k for k in world.states if k.startswith(wanted)]
+            kind = str(assignment.get("agent", "ant")).strip() or "ant"
+
+            # Only an ant has to *stand* in the state. A generator reads the
+            # map and never touches the browser; a healer replays from the
+            # entry URL and builds its own route. Refusing those on a perished
+            # state would forbid testing exactly the regions the colony changed
+            # by exploring them -- which is most of the interesting ones.
+            if kind == "ant" and matches[0] in perished:
                 # Refused before the ant is built, not after it dies. The ant
                 # would cost a model call and a page load to rediscover what
                 # the last one already established.
@@ -337,49 +521,59 @@ def run(
 
             instruction = str(assignment.get("instruction", "")).strip()
             tag = f"w{wave + 1}a{ant_index + 1}"
-            emit("info", f"  ant {tag} -> {matches[0][:8]}: {instruction}")
+            emit("info", f"  {kind} {tag} -> {matches[0][:8]}: {instruction}")
 
-            # Everything this ant records is stamped with it. Set here rather
-            # than passed into `explore`, because the recording happens deep in
-            # `ant.py` and `forms.py` and threading an identity down would put
-            # the colony's dispatch structure into modules that have no ants.
+            # Everything this agent records is stamped with it. Set here rather
+            # than passed into the handler, because the recording happens deep
+            # in `ant.py` and `forms.py` and threading an identity down would
+            # put the colony's dispatch structure into modules that have no ants.
             world.attribution = tag
             try:
-                report = explore(
-                    page,
-                    world,
-                    ant_provider,
-                    entry_url=entry_url,
-                    start_key=matches[0],
-                    instruction=instruction,
-                    credentials=credentials,
-                    budget=budget.ant_actions,
-                    run_id=run_id,
-                    shot=shot,
-                    synthesizer=synthesizer,
-                )
+                outcome = AGENTS[kind](colony, matches[0], instruction, tag)
             except Exception as exc:
-                # One ant dying must not take the colony with it. A transient
-                # 503 from the provider killed a completed two-wave exploration
-                # during development, and the map -- states, transitions, every
-                # observation -- was lost with the stack frame, even though
-                # nothing about it was wrong.
+                # One agent dying must not take the colony with it. A
+                # transient 503 from the provider killed a completed two-wave
+                # exploration during development, and the map -- states,
+                # transitions, every observation -- was lost with the stack
+                # frame, even though nothing about it was wrong.
                 #
-                # The dead ant becomes a report like any other, so the
+                # The dead agent becomes an ordinary result, so the
                 # orchestrator can see what happened and decide whether to
                 # retry that state, go elsewhere, or finish with what it has.
-                emit("error", f"  ant died: {type(exc).__name__}: {exc}")
-                report = Report(start_key=matches[0], ended="error")
-                report.uncertain = (
-                    f"this ant failed before reporting ({type(exc).__name__}); "
-                    "its region is still unexplored"
-                )
+                # A failed healer is reported as *untested*, never as passing:
+                # that distinction is the difference between a suite and a
+                # dashboard.
+                emit("error", f"  {kind} died: {type(exc).__name__}: {exc}")
+                if kind == "ant":
+                    outcome = Report(start_key=matches[0], ended="error")
+                    outcome.uncertain = (
+                        f"this ant failed before reporting ({type(exc).__name__}); "
+                        "its region is still unexplored"
+                    )
+                else:
+                    outcome = (
+                        f"{kind} {tag}: failed on [{matches[0][:8]}] "
+                        f"({type(exc).__name__}: {exc}). That region is "
+                        "untested, not passing."
+                    )
             finally:
                 # Anything recorded between ants -- the orchestrator's own
                 # bookkeeping, a later crawl -- belongs to no ant, and a stale
                 # tag would quietly credit it to the last one that ran.
                 world.attribution = None
 
+            ants_left -= 1
+
+            if not isinstance(outcome, Report):
+                # A generator or a healer. Its result is one line, and that line
+                # is the whole feedback loop: it goes into `result.experiments`,
+                # which `brief()` renders on every subsequent wave, so the next
+                # dispatch decision is made knowing what the last one produced.
+                result.experiments.append(str(outcome))
+                emit("info", f"  {outcome}")
+                continue
+
+            report = outcome
             if report.ended == "stuck":
                 # The one ending that says something about the *map* rather
                 # than about the ant. Recorded so the next wave cannot repeat
@@ -392,7 +586,6 @@ def run(
                     f"assigning further ants to it",
                 )
 
-            ants_left -= 1
             wave_reports.append(report)
             emit(
                 "info",
@@ -419,6 +612,8 @@ def run(
             reports=wave_reports,
             waves_left=budget.max_waves - wave - 1,
             ants_left=ants_left,
+            behaviour=result.behaviour,
+            results=result.experiments,
         )
         if perished:
             # Stated every wave, not once. The orchestrator's context is the
@@ -452,6 +647,23 @@ def run(
                 ),
             )
         )
+
+    result.results = colony.verdicts
+
+    # Ruled on at the end rather than at synthesis, because the map is bigger
+    # now: an invariant about an edge no ant had walked when it was proposed is
+    # `inconclusive` then and decidable now. This is the cheapest verdict in the
+    # system -- it reads recorded transitions and makes no call of any kind.
+    if result.behaviour.hypotheses:
+        result.behaviour = examine(world, result.behaviour)
+        broken = [
+            h for h in result.behaviour.hypotheses if h.status == "contradicted"
+        ]
+        for hypothesis in broken:
+            emit(
+                "decision",
+                f"invariant broken -- {hypothesis.claim}: {hypothesis.because}",
+            )
 
     saved = autosave(
         world, entry_url, mode="colony", model=provider.model,

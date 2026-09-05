@@ -327,6 +327,80 @@ def interleave(groups: dict[str, list], limit: int) -> list:
     return picked
 
 
+
+def from_flow(world: WorldMap, hypothesis) -> Scenario | None:
+    """Compile a believed flow into a scenario, or None if the map cannot back it.
+
+    `scenarios()` compiles the shortest path from the entry plus one terminal
+    action. That is the right default when nothing knows what the app is *for*,
+    and it structurally cannot express a sequence -- "log in, add an item,
+    reload, check it survived" is three transitions the crawler walked and no
+    ranking over single edges will ever propose them together.
+
+    A `flow` hypothesis carries the states in order, so it can. What it does not
+    carry is licence: **every consecutive pair must have a transition the
+    crawler actually recorded.** A model naming an ordering nobody walked is
+    asserting a transition that may not exist, and a test built on it would
+    check an expectation nothing ever observed -- unclassifiable on failure,
+    which is the exact defect `claims.py` refuses to generate. So a gap in the
+    chain compiles to nothing rather than to a shortest-path detour that quietly
+    tests something else.
+
+    Returns None for a non-flow hypothesis, a flow citing fewer than two states,
+    or any pair with no recorded edge.
+    """
+    if getattr(hypothesis, "kind", "") != "flow":
+        return None
+
+    path = hypothesis.states
+    if len(path) < 2:
+        return None
+
+    steps: list[Step] = []
+    for from_key, to_key in zip(path, path[1:]):
+        # The action the crawler took to get from one to the other. Several may
+        # qualify on an app where two controls lead the same place; the first
+        # recorded one is taken, which is the one the crawler saw first.
+        edge = next(
+            (
+                action
+                for (key, action), taken in world.transitions.items()
+                if key == from_key and any(t.to_key == to_key for t in taken)
+            ),
+            None,
+        )
+        if edge is None:
+            return None
+        expect = expectation(world, from_key, edge)
+        if expect is None:
+            return None
+        observation = world.evidence[world.states[from_key].evidence[0]]
+        steps.append(
+            Step(
+                intent=intent_of(
+                    edge,
+                    world.states[from_key].title,
+                    _where(world, to_key),
+                ),
+                action=edge,
+                from_key=from_key,
+                fields=fields_of(observation),
+                expect=expect,
+            )
+        )
+
+    entry = world.states.get(world.entry_key) if world.entry_key else None
+    return Scenario(
+        # Named for the claim, because that is what a reader needs: a scenario
+        # called "click Log out" says what it does and a scenario called
+        # "signing out returns to an unauthenticated state" says what it is
+        # checking, and only the second can be wrong in an interesting way.
+        name=hypothesis.claim,
+        target_url=(entry.url if entry else world.states[path[0]].url),
+        steps=tuple(steps),
+    )
+
+
 def scenarios(world: WorldMap, limit: int = 8) -> tuple[Scenario, ...]:
     """Every recorded edge, as a runnable scenario. Best first, capped.
 

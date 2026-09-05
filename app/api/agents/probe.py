@@ -473,6 +473,434 @@ def _invariant_checks() -> bool:
     return ok
 
 
+def _behaviour_world():
+    """Two real states, a real edge, and real observations behind both.
+
+    Built by hand rather than by crawling, so the checks that use it need no
+    browser and no server -- but with genuine `Observation`s in `evidence`,
+    because every state in a real map has one (`WorldMap.record` puts it there)
+    and a fixture without them would let a consumer that crashes on a
+    missing snapshot pass.
+    """
+    from .explorer.observer import Observation
+    from .explorer.worldmap import StateNode, Transition, WorldMap
+
+    world = WorldMap()
+    world.evidence = [
+        Observation(url="/login", title="Login",
+                    snapshot='- heading "Sign in"\n- button "Sign in"'),
+        Observation(url="/dash", title="Dashboard",
+                    snapshot='- heading "Dashboard"\n- button "Log out"'),
+        Observation(url="/done", title="Done",
+                    snapshot='- heading "Signed out"'),
+    ]
+    world.states = {
+        "a" * 16: StateNode(key="a" * 16, url="/login", title="Login",
+                            actions=("click:Sign in",), label="login",
+                            evidence=(0,)),
+        "b" * 16: StateNode(key="b" * 16, url="/dash", title="Dashboard",
+                            actions=("click:Log out",), label="dashboard",
+                            evidence=(1,)),
+    }
+    world.entry_key = "a" * 16
+    world.transitions = {
+        ("a" * 16, "click:Sign in"): [
+            Transition(from_key="a" * 16, action="click:Sign in",
+                       to_key="b" * 16, mutating=True, evidence=1)
+        ]
+    }
+    return world
+
+
+def _behaviour_checks() -> bool:
+    """The semantic layer: a model interprets the map and may not invent it.
+
+    `Exploration.summary`/`flows` were the embryo of this and had one fatal
+    property -- nothing downstream read them, so nothing ever checked a claim
+    in them against the map. A behavioural model that can name a state the
+    crawler never saw is not a model of *this* application, and a generator
+    compiling from it would emit a test for a page that does not exist.
+
+    Every check here is that guard, or the seam it protects.
+    """
+    print("BEHAVIOUR   the model interprets the map, and may not invent it")
+    ok = True
+
+    try:
+        from .behavior import admit, synthesise
+    except ImportError as exc:
+        print(f"  FAIL  agents.behavior does not import ({exc})")
+        return False
+
+    world = _behaviour_world()
+
+    ok &= check(
+        "a hypothesis citing a state the map does not hold is refused",
+        admit(world, {"claim": "x", "kind": "flow", "cites": ["deadbeef"]}) is None,
+    )
+
+    admitted = admit(
+        world,
+        {"claim": "signing in authenticates", "kind": "flow",
+         "cites": ["aaaaaaaa", "click:Sign in"]},
+    )
+    ok &= check("a hypothesis citing a real state is admitted", admitted is not None)
+    ok &= check(
+        "an admitted citation is widened to the full state key",
+        admitted is not None and "a" * 16 in admitted.cites,
+        f"cites={admitted.cites if admitted else None}",
+    )
+    ok &= check(
+        "an action in the map's vocabulary is a valid citation",
+        admitted is not None and "click:Sign in" in admitted.cites,
+    )
+    ok &= check(
+        "an admitted hypothesis starts unexamined, not believed",
+        admitted is not None and admitted.status == "unexamined",
+        f"status={admitted.status if admitted else None}",
+    )
+    ok &= check(
+        "a hypothesis with no citation at all is refused",
+        admit(world, {"claim": "the app is slow", "kind": "flow", "cites": []})
+        is None,
+    )
+
+    ok &= check(
+        "with no provider nothing is guessed",
+        synthesise(world, None).hypotheses == (),
+    )
+
+    class Inventive:
+        """Cites one real state and one page it made up."""
+
+        name, model = "scripted:inventive", "none"
+
+        def turn(self, system, transcript, tool_defs):
+            return Turn(text="", calls=(ToolCall(
+                id="m1", name="model",
+                arguments={
+                    "summary": "a login guarding a dashboard",
+                    "hypotheses": [
+                        {"claim": "signing in authenticates", "kind": "flow",
+                         "cites": ["aaaaaaaa", "bbbbbbbb"]},
+                        {"claim": "checkout charges a card", "kind": "flow",
+                         "cites": ["cafef00d"]},
+                    ],
+                },
+            ),))
+
+    built = synthesise(world, Inventive())
+    ok &= check(
+        "the grounded hypothesis survives synthesis",
+        len(built.hypotheses) == 1,
+        f"{len(built.hypotheses)} admitted",
+    )
+    ok &= check(
+        "the invented one is dropped and counted, not silently ignored",
+        built.dropped == 1,
+        f"dropped={built.dropped}",
+    )
+    ok &= check("synthesis carries the summary", bool(built.summary))
+    ok &= check(
+        "the model reaches the orchestrator's view of the world",
+        "signing in authenticates" in tools.brief(
+            world, waves_left=1, ants_left=1, behaviour=built
+        ),
+        "tools.brief ignored the behavioural model, so the orchestrator "
+        "cannot reason over it",
+    )
+
+    return ok
+
+
+def _dispatch_checks() -> bool:
+    """One orchestrator, several kinds of agent.
+
+    Until this existed there were two orchestrators that never spoke:
+    `pipeline.py` routed the stages and `orchestrator.py` routed ants, so the
+    decision "should I explore more or test what I have" was made by neither --
+    it was made by the order the stages are written in. A colony whose only
+    verb is `send an ant` cannot decide to stop exploring and start testing.
+
+    The guard that matters is the last one: an unknown agent kind must be
+    refused out loud. A dispatcher that silently treats an unrecognised name as
+    the default runs the wrong agent and reports success.
+    """
+    print("DISPATCH    one orchestrator, several kinds of agent")
+    ok = True
+
+    from . import tools
+
+    item = tools.DISPATCH.parameters["properties"]["assignments"]["items"]
+    enum = item.get("properties", {}).get("agent", {}).get("enum")
+    ok &= check(
+        "dispatch can send something other than an ant",
+        bool(enum) and set(enum) >= {"ant", "generator", "healer"},
+        f"agent enum = {enum}",
+    )
+
+    from .orchestrator import AGENTS
+
+    ok &= check(
+        "every advertised agent kind has a handler",
+        bool(enum) and set(enum) == set(AGENTS),
+        f"advertised {sorted(enum or [])}, handled {sorted(AGENTS)}",
+    )
+
+    world = _behaviour_world()
+    refusal = tools.refuse_assignment(world, {"state": "aaaaaaaa", "agent": "wizard"})
+    ok &= check(
+        "an unknown agent kind is refused, not run as an ant",
+        refusal is not None and "wizard" in refusal,
+        f"refusal={refusal!r}",
+    )
+    ok &= check(
+        "a known agent on a real state is not refused",
+        tools.refuse_assignment(world, {"state": "aaaaaaaa", "agent": "healer"})
+        is None,
+    )
+    ok &= check(
+        "a known agent on a state the map lacks is refused",
+        tools.refuse_assignment(world, {"state": "deadbeef", "agent": "ant"})
+        is not None,
+    )
+    ok &= check(
+        "an assignment naming no agent still runs an ant",
+        tools.refuse_assignment(world, {"state": "aaaaaaaa"}) is None,
+    )
+
+    # The feedback loop: what an earlier dispatch produced has to reach the
+    # next decision, or the orchestrator re-runs work that is already done.
+    rendered = tools.brief(
+        world, waves_left=1, ants_left=1,
+        results=["generator w1a1: compiled 3 scenarios from [aaaaaaaa]"],
+    )
+    ok &= check(
+        "what an agent produced reaches the next dispatch decision",
+        "compiled 3 scenarios" in rendered,
+    )
+
+    return ok
+
+
+def _report_checks() -> bool:
+    """The semantic layer has to reach the last screen, or it did not happen.
+
+    The rubric pays 15% for presenting *the agent's decisions*, and a run that
+    reasoned over a behavioural model and then printed only pass/fail counts
+    has hidden the part that was reasoning. The discarded count is here for the
+    same reason: a guard nobody can see is a guard nobody trusts.
+    """
+    print("REPORT      what the agent believed reaches the last screen")
+    ok = True
+
+    from .behavior import BehaviorModel, Hypothesis
+    from .pipeline import Pipeline, report
+
+    pipe = Pipeline(target_url="http://localhost:3000/sut")
+    pipe.behaviour = BehaviorModel(
+        summary="a login guarding a dashboard",
+        hypotheses=(
+            Hypothesis(
+                claim="logging out ends the session",
+                kind="invariant",
+                cites=("a" * 16,),
+            ),
+        ),
+        dropped=2,
+    )
+    pipe.experiments = ["generator w1a2: compiled 3 scenario(s) through [aaaaaaaa]"]
+    rendered = report(pipe)
+
+    ok &= check(
+        "the report names what the agent believed",
+        "logging out ends the session" in rendered,
+    )
+    ok &= check(
+        "an unexamined belief is not presented as a finding",
+        "unexamined" in rendered or "?" in rendered,
+    )
+    ok &= check(
+        "discarded hypotheses are reported, not hidden",
+        "2 further hypothesis" in rendered,
+        "the citation guard fired and the report did not say so",
+    )
+    ok &= check(
+        "the report says what the colony dispatched",
+        "compiled 3 scenario(s)" in rendered,
+    )
+
+    empty = report(Pipeline(target_url="http://x"))
+    ok &= check(
+        "a run with no model still renders a report",
+        "TEST QUALITY REPORT" in empty and "WHAT THE AGENT BELIEVES" not in empty,
+    )
+
+    return ok
+
+
+def _flow_checks() -> bool:
+    """A believed flow has to become a runnable test, or the model is decoration.
+
+    This is the join the whole semantic layer exists for. `generator.scenarios`
+    compiles the *shortest path from the entry plus one terminal action*, which
+    is a fine default and cannot express "log in, add an item, reload, check it
+    survived" -- a sequence the map has always contained and nothing could ask
+    for. A flow hypothesis carries the states in order, so it can.
+
+    The guard that matters is the second one: a flow citing two states with no
+    recorded edge between them must compile to nothing. The model named an
+    ordering it never saw walked, and a test built on it would assert a
+    transition the crawler never observed -- exactly the fabricated expectation
+    `claims.py` refuses to generate.
+    """
+    print("FLOWS       a believed flow compiles into a runnable scenario")
+    ok = True
+
+    from .behavior import Hypothesis
+    from .generator import from_flow
+    from .explorer.worldmap import StateNode, Transition
+
+    world = _behaviour_world()
+    # A third state, reachable from the second, so the flow is longer than
+    # anything `paths()` would produce on its own.
+    world.states["c" * 16] = StateNode(
+        key="c" * 16, url="/done", title="Done",
+        actions=(), label="signed out", evidence=(2,),
+    )
+    world.transitions[("b" * 16, "click:Log out")] = [
+        Transition(from_key="b" * 16, action="click:Log out",
+                   to_key="c" * 16, mutating=True, evidence=2)
+    ]
+
+    walked = Hypothesis(
+        claim="signing in and out returns to an unauthenticated state",
+        kind="flow",
+        cites=("a" * 16, "b" * 16, "c" * 16),
+    )
+    scenario = from_flow(world, walked)
+    ok &= check("a flow the crawler walked compiles", scenario is not None)
+    ok &= check(
+        "the compiled scenario follows the flow, not the shortest path",
+        scenario is not None and len(scenario.steps) == 2,
+        f"{len(scenario.steps) if scenario else 0} step(s)",
+    )
+    ok &= check(
+        "the scenario is named for the claim, not for its last action",
+        scenario is not None and "unauthenticated" in scenario.name,
+        f"name={scenario.name if scenario else None!r}",
+    )
+
+    unwalked = Hypothesis(
+        claim="the login page leads straight to sign-out",
+        kind="flow",
+        cites=("a" * 16, "c" * 16),
+    )
+    ok &= check(
+        "a flow with no recorded edge between two states compiles to nothing",
+        from_flow(world, unwalked) is None,
+        "the model asserted an ordering nobody walked and it became a test",
+    )
+
+    ok &= check(
+        "a non-flow hypothesis is not compiled",
+        from_flow(world, Hypothesis(claim="x", kind="invariant",
+                                    cites=("a" * 16, "b" * 16))) is None,
+    )
+    ok &= check(
+        "a flow citing one state has no transition to test",
+        from_flow(world, Hypothesis(claim="x", kind="flow",
+                                    cites=("a" * 16,))) is None,
+    )
+
+    return ok
+
+
+def _verdict_checks() -> bool:
+    """A proposed invariant gets checked by code, never by the model that wrote it.
+
+    This is the seam the whole architecture turns on. The model is allowed to
+    reason about *what ought to hold* -- that is a semantic question and no
+    amount of graph traversal answers it. It is not allowed to decide whether
+    it holds, because that is the configuration the coverage-evaluation research
+    measures at a 84.4% false-positive rate.
+
+    So an `invariant` hypothesis carries a `rule` from a fixed vocabulary bound
+    to real states and actions, and `examine()` evaluates it against the map.
+    The model picks the claim; the recorded transitions return the verdict.
+    """
+    print("VERDICT     the model proposes an invariant, the map rules on it")
+    ok = True
+
+    from .behavior import BehaviorModel, Hypothesis, RULES, examine
+
+    world = _behaviour_world()
+
+    def one(rule, cites):
+        return BehaviorModel(hypotheses=(
+            Hypothesis(claim="c", kind="invariant", cites=tuple(cites), rule=rule),
+        ))
+
+    # `click:Sign in` from [aaaa] lands in [bbbb] and fired a non-GET.
+    ok &= check(
+        "an invariant the map upholds is supported",
+        examine(world, one("must-move", ["a" * 16, "click:Sign in"]))
+        .hypotheses[0].status == "supported",
+    )
+    ok &= check(
+        "an invariant the map contradicts is contradicted",
+        examine(world, one("must-not-mutate", ["a" * 16, "click:Sign in"]))
+        .hypotheses[0].status == "contradicted",
+    )
+    ok &= check(
+        "a verdict says which transition decided it",
+        bool(examine(world, one("must-mutate", ["a" * 16, "click:Sign in"]))
+             .hypotheses[0].because),
+    )
+    ok &= check(
+        "an invariant about an edge nobody walked is inconclusive, not passing",
+        examine(world, one("must-move", ["b" * 16, "click:Sign in"]))
+        .hypotheses[0].status == "inconclusive",
+        "an unwalked edge was reported as upholding the rule",
+    )
+    ok &= check(
+        "an invariant naming no rule cannot be checked",
+        examine(world, one("", ["a" * 16, "click:Sign in"]))
+        .hypotheses[0].status == "inconclusive",
+    )
+    ok &= check(
+        "an unknown rule is inconclusive, never quietly true",
+        examine(world, one("must-be-lovely", ["a" * 16, "click:Sign in"]))
+        .hypotheses[0].status == "inconclusive",
+    )
+
+    # A flow hypothesis has no rule and must not be silently ruled on.
+    flows = BehaviorModel(hypotheses=(
+        Hypothesis(claim="c", kind="flow", cites=("a" * 16, "b" * 16)),
+    ))
+    ok &= check(
+        "a non-invariant hypothesis is left unexamined by the checker",
+        examine(world, flows).hypotheses[0].status == "unexamined",
+    )
+
+    ok &= check(
+        "every rule the model is offered has a checker",
+        set(RULES) == set(
+            _behaviour_rule_enum()
+        ),
+        "the schema advertises a rule nothing can evaluate",
+    )
+
+    return ok
+
+
+def _behaviour_rule_enum():
+    from .behavior import MODEL
+
+    items = MODEL.parameters["properties"]["hypotheses"]["items"]
+    return items["properties"]["rule"]["enum"]
+
+
 def check(label: str, condition: bool, detail: str = "") -> bool:
     print(f"  {'PASS' if condition else 'FAIL'}  {label}")
     if not condition and detail:
@@ -1657,6 +2085,32 @@ def main() -> int:
     # them. These checks are what stops that reopening.
     print()
     ok &= _parity_checks()
+
+    # 9b. The semantic layer over the map. The colony has always written a
+    # summary and named flows; nothing ever checked a word of it against the
+    # map, and nothing downstream read it. These pin both halves.
+    print()
+    ok &= _behaviour_checks()
+
+    # 9c. One orchestrator that can send an ant, a generator or a healer. The
+    # pipeline used to decide that by the order its stages were written in.
+    print()
+    ok &= _dispatch_checks()
+
+    # 9d. The semantic layer has to reach the report, or the run reasoned in
+    # private and presented a log.
+    print()
+    ok &= _report_checks()
+
+    # 9e. The join the semantic layer exists for: a believed flow becomes a
+    # runnable scenario, and a believed flow nobody walked becomes nothing.
+    print()
+    ok &= _flow_checks()
+
+    # 9f. The model proposes what ought to hold; the recorded transitions rule
+    # on it. This is the one place a hypothesis stops being unexamined.
+    print()
+    ok &= _verdict_checks()
 
     # 10. Bring-your-own-key. The console's Advanced panel is only a form until
     # the key it holds reaches `load()`; these checks are the wire between them.

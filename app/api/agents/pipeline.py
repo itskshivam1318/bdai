@@ -56,6 +56,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from playwright.sync_api import Page
 
+from .behavior import BehaviorModel, examine
 from .critic import Gap, prioritise
 from .critic import render as render_gaps
 from .invariants import render as render_violations
@@ -63,7 +64,7 @@ from .explorer.crawler import Budget as CrawlBudget
 from .explorer.crawler import crawl
 from .explorer.forms import Credentials
 from .explorer.worldmap import WorldMap
-from .generator import Scenario, scenarios
+from .generator import Scenario, from_flow, scenarios
 from .runner import DEFECT, ESCALATE, HEALED, PASSED, Result
 from .runner import run as replay
 
@@ -123,6 +124,12 @@ class Pipeline:
     # Set from the synthesizer during `run`; empty when there was none, which
     # costs only annotation, never a verdict. See `invariants.payloads_from`.
     payloads: dict = field(default_factory=dict)
+    # The semantic layer the colony built over the crawled map, and the
+    # heterogeneous dispatches it made. Empty on a run with no provider, which
+    # is the whole no-key path -- every stage below still works without it.
+    behaviour: BehaviorModel = field(default_factory=BehaviorModel)
+    experiments: list = field(default_factory=list)
+    waves: int = 0
 
     def decide(self, stage: str, choice: str, because: str, **evidence) -> Decision:
         decision = Decision(stage, choice, because, evidence)
@@ -179,6 +186,17 @@ class Budget:
     max_rounds: int = 2  # exploration attempts, including the first
     max_scenarios: int = 8
     max_seconds: float = 900.0
+    # The colony that runs after the crawl. Bounded separately because the two
+    # cost differently: a crawl action is a page load and a colony wave is a
+    # model call plus up to four agents. Small by default -- the crawl has
+    # already done the breadth, and what is left for the colony is judgement.
+    # Four rather than three: measured on our own SUT, a 2-wave colony spent
+    # both on ants and dispatched no generator at all (`experiments=0`), so the
+    # heterogeneous half of dispatch never fired. The prompt now reserves the
+    # last wave for generating and healing, and that only helps if there is a
+    # wave left after exploring.
+    colony_waves: int = 4
+    colony_ants: int = 6
 
 
 def addressable(gaps: tuple[Gap, ...], has_synthesizer: bool) -> tuple[Gap, ...]:
@@ -249,6 +267,71 @@ def run(
         ),
         surface="plan",
     )
+
+    # --- the colony, seeded by the crawl ---------------------------------
+    #
+    # **The crawl is not optional and the colony is not a fallback.** They
+    # answer different questions and the order is the architecture: the crawler
+    # establishes what can be observed and reproduced, and only then is there
+    # something for judgement to be about. An unseeded colony spends its first
+    # four waves rediscovering structure `crawler.py` produces in 124 seconds
+    # for nothing -- measured on saucedemo, with the budget gone before
+    # `finish` was reached.
+    #
+    # What the colony adds is everything determinism cannot reach: a
+    # behavioural model over the map, ants sent at the gaps the crawl left,
+    # and -- since it can dispatch a generator and a healer as well as an ant
+    # -- the decision of when to stop looking and start testing. That decision
+    # used to be made here, by the order these stages are written in.
+    if provider is not None and len(world.states) >= 1:
+        from .orchestrator import Budget as ColonyBudget
+        from .orchestrator import run as colony
+
+        exploration = colony(
+            page, target_url, provider,
+            budget=ColonyBudget(
+                max_waves=budget.colony_waves,
+                max_ants=budget.colony_ants,
+                max_seconds=max(30, int(budget.explore_seconds)),
+            ),
+            credentials=credentials,
+            synthesizer=synthesizer,
+            world=world,
+            on_event=lambda level, message: emit(level, message, "plan"),
+        )
+        world = exploration.world
+        pipe.world = world
+        pipe.behaviour = exploration.behaviour
+        pipe.experiments = list(exploration.experiments)
+        pipe.waves = exploration.waves
+        pipe.results.extend(exploration.results)
+        announce(
+            pipe.decide(
+                "colony",
+                f"{exploration.waves} wave(s), {len(exploration.reports)} ant(s), "
+                f"{len(pipe.behaviour.hypotheses)} grounded hypothesis(es)",
+                "the crawler established what is observable; the colony decided "
+                "what it means and where judgement was still needed. It stopped "
+                f"because: {exploration.stopped}",
+                states=len(world.states),
+                hypotheses=len(pipe.behaviour.hypotheses),
+                discarded=pipe.behaviour.dropped,
+                experiments=len(pipe.experiments),
+                stopped=exploration.stopped,
+            ),
+            surface="plan",
+        )
+    elif provider is None:
+        announce(
+            pipe.decide(
+                "colony", "skipped the colony",
+                "no model is configured, so there is nothing that can interpret "
+                "the map. The crawl stands alone and every stage below runs on "
+                "it -- what is lost is the behavioural model, not the suite",
+                states=len(world.states),
+            ),
+            surface="plan",
+        )
 
     if len(world.states) < 2:
         pipe.stopped = "nothing to test"
@@ -349,13 +432,49 @@ def run(
         pipe.rounds += 1
 
     # --- generate --------------------------------------------------------
-    pipe.plan = scenarios(world, limit=budget.max_scenarios)
+    #
+    # Believed flows first, then the computed suite fills the rest. The order is
+    # the point: `scenarios()` ranks single edges and can never propose a
+    # sequence, so a flow the colony named is the only way "log in, add an item,
+    # reload, check it survived" enters the plan. Both are compiled from
+    # recorded transitions -- `from_flow` returns None the moment a consecutive
+    # pair has no edge the crawler walked -- so nothing here asserts an
+    # expectation that was never observed.
+    believed: list[Scenario] = []
+    unwalked = 0
+    for hypothesis in pipe.behaviour.of_kind("flow"):
+        scenario = from_flow(world, hypothesis)
+        if scenario is None:
+            unwalked += 1
+            continue
+        believed.append(scenario)
+
+    computed = scenarios(world, limit=budget.max_scenarios)
+    # Deduplicated on the action sequence, not the name: a believed flow and a
+    # computed scenario can walk the same edges under different names, and
+    # running both would double-count the coverage they prove.
+    seen = {tuple(step.action for step in s.steps) for s in believed}
+    pipe.plan = tuple(
+        believed
+        + [s for s in computed if tuple(step.action for step in s.steps) not in seen]
+    )[: budget.max_scenarios]
+
     announce(
         pipe.decide(
             "generate", f"compiled {len(pipe.plan)} scenarios",
             "each is a path the crawler actually walked, and each assertion is "
-            "an effect the application actually produced when it walked it",
+            "an effect the application actually produced when it walked it. "
+            f"{len(believed)} came from a flow the colony believed in and the "
+            "rest from ranking the recorded edges"
+            + (
+                f"; {unwalked} believed flow(s) named an ordering nobody walked "
+                "and were not compiled"
+                if unwalked
+                else ""
+            ),
             scenarios=len(pipe.plan),
+            from_behaviour=len(believed),
+            uncompilable=unwalked,
             unhappy=sum(1 for s in pipe.plan if "nothing filled" in s.name
                         or "should reject" in s.name),
         ),
@@ -420,6 +539,36 @@ def run(
         from .invariants import payloads_from
 
         pipe.payloads = payloads_from(synthesizer)
+
+    # Re-ruled once more over the finished map, for the same reason the colony
+    # rules at its end: every edge walked since synthesis is a fact an
+    # invariant may now be decidable against.
+    if pipe.behaviour.hypotheses:
+        pipe.behaviour = examine(world, pipe.behaviour)
+        broken = tuple(
+            h for h in pipe.behaviour.hypotheses if h.status == "contradicted"
+        )
+        if broken:
+            announce(
+                pipe.decide(
+                    "believed",
+                    f"{len(broken)} proposed invariant(s) contradicted by the map",
+                    "a model proposed what ought to hold of this application and "
+                    "the recorded transitions decided it -- these are defects "
+                    "provable from the crawl alone, with no baseline to compare "
+                    "against and nothing a model was asked to judge",
+                    contradicted=len(broken),
+                    supported=sum(
+                        1 for h in pipe.behaviour.hypotheses
+                        if h.status == "supported"
+                    ),
+                    inconclusive=sum(
+                        1 for h in pipe.behaviour.hypotheses
+                        if h.status == "inconclusive"
+                    ),
+                ),
+                surface="defect",
+            )
 
     violations = pipe.proven
     if violations:
@@ -553,6 +702,27 @@ def report(pipe: Pipeline) -> str:
         "HOW THE AGENT DECIDED",
     ]
     lines += [decision.render() for decision in pipe.decisions]
+
+    # The semantic layer, between the decisions and the suite, because it is
+    # what the decisions were made *on*. A report that lists what ran without
+    # what the agent believed is a log; this is the difference between "it
+    # executed eight scenarios" and "it thought logging out ends the session,
+    # and here is what happened when it checked".
+    if pipe.behaviour.hypotheses:
+        lines += ["", "WHAT THE AGENT BELIEVES ABOUT THIS APPLICATION"]
+        if pipe.behaviour.summary:
+            lines.append(f"  {pipe.behaviour.summary}")
+        lines += [h.render() for h in pipe.behaviour.hypotheses]
+        if pipe.behaviour.dropped:
+            lines.append(
+                f"  {pipe.behaviour.dropped} further hypothesis(es) were "
+                "discarded: they described states or actions this crawl never "
+                "observed, so nothing here could have tested them"
+            )
+
+    if pipe.experiments:
+        lines += ["", "WHAT THE COLONY DISPATCHED"]
+        lines += [f"  {line}" for line in pipe.experiments]
 
     lines += ["", "SCENARIOS COVERED"]
     if not pipe.plan:

@@ -23,6 +23,7 @@ app/
 │   ├── agents/context.py   the free-text box → credentials + focus + claims
 │   ├── agents/claims.py    a typed claim → the tests that already cover it
 │   ├── agents/invariants.py defects provable from the map alone, app unseen
+│   ├── agents/behavior.py  the semantic layer: what the map *means*, cited
 │   ├── agents/suite.py     the Runner's verdict, keyed to where on the map
 │   ├── agents/shots.py     one picture per state, taken at most once
 │   ├── agents/fixtures/    recorded pages, so a probe needs no live target
@@ -65,8 +66,13 @@ execution — most heavily:
 The meta-agent evaluates coverage between stages, decides when to re-plan or
 escalate, and synthesises a final test quality report. That is
 **`agents/pipeline.py`** — `make pipeline` runs the whole thing from a URL with
-no stage chosen by a human. Do not confuse it with `agents/orchestrator.py`,
-which orchestrates *ants within exploration* and says so in its own docstring.
+no stage chosen by a human.
+
+`agents/orchestrator.py` is the colony, and since 2026-09-05 `pipeline.run`
+**calls it**, seeded with the crawled map. The two used to be separate
+orchestrators that never spoke, which meant the decision "stop exploring and
+start testing" was made by neither — it was made by the order the stages are
+written in this file.
 
 Its policy is code, not a prompt, and the reason is in `decisions.md`
 (2026-09-04 19:30): the evidence it routes on was computed by something else —
@@ -85,6 +91,89 @@ so is the difference between orchestrating and looping.
 says how far it has got. Prior art on coverage evaluation — the hardest of the
 four, and 20% of the score — is in `../docs/research/coverage-evaluation.md`;
 read `../docs/research/README.md` first to see whether you need it.
+
+### Crawl first, then judgement — and the colony can send more than ants
+
+The order is the architecture and it is not negotiable in either direction.
+
+**The deterministic crawler runs first, always.** `explorer/` answers one
+question — *what can I observe, and what transitions can I reproduce?* — and it
+is deliberately incapable of interpretation: `worldmap.py` treats an action as
+an opaque string so that nothing in it ever learns what a login *is*. Only once
+that substrate exists is there anything for judgement to be about. An unseeded
+colony spends its first four waves rediscovering structure the crawler produces
+in 124 seconds for nothing; measured on saucedemo, the budget was gone before
+`finish` was reached.
+
+**Then the colony, over the map the crawl produced.** It adds the three things
+determinism cannot reach:
+
+| | |
+|---|---|
+| `agents/behavior.py` | the **behavioural model** — one model call turns the map into cited claims |
+| `orchestrator.py` | dispatch — which agent goes where, and when to stop |
+| `ant.py` | an explorer that decides its own actions where it is sent |
+
+`dispatch` sends an **`ant`, a `generator` or a `healer`** — `tools.AGENT_KINDS`
+advertises them and `orchestrator.AGENTS` handles them, and a probe check
+asserts the two sets are equal, because an agent the model is offered and the
+runtime cannot run burns a wave and reports nothing. What a generator compiled
+and what a healer found are fed back into the next wave's `brief()`, which is
+what makes the loop a loop rather than a sequence.
+
+#### The citation guard is the whole of `behavior.py`
+
+`Exploration.summary` and `.flows` were the embryo of the semantic layer and had
+one fatal property: nothing downstream read them, so no claim in them was ever
+checked against anything. A model asked to describe an app it has seen only as a
+state table will name a checkout page it never saw — not from malice, but
+because applications like this one usually have one.
+
+So `admit()` is the seam. Every citation must resolve to a state key in
+`world.states` or an action in `world.vocabulary()`; 8-character ids are widened
+to 16 and an ambiguous prefix is refused rather than guessed; a hypothesis left
+with no surviving citation is **dropped and counted**, and the count reaches the
+report. This is `critic.prioritise`'s extractive-quote rule one layer up, and
+the difference is that the critic could hand the model indices into a list —
+a behavioural claim is prose, so the handle has to be the map's own vocabulary.
+
+A hypothesis starts `unexamined` and only evidence moves it. Nothing in
+`behavior.py` decides that a claim is true; `runner.py` and `invariants.py` do
+that from observation, and this file has none. A model that could mark its own
+hypothesis `supported` would be exactly the 84.4%-false-positive verifier
+`critic.py`'s docstring exists to avoid.
+
+#### An invariant the model proposes, the map rules on
+
+`kind="invariant"` hypotheses carry a **`rule`** from a fixed four-entry
+vocabulary (`behavior.RULES`) bound to real states and actions —
+`must-move`, `must-mutate`, `must-not-mutate`, `must-reach`. Every one is
+decidable from `WorldMap` alone: a recorded transition either changed state,
+or fired a non-GET, or landed where it was claimed to, or did not.
+
+`examine()` returns the verdict, and **the model that wrote the claim never
+grades it**. That is the whole point of keeping the vocabulary small — a richer
+language would let a claim be phrased so nothing on the map could falsify it, at
+which point the checker starts guessing, and guessing is exactly what
+`critic.py`'s 84.4%-false-positive citation is about.
+
+Three outcomes, and the third keeps the other two honest: `supported`,
+`contradicted`, and `inconclusive` for an edge the crawler never walked, a
+missing rule, or one nothing here can evaluate. **`inconclusive` is never
+collapsed into `supported`** — an invariant about an unwalked edge has not been
+upheld, it has not been tested, and reporting the two as one is how a suite
+starts manufacturing green. A claim the model believes but cannot phrase as a
+rule belongs in `kind="uncertainty"`, which gets an ant, not a verdict.
+
+A contradicted invariant is a **defect provable from the crawl alone** — no
+baseline, no redeploy — which is the blind spot `invariants.py` names for any
+third-party target we cannot change.
+
+With no provider, `synthesise` returns an **empty** model rather than a degraded
+one. `critic.prioritise` can fall back to a computed order because the
+candidates were computed; there is no deterministic way to guess what an
+application means, so silence is the honest answer. Every stage below still runs
+on the crawl alone.
 
 ### The World Map is the spine
 
